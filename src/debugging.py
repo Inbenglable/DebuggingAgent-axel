@@ -4,24 +4,26 @@ import sys
 import json
 import time
 import shutil   
+import tiktoken
 import subprocess
 from pathlib import Path
 from datasets import load_dataset
 from swe_log import init_logger, log_msg, log_and_print, remove_ansi_escape_sequences
-from model import LLMModel, extract_json_instruction
+from model import LLMModel, extract_json_instruction, extract_trace_reply
 from retrieve_src import retrieve_code_and_comment
 from decorator_manager import modify_decorators_libcst
 from prompt import GEN_DEBUGGING_TEST, DEBUGGING_AGENT_SYSTEM_MSG, \
-    START_DEBUGGING, DEBUGGING_LOOP, MODIFY_SOURCE_CODE, TOO_LONG_EXEC_RESULT
-
+    ANALYSE_TEST, MODIFY_SOURCE_CODE_HEAD, MODIFY_SOURCE_CODE_INSTRUCT, TOO_LONG_EXEC_RESULT, DEBUGGING_START_AFTER_TESTING, \
+    CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD
 
 sys.path.append(os.path.abspath('/data/swe-fl/SRC/SWE-Bench-Validation/src'))
 from utils import get_test_directives
 from constants import MAP_VERSION_TO_INSTALL
 
-
+MODEL_NAME = 'gpt-4o'
+# MODEL_NAME = 'qwen2.5:32b-instruct-fp8'
 # MODEL_NAME = 'gpt-4o-2024-05-13'
-MODEL_NAME = 'gpt-4o-2024-08-06'
+# MODEL_NAME = 'gpt-4o-2024-08-06'
 # MODEL_NAME = 'o1-mini-2024-09-12'
 # MODEL_NAME = 'claude-3-5-sonnet-20241022'
 
@@ -131,9 +133,9 @@ def load_instance_data(instance_id: str):
             instance = item
             break
 
-    instance['conda_env_name'] = instance_id.split('-')[0] + '__' + instance['version']
+    instance['conda_env_name'] = '-'.join(instance_id.split('-')[:-1]) + '__' + instance['version']
 
-    owner_proj_name = (instance_id.split('-')[0]).replace('__', '/')
+    owner_proj_name = ('-'.join(instance_id.split('-')[:-1])).replace('__', '/')
     
     instance['conda_env_install_cmd'] = MAP_VERSION_TO_INSTALL[owner_proj_name][instance['version']]['install']
 
@@ -157,8 +159,18 @@ def load_instance_data(instance_id: str):
     return instance
 
 
+# def exec_debugging_test_with_limited_length(instance: dict, file_scope_dict=None, depth=2, loop=None):
+#     if loop:
+#         return exec_debugging_test(instance, file_line_dict, depth = 1)
+#     else:
+#         output = exec_debugging_test(instance, file_line_dict, depth = 1)
+#         encoding = tiktoken.get_encoding("cl100k_base")
+#         token_len =  len(encoding.encode(output))
+#         if token_len > 2000:
+            
 
-def gen_debugging_test(instance: dict, debugging_agent: object) -> str:
+
+def gen_debugging_test(instance: dict, debugging_agent: LLMModel) -> str:
     # reproduce_test_path = Path(f"/data/SWE/SRC/approach/data/claude_reproduce_test/{instance['instance_id']}.py")
     # with open(reproduce_test_path, 'r') as f:
     #     reproduce_test_code = f.read()
@@ -182,7 +194,7 @@ def gen_debugging_test(instance: dict, debugging_agent: object) -> str:
 
     log_and_print('gen_debugging_test')
 
-    gen_debugging_test_response = debugging_agent.query_model(gen_debugging_test_prompt, retain_memory=True, json_flag=True)
+    gen_debugging_test_response = debugging_agent.query_model(gen_debugging_test_prompt, flag_type='json')
 
     debugging_test_instruction = extract_json_instruction(gen_debugging_test_response)
     
@@ -283,27 +295,28 @@ def extract_runtime_info(instance, debugging_instruction: list) -> dict:
         else:
             start_line = end_line = int(observe_range)
         
-        obs_file_path = str(instance['testbed_src_path'] / file_path)
-        runtime_info[obs_file_path] = (start_line, end_line)
+        abs_file_path = str(instance['testbed_src_path'] / file_path)
+        runtime_info[abs_file_path] = (start_line, end_line)
 
     log_and_print(runtime_info)
     return runtime_info
 
 
 def analyse_debugging_test(instance: dict, debugging_agent: LLMModel, debugging_test_exec_result):
-    start_debugging_prompt = START_DEBUGGING.format(
+    start_debugging_prompt = ANALYSE_TEST.format(
         debugging_test_exec_result = debugging_test_exec_result
     )
 
     log_and_print('start_debugging')
 
-    start_debugging_response = debugging_agent.query_model(start_debugging_prompt, retain_memory=True, json_flag=True)
+    start_debugging_response = debugging_agent.query_model(start_debugging_prompt, flag_type='json')
 
     start_debugging_instruction = extract_json_instruction(start_debugging_response)
 
     if not start_debugging_instruction['is_debugging_test_successfully_generated']:
         raise ValueError("Debugging test was not successfully generated.")
     
+    #TODO the regenerate process 
     # if retain_memory and self.memory.chat_memory.messages:
     #     messages = self.memory.chat_memory.messages.copy()
     # else:
@@ -314,45 +327,92 @@ def analyse_debugging_test(instance: dict, debugging_agent: LLMModel, debugging_
 
     return start_debugging_instruction
 
+def update_history(history: str, new_entry: str) -> str:
+    new_history = history + new_entry + '\n' + '='*50 + '\n'
+    return new_history
 
-def remove_runtime_info_code(debugging_agent: object):
-    pattern = r'<runtime-info>.*?</runtime-info>'
-    modified = debugging_agent.modify_memory_content(
-        target_pattern=pattern,
-        replacement="", 
-    )
-    log_and_print(f'remove_runtime_info_code: Modify {modified} runtime-info code')
+def get_method_from_name(instance: dict, file_name: str, method_name: str) -> str:
+    if not os.path.exists(file_name):
+        abs_file_path = instance['testbed_src_path'] / file_name
+    else:
+        abs_file_path = file_name
+    retrieve_result = retrieve_code_and_comment(abs_file_path, method_name)
+    return retrieve_result
+    
+    
+def deep_dive_debugging(instance: dict, debugging_agent: LLMModel, debugging_test_exec_result: str, reproduce_test_code: str):
 
-
-def deep_dive_debugging(instance: dict, debugging_agent: object, debugging_instruction: dict):
-
+    debugging_agent.clear_memory()
+    initial_debugging_prompt = DEBUGGING_START_AFTER_TESTING.format(
+        project=instance['repo'].split('/')[1],
+        issue=instance['problem_statement'],
+        test_code = reproduce_test_code,
+        terminal_output = debugging_test_exec_result
+    ) + CHOOSE_METHOD_INSTRUCT
+    model_response = debugging_agent.query_model(initial_debugging_prompt, flag_type='choose_method', instance = instance)
+    history = '\n' + '='*50 + '\n' + model_response + '\n' + '='*50 + '\n'
     debugging_depth = 1
-
-    while debugging_instruction['move_to_step_3'] != 'True' and debugging_depth < 6:
-
-        review_src_str = get_review_src(instance, debugging_instruction)
-
-        # remove previous runtime-info memory in llm
-        remove_runtime_info_code(debugging_agent)
-        
-        runtime_info = extract_runtime_info(instance, debugging_instruction)
-
-        debugging_test_exec_result = exec_debugging_test(instance, runtime_info)
-
-        debugging_loop_prompt = DEBUGGING_LOOP.format(
-            debugging_test_exec_result = debugging_test_exec_result,
-            review_src=review_src_str
-        )
-
+    begin_prompt = BEGIN_INTRO.format(
+        project = instance['repo'].split('/')[1],
+        issue = instance['problem_statement'],
+        test_code = reproduce_test_code
+    )
+    
+    while debugging_depth < 6:
         log_and_print(f'deep_dive_debugging depth: {debugging_depth}')
-
-        debugging_loop_response = debugging_agent.query_model(debugging_loop_prompt, retain_memory=True, json_flag=True)
-
-        debugging_instruction = extract_json_instruction(debugging_loop_response)
-
+        trace_reply = extract_trace_reply(model_response)
+        if trace_reply['type'].lower() == 'buggy method':
+            log_and_print(f'choose buggy method: {trace_reply["file"]}:{trace_reply["method"]}')
+            return trace_reply['file'], trace_reply['method'], history
+        else:
+            observed_method = trace_reply['method']
+            observed_file = trace_reply['file']
+        observed_method_info = get_method_from_name(instance, observed_file, observed_method)
+        observed_file = str(observed_method_info['path'])
+        observed_method_code = observed_method_info['code']
+        file_line_dict = {observed_file: (observed_method_info['start_line'], observed_method_info['end_line'])}
+        observed_method = observed_method_info['name']
+        
+        log_and_print(f'choose method: {observed_file}:{observed_method}')
+        ## chose scope
+        test_exec_result = exec_debugging_test(instance, file_line_dict, depth = 1)
+        
+        choose_scope_prompt = begin_prompt + DEBUGGING_CHOOSE_SCOPE.format(
+            history = history,
+            observe_method = observed_method,
+            method_code = observed_method_code,
+            runtime_info = test_exec_result
+        ) + CHOOSE_SCOPE_INSTRUCT
+        model_response = debugging_agent.query_model(choose_scope_prompt, flag_type='choose_scope', instance = instance)
+        history = update_history(history, model_response)
+        trace_reply = extract_trace_reply(model_response)
+        if trace_reply['type'].lower() == 'buggy method':
+            log_and_print(f'choose buggy method: {trace_reply["file"]}:{trace_reply["method"]}')
+            return trace_reply['file'], trace_reply['method'], history
+        
+        ## chose method
+        observed_file = trace_reply['file']
+        observed_start_line = trace_reply['start_line']
+        observed_end_line = trace_reply['end_line']
+        
+        log_and_print(f'choose scope: {observed_file}:{observed_start_line}-{observed_end_line}')
+        
+        method_info = get_method_from_name(instance, observed_file, f'{observed_start_line}-{observed_end_line}')
+        code_snippet = method_info['code']
+        observed_file = str(method_info['path'])
+        file_line_dict = {observed_file: (observed_start_line, observed_end_line)}
+        test_exec_result = exec_debugging_test(instance, file_line_dict, depth = 2)
+        choose_method_prompt = begin_prompt + DEBUGGING_CHOOSE_METHOD.format(
+            history = history,
+            observe_method = observed_method,
+            code_snippet = code_snippet,
+            runtime_info = test_exec_result
+        ) + CHOOSE_METHOD_INSTRUCT
+        model_response = debugging_agent.query_model(choose_method_prompt, flag_type='choose_method', instance=instance)
+        history = update_history(history, model_response)
         debugging_depth += 1
-
-    return
+        
+    return None, None, None
 
 
 def apply_patch(instance: dict, debugging_instruction: dict):
@@ -373,7 +433,7 @@ def apply_patch(instance: dict, debugging_instruction: dict):
     """
     edits = debugging_instruction.get("search_replace_edits", [])
     # save edits in log dir
-    with open(f'/data/swe-fl/SRC/DebuggingAgent/log/{instance["instance_id"]}_edits.log', 'w') as f:
+    with open(f'/data/swe-fl/SRC/DebuggingAgent/log/{instance["instance_id"]}/{instance["instance_id"]}_edits.log', 'w') as f:
         f.write('\n'.join(edits))
     # Group edits by file path
     file_edits = {}
@@ -401,8 +461,10 @@ def apply_patch(instance: dict, debugging_instruction: dict):
 
     # Process each file
     for file_path, edits in file_edits.items():
-        abs_path = instance['testbed_src_path'] / file_path
-        
+        if not os.path.exists(file_path):
+            abs_path = instance['testbed_src_path'] / file_path
+        else:
+            abs_path = file_path
         if not abs_path.exists():
             log_msg(f"File not found: {abs_path}")
             raise FileNotFoundError(f"File not found: {abs_path}")
@@ -414,11 +476,56 @@ def apply_patch(instance: dict, debugging_instruction: dict):
         # Apply edits sequentially
         modified = content
         for search, replace in edits:
-            if search not in modified:
+            if search in modified:
+                modified = modified.replace(search, replace, 1)  # Replace first occurrence
+                continue
+            # Normalize and strip for matching
+            modified_lines = modified.split('\n')
+            modified_stripped_lines = [line.strip() for line in modified_lines]
+            modified_normalized = '\n'.join(modified_stripped_lines)
+
+            search_lines = search.split('\n')
+            search_stripped_lines = [line.strip() for line in search_lines]
+            search_normalized = '\n'.join(search_stripped_lines)
+
+            if search_normalized in modified_normalized:
+                for i in range(len(modified_lines) - len(search_lines) + 1):
+                    window = modified_lines[i:i+len(search_lines)]
+                    window_stripped = [line.strip() for line in window]
+                    if '\n'.join(window_stripped) == search_normalized:
+                        # 计算最小缩进
+                        indent_levels = [
+                            len(line) - len(line.lstrip())
+                            for line in window if line.strip() != ''
+                        ]
+                        min_indent = min(indent_levels) if indent_levels else 0
+
+                        # 应用缩进到 replace 块
+                        replace_lines = replace.split('\n')
+                        
+                        replace_indent_levels = [
+                            len(line) - len(line.lstrip())
+                            for line in replace_lines if line.strip() != ''
+                        ]
+                        replace_min_indent = min(replace_indent_levels) if replace_indent_levels else 0
+
+                        # 去除原有缩进后再加上目标缩进
+                        adjusted_replace = '\n'.join(
+                            (' ' * min_indent + line[replace_min_indent:] if line.strip() != '' else '')
+                            for line in replace_lines
+                        )
+                        # 替换原内容
+                        modified_lines = (
+                            modified_lines[:i] +
+                            adjusted_replace.split('\n') +
+                            modified_lines[i+len(search_lines):]
+                        )
+                        modified = '\n'.join(modified_lines)
+                        log_and_print('fuzzy search matched and replaced')
+                        break
+            else:
                 log_msg(f"Search block not found in {file_path}:\n{search}")
-                raise ValueError("Search pattern not found in file")
-            
-            modified = modified.replace(search, replace, 1)  # Replace first occurrence
+                raise ValueError("Search pattern not found in file.")
 
         # Create backup if needed
         backup_path = abs_path.with_suffix(abs_path.suffix + '.bak')
@@ -434,82 +541,99 @@ def apply_patch(instance: dict, debugging_instruction: dict):
 
 
 
-def modify_code_resolve_issue(instance: dict, debugging_agent: object):
-    
-    modify_src_prompt = MODIFY_SOURCE_CODE
+def modify_code_resolve_issue(instance: dict, debugging_agent: LLMModel, file_path: str, method: str, history: str, test_code: str):
+    method_code = get_method_from_name(instance, file_path, method)['code']
+    modify_src_prompt = MODIFY_SOURCE_CODE_HEAD.format(
+        project = instance['repo'].split('/')[1],
+        issue = instance['problem_statement'],
+        test_code = test_code,
+        history = history,
+        method_name = method,
+        method_code = method_code
+    ) + MODIFY_SOURCE_CODE_INSTRUCT
     
     log_and_print('modify_src')
 
-    modify_src_response = debugging_agent.query_model(modify_src_prompt, retain_memory=True, json_flag=True)
+    success = False
+    retries = 0
+    while retries < 3:
+        try:
+            modify_src_response = debugging_agent.query_model(modify_src_prompt, flag_type='json')
 
-    modify_src_instruction = extract_json_instruction(modify_src_response)
+            modify_src_instruction = extract_json_instruction(modify_src_response)
+            apply_patch(instance, modify_src_instruction)
+            success = True
+            break
+        except Exception as e:
+            log_and_print(f"Error applying patch: {str(e)}, Retrying..")
+            if modify_src_instruction:
+                modify_src_prompt += f"\nERROR! Your Reponse: {modify_src_instruction}.\nYour response format is invalid: {str(e)}\nPlease try again.\n"
+                modify_src_prompt += MODIFY_SOURCE_CODE_INSTRUCT
+            retries += 1
 
-    apply_patch(instance, modify_src_instruction)
-
+    if not success:
+        log_and_print("Failed to apply patch after multiple attempts.")
+        raise ValueError("Failed to apply patch after multiple attempts.")
     # TODO: should we apply review stage like tools+claude?
 
-
-    pass
 
 
 
 def debugging_process(instance: dict):
     
-    debugging_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG)
+    debugging_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
     
-
-    # Step 1: generate debugging test
     debugging_test_instruction = gen_debugging_test(instance, debugging_agent)
-    
+
+    reproduce_test_code = debugging_test_instruction['debugging_test']
     write_debugging_test(instance, debugging_test_instruction)
 
     debugging_test_exec_result = exec_debugging_test(instance)
 
+    file_path, method, history = deep_dive_debugging(instance, debugging_agent, debugging_test_exec_result, reproduce_test_code)
+    if file_path is None:
+        raise ValueError("Failed to locate buggy method")
 
-    # Step 2: start debugging (first analyse if debugging test is successfully generated)
-    start_debugging_instruction = analyse_debugging_test(instance, debugging_agent, debugging_test_exec_result)
-    
-    deep_dive_debugging(instance, debugging_agent, start_debugging_instruction)
+    modify_code_resolve_issue(instance, debugging_agent, file_path, method, history, reproduce_test_code)
 
-    
-    # Step 3: modify source code 
-    # First review the code range you want to modify: +-5 line
-    # Then modify the code with range 
-    # Finally review the code change.
+def evaluation(instance: dict):
+    cmd = f"cd {instance['testbed_src_path']} && conda run -n {instance['conda_env_name']} {instance['test_cmd']}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-    modify_code_resolve_issue(instance, debugging_agent)
-     
+    log_and_print(result.stdout + result.stderr)
+ 
     
 
 def main():
 
     instance_id = 'astropy__astropy-12907'
-    log_path = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}.log")
-    
-    detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/chat")
+    detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}/chat")
     if os.path.exists(detailed_chat_dir):
         shutil.rmtree(detailed_chat_dir)
+    log_path = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}/{instance_id}.log")
+
     
     init_logger(log_path)
     
     print('start load_instance_data')
     instance = load_instance_data(instance_id)
-
-    # DEBUG
-    print('start init_instance_testbed')
-    init_instance_testbed(instance)
+    
+    # print('start init_instance_testbed')
+    # init_instance_testbed(instance)
+    
     print('start debugging_process')
-
     debugging_process(instance)
-
+    
+    evaluation(instance)
 
 
     # reproduce_issue(instance)
     # get_covered_filetree(instance)
 
-
-
-    
+# astropy__astropy-13579 
+# astropy__astropy-14096
+# astropy__astropy-8872
+# astropy__astropy-13453 fail
     pass
 
 

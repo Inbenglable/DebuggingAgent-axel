@@ -1,5 +1,109 @@
 DEBUGGING_AGENT_SYSTEM_MSG = 'You are a debugging agent tasked with precisely using tools to resolve issues and submit pull requests.'
 
+DEBUGGING_START_AFTER_TESTING = '''
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **{project}** project:
+#### ISSUE
+{issue}
+
+Based on this issue, the testing agent has generated a reproducible test:
+{test_code}
+
+This is the corresponding output and runtime information:
+{terminal_output}
+
+'''
+
+CHOOSE_METHOD_INSTRUCT = '''
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+'''
+
+# CHOOSE_METHOD_INSTRUCT = '''
+# You need to trace the abnormal program behavior step by step to identify the root cause and locate the buggy method—the one containing the code that needs to be fixed.
+# Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
+# Now, please first analyze the current observed code and the abnormal program behavior. 
+
+CHOOSE_SCOPE_INSTRUCT = '''
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+'''
+
+
+BEGIN_INTRO = '''
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **{project}** project:
+#### ISSUE
+{issue}
+
+Based on this issue, the testing agent has generated a reproducible test:
+{test_code}
+
+'''
+
+DEBUGGING_CHOOSE_SCOPE = '''
+This is the tracing and analysis history:
+{history}
+
+Now you choose downstream method {observe_method} to further observe, tracing the abnormal program behavior.
+This is the method code:
+{method_code}
+
+This is the runtime information of {observe_method}:
+
+{runtime_info}
+
+'''
+
+DEBUGGING_CHOOSE_METHOD = '''
+This is the tracing and analysis history:
+{history}
+
+Now you choose {observe_method}'s code snippet 
+{code_snippet}
+for further observation, tracing the abnormal program behavior.
+
+This is the runtime information of the code snippet you choose to observed in {observe_method}:
+
+{runtime_info}
+
+'''
+
+ANALYSE_TEST = '''
+This is the output from running the debugging test. Next, you need to determine whether the debugging test was executed correctly.
+
+{debugging_test_exec_result}
+
+- **If the debugging test was generated successfully**, proceed to **Step 2**:
+- **If the debugging test was not generated successfully**, please regenerate it.
+
+Your analysis should be thorough, and it's acceptable for it to be very detailed.
+
+In **Step 2**, you will perform multiple iterative steps to progressively resolve the issue.
+
+At the end of your analysis, provide the specific information in the following JSON format:
+
+
+{{
+    "is_debugging_test_successfully_generated": "True/False",
+    "debugging_test": "YOUR TEST CODE if the previous was not successfully generated",
+}}
+
+'''
 
 
 GEN_DEBUGGING_TEST = '''
@@ -8,7 +112,7 @@ You are a debugging agent tasked with precisely using tools to resolve issues an
 
 **Current Task:**  
 Resolve the following issue in the {project} project:
-
+#### ISSUE
 {issue}
 
 Based on this issue, the testing agent has generated a reproducible test:
@@ -37,118 +141,24 @@ Note: You should clearly specify the tests you are debugging as much as possible
 '''
 
 
+MODIFY_SOURCE_CODE_HEAD = '''
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **{project}** project:
+#### ISSUE
+{issue}
 
-START_DEBUGGING = '''
-This is the output from running the debugging test. Next, you need to determine whether the debugging test was executed correctly.
+Based on this issue, the testing agent has generated a reproducible test that can trigger the bug:
+{test_code}
 
-<runtime-info>
-{debugging_test_exec_result}
-</runtime-info>
-- **If the debugging test was generated successfully**, proceed to **Step 2**:
-  - Select the functions or classes whose source code and dynamic runtime information assist you in deeper debugging.
+This is the tracing and analysis history of how we tracing and locating the buggy method and the root cause:
+{history}
 
-- **If the debugging test was not generated successfully**, please regenerate it.
+Now, you need to fix the buggy method {method_name}, whose method code is as follow:
+{method_code}
 
-
-Your analysis should be thorough, and it's acceptable for it to be very detailed.
-
-In **Step 2**, you will perform multiple iterative debugging steps to progressively find out the root cause.
-
-- Avoid wasting context:
-
-Iterate through debugging without repeatedly reading the same source code.
-Avoid observing identical runtime information multiple times.
-
-- Handling Long Source Code:
-
-A code skeleton will be provided if the source code is too lengthy.
-Use the skeleton's line number ranges to identify specific sections to review.
-
-- Adding to runtime_info:
-
-Review relevant code sections before adding them for monitoring.
-This ensures you select appropriate ranges and avoid excessive output.
-
-
-At the end of your analysis, provide the specific information in the following JSON format:
-
-
-{{
-    "is_debugging_test_successfully_generated": "True/False",
-    "debugging_test": "YOUR TEST CODE if the previous was not successfully generated",
-    "review_src": ["FILE_PATH:METHOD", "FILE_PATH:CLASS", "FILE_PATH:LINE_A-LINE_B"],
-    "runtime_info": ["FILE_PATH:LINE_A-LINE_B"]
-}}
-
-Please note that FILE_PATH refers to the path relative to the repository.
-Format: `FILE_PATH:LINE_A-LINE_B` -> Example: `src/model.py:10-20`.  Note that runtime_info can only accept an exact line number as input. 
 '''
 
-
-# "review_src": ["FILE_PATH:METHOD", "FILE_PATH:CLASS", "FILE_PATH:LINE_A-LINE_B"],
-DEBUGGING_LOOP = '''
-This is the run time information you want to observe:
-
-<runtime-info>
-{debugging_test_exec_result}
-</runtime-info>
-
-And here is the source code of your `review_src` list. Note that if the review_src is too long, the skeleton of the code will be provided, you can further specify the range of the code you want to review.
-
-{review_src}
-
-First, analyze the source code and the runtime information you intend to observe.
-
-It's recommended to gather more information and remain in **Step 2** multiple times. 
-
-Note that you should:
-
-- Avoid wasting context:
-
-Iterate through debugging without repeatedly reading the same source code.
-Avoid observing identical runtime information multiple times.
-
-- Handling Long Source Code:
-
-A code skeleton will be provided if the source code is too lengthy.
-Use the skeleton's line number ranges to identify specific sections to review.
-
-- Adding to runtime_info:
-
-Review relevant code sections before adding them for monitoring.
-This ensures you select appropriate ranges and avoid excessive output.
-
-
-- **Condition to stay in Step 2:**
-  If you are not ready to resolve the issue by modifying the source code, continue with **Step 2** by selecting the functions or classes whose source code and dynamic runtime information you wish to examine for deeper debugging.
-    - Set `move_to_step_3` to 'False'.
-    - Ensure that you do not repeat the same `review_src` and `runtime_info` lists, as they will be identical to the previous ones and will consume a large amount of context.
-
-- **Condition to move to Step 3:**
-
-  You must have completely reviewed the code that needs to be modified before proceeding.
-  If you are ready to resolve the issue by precisely modifying the source code, you can move to Step 3.
-
-  - Set move_to_step_3 to True.
-  - Set review_src and runtime_info to NULL.
-
-
-
-**Before adding code to `runtime_info` for monitoring, ensure you have reviewed the relevant sections. This prevents selecting overly large ranges and generating excessive output.**
-
-At the end of your analysis, provide the specific information in the following JSON format:
-
-{{
-    "move_to_step_3": "True/False",
-    "review_src": ["FILE_PATH:METHOD", "FILE_PATH:CLASS", "FILE_PATH:LINE_A-LINE_B"],
-    "runtime_info": ["FILE_PATH:LINE_A-LINE_B"]
-}}
-Format: `FILE_PATH:LINE_A-LINE_B` -> Example: `src/model.py:10-20`. Note that runtime_info **can only accept an exact line number as input**. 
-'''
-
-
-
-MODIFY_SOURCE_CODE = '''
+MODIFY_SOURCE_CODE_INSTRUCT = '''
 Please ensure that your patch does not disrupt the original functionality of the code.
 Generate *SEARCH/REPLACE* patches to fix the issue.
 
@@ -160,7 +170,7 @@ Every *SEARCH/REPLACE* edit must use this format:
 5. The lines to replace into the source code
 6. The end of the replace block: >>>>>>> REPLACE
 
-Here is an example:
+Here is an example of a *SEARCH/REPLACE* edit:
 
 ```python
 ### mathweb/flask/app.py
@@ -173,12 +183,12 @@ from flask import Flask
 ```
 
 At the end of your analysis, provide edit result in the following JSON format:
-{{
+{
   "search_replace_edits": [
-    "edit_1",
-    "edit_2"
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
   ]
-}}
+}
 '''
 
 # '''

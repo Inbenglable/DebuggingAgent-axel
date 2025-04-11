@@ -85,8 +85,13 @@ def generate_skeleton(file: str, name: str) -> str:
     """
     code_map = method_and_class_ranges_in_file(file)
     if name not in code_map:
-        print(f"No matching class/method found for name: {name} in file: {file}")
-        return ""
+        for map_name in code_map:
+            name_last = map_name.split('.')[-1]
+            if name == name_last:
+                name = map_name
+        if name not in code_map:
+            print(f"No matching class/method found for name: {name} in file: {file}")
+            return ""
 
     element_info = code_map[name]
     with open(file, 'r') as f:
@@ -315,8 +320,13 @@ def retrieve_code_and_comment(file: str, name: str, skeleton: bool = False):
 
     code_map = method_and_class_ranges_in_file(file)
     if name not in code_map:
-        print(f"No matching method/class or valid line range found for name: {name} in file: {file}")
-        return {}
+        for map_name in code_map:
+            name_last = map_name.split('.')[-1]
+            if name == name_last:
+                name = map_name
+        if name not in code_map:
+            print(f"No matching method/class or valid line range found for name: {name} in file: {file}")
+            return {}
 
     element_info = code_map[name]
 
@@ -361,3 +371,5 @@ if __name__ == '__main__':
 
         else:
             print("No code retrieved.")
+
+# print(method_and_class_ranges_in_file('/data/swe-fl/TMP/testbed/scikit-learn__scikit-learn-14894/sklearn/svm/libsvm_sparse.pyx'))

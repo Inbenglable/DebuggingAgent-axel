@@ -1,0 +1,163 @@
+You are a debugging agent tasked with precisely using tools to resolve issues and submit pull requests.
+
+You are a debugging agent that traces the abnormal program to resolve project issues and submit pull requests.
+Here is an issue in the django project:
+add ModelAdmin.get_inlines() hook to allow set inlines based on the request or model instance.
+Description
+	
+add ModelAdmin.get_inlines() hook to allow set inlines based on the request or model instance.
+Currently, We can override the method get_inline_instances to do such a thing, but a for loop should be copied to my code. So I wished add a hook get_inlines(request, obj=None)
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import django
+from django.test import TestCase, RequestFactory
+from django.contrib import admin
+from django.db import models
+
+# Sample Model
+class Book(models.Model):
+    title = models.CharField(max_length=100)
+
+class Chapter(models.Model):
+    book = models.ForeignKey(Book, on_delete=models.CASCADE)
+    name = models.CharField(max_length=100)
+
+# ModelAdmin with a new get_inlines hook
+def inline_hook(request, obj=None):
+    if obj and obj.title.startswith('A'):
+        return [ChapterInline]
+    return []
+
+class BookAdmin(admin.ModelAdmin):
+    inlines = []
+
+    def get_inlines(self, request, obj=None):
+        return inline_hook(request, obj)
+
+class ChapterInline(admin.TabularInline):
+    model = Chapter
+
+# Register the model admin
+admin.site.register(Book, BookAdmin)
+
+# Test case
+class GetInlinesHookTest(TestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+
+    def test_get_inlines_hook(self):
+        # Create a sample book and request
+        book = Book.objects.create(title="A Book")
+        request = self.factory.get('/admin/app/book/')
+        admin_site = admin.site._registry[Book]
+
+        # Check if the inlines are returned properly
+        inlines = admin_site.get_inlines(request, book)
+        self.assertEqual(inlines, [ChapterInline])
+
+        # Create another book
+        another_book = Book.objects.create(title="Another Book")
+
+        # Check if the inlines are not returned for this book
+        inlines_none = admin_site.get_inlines(request, another_book)
+        self.assertEqual(inlines_none, [])
+
+
+
+This is the tracing and analysis history:
+Based on the observed error, it seems the test script is encountering an `ImproperlyConfigured` exception. This exception is raised when Django attempts to access settings, in this case, `INSTALLED_APPS`, but the Django settings have not been properly configured. The error suggests that the environment variable `DJANGO_SETTINGS_MODULE` has not been set, or the settings have not been configured using `settings.configure()`.
+
+This is a common issue when running Django tests or scripts outside of the standard environment where `DJANGO_SETTINGS_MODULE` would usually be set to point to an existing settings file, typically in `manage.py` or `wsgi.py`. 
+
+Considering this, the script should be configured to use Django settings before any model definitions or imports that rely on Django settings. This can usually be done at the beginning of the script.
+
+The observed abnormal behavior leads us to first ensure the Django settings configuration is correct before proceeding to deeper issues related to the hook implementation.
+
+Observed method: `django/conf/__init__.py:_setup`
+
+Now you choose downstream method LazySettings._setup to further observe, tracing the abnormal program behavior.
+This is the method code:
+    48	    def _setup(self, name=None):
+    49	        """
+    50	        Load the settings module pointed to by the environment variable. This
+    51	        is used the first time settings are needed, if the user hasn't
+    52	        configured settings manually.
+    53	        """
+    54	        settings_module = os.environ.get(ENVIRONMENT_VARIABLE)
+    55	        if not settings_module:
+    56	            desc = ("setting %s" % name) if name else "settings"
+    57	            raise ImproperlyConfigured(
+    58	                "Requested %s, but settings are not configured. "
+    59	                "You must either define the environment variable %s "
+    60	                "or call settings.configure() before accessing settings."
+    61	                % (desc, ENVIRONMENT_VARIABLE))
+    62	
+    63	        self._wrapped = Settings(settings_module)
+
+
+This is the runtime information of LazySettings._setup:
+
+Error occurred during script execution:Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-11095/django/conf/__init__.py
+New var:....... __module__ = 'django.conf'
+New var:....... __qualname__ = 'LazySettings'
+New var:....... __doc__ = '\n    A lazy proxy for either global Django set...dule pointed to by DJANGO_SETTINGS_MODULE.\n    '
+ line        48     def _setup(self, name=None):
+Starting var:.. self = <LazySettings [Unevaluated]>
+Starting var:.. name = 'INSTALLED_APPS'
+ call        48     def _setup(self, name=None):
+ line        54         settings_module = os.environ.get(ENVIRONMENT_VARIABLE)
+New var:....... settings_module = None
+ line        55         if not settings_module:
+ line        56             desc = ("setting %s" % name) if name else "settings"
+New var:....... desc = 'setting INSTALLED_APPS'
+ line        57             raise ImproperlyConfigured(
+ line        58                 "Requested %s, but settings are not configured. "
+ line        61                 % (desc, ENVIRONMENT_VARIABLE))
+ exception   61                 % (desc, ENVIRONMENT_VARIABLE))
+Exception:..... django.core.exceptions.ImproperlyConfigured: Req...l settings.configure() before accessing settings.
+New var:....... self = <LazySettings [Unevaluated]>
+New var:....... name = 'INSTALLED_APPS'
+New var:....... settings_module = None
+New var:....... desc = 'setting INSTALLED_APPS'
+Call ended by exception
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 14, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 12, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-11095/debugging_test.py", line 7, in <module>
+    class Book(models.Model):
+  File "/data/swe-fl/TMP/testbed/django__django-11095/django/db/models/base.py", line 103, in __new__
+    app_config = apps.get_containing_app_config(module)
+  File "/data/swe-fl/TMP/testbed/django__django-11095/django/apps/registry.py", line 252, in get_containing_app_config
+    self.check_apps_ready()
+  File "/data/swe-fl/TMP/testbed/django__django-11095/django/apps/registry.py", line 134, in check_apps_ready
+    settings.INSTALLED_APPS
+  File "/data/swe-fl/TMP/testbed/django__django-11095/django/conf/__init__.py", line 76, in __getattr__
+    self._setup(name)
+  File "/data/swe-fl/TMP/testbed/django__django-11095/django/conf/__init__.py", line 61, in _setup
+    % (desc, ENVIRONMENT_VARIABLE))
+django.core.exceptions.ImproperlyConfigured: Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

@@ -1,0 +1,150 @@
+You are a debugging agent tasked with precisely using tools to resolve issues and submit pull requests.
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+Form Field’s __deepcopy__ does not (deep)copy the error messages.
+Description
+	
+The __deepcopy__ method defined for the formfields (​https://github.com/django/django/blob/146086f219d01dbb1cd8c089b5a5667e396e1cc4/django/forms/fields.py#L200) performs a shallow copy of self and does not include additional treatment for the error_messages dictionary. As a result, all copies of the same field share the same dictionary and any modification of either the dictionary or the error message itself for one formfield is immediately reflected on all other formfiels.
+This is relevant for Forms and ModelForms that modify the error messages of their fields dynamically: while each instance of the specific form (e.g., ProfileForm) is expected to have a set of fields “sealed” away from other instances of the same ProfileForm (​https://github.com/django/django/blob/146086f219d01dbb1cd8c089b5a5667e396e1cc4/django/forms/forms.py#L95), in fact all these instances share the same error messages, resulting in incorrectly raised errors.
+Confirmed for versions of Django going back to 1.11.
+
+
+Based on this issue, the testing agent has generated a reproducible test that can trigger the bug:
+import copy
+from django.forms import CharField
+
+def minimal_deepcopy_test():
+    field = CharField(error_messages={'required': 'Original message'})
+    copied_field = copy.deepcopy(field)
+
+    # Modify the error_messages of copied_field
+    copied_field.error_messages['required'] = 'Changed message'
+
+    # Minimal output to show the difference (or lack thereof) in the error_messages
+    print('Original field error message:', field.error_messages['required'])
+    print('Copied field error message:', copied_field.error_messages['required'])
+
+    # Assert to check if deep copy worked correctly
+    assert field.error_messages['required'] != copied_field.error_messages['required'], \
+        "Error: error_messages are not deep copied!"
+
+# This function will not run automatically; it serves as a debugging utility.
+if __name__ == "__main__":
+    minimal_deepcopy_test()
+
+
+This is the tracing and analysis history of how we tracing and locating the buggy method and the root cause:
+
+==================================================
+To address the issue with `CharField` not properly deep copying error messages, let's walk through the code and identify the source of the problem.
+
+### Analysis of Abnormal Program Behavior
+
+The test script creates an instance of `CharField` with custom `error_messages`, copies it using `deepcopy`, and then modifies the error messages of the copied field. The expected behavior is that changes to the `error_messages` in the copied field should not affect the original field. However, both the original and copied fields reflect the changed error message, indicating that `error_messages` is being shared between them. This happens because `deepcopy` does not properly copy the `error_messages` dictionary.
+
+### Current Observed Code
+
+The `CharField` inherits from `Field`, which has the `__deepcopy__` method defined. This method should ensure that all relevant attributes in `Field`, including dictionaries like `error_messages`, are correctly deep copied.
+
+In the runtime stack trace, there's an invocation of the `Field.__deepcopy__` method:
+
+```plaintext
+copier = <bound method Field.__deepcopy__ of <django.forms.fields.CharField object at 0x7f41e209c2b0>>
+```
+
+This implies the `__deepcopy__` method is actively used, yet it fails to deep copy the `error_messages` attribute.
+
+### Conclusion
+
+We can deduce that the issue lies within the `__deepcopy__` method inside the `Field` class because it does not appropriately handle the deep copy of `error_messages`.
+
+### Next Step
+
+To confirm our hypothesis and pinpoint the line of code that requires modification, we should examine the method responsible for the shallow copy of `error_messages`.
+
+Observed method: `django/forms/fields.py:Field.__deepcopy__`
+==================================================
+Based on the current observed code and the abnormal program behavior, we can see that the `__deepcopy__` method for the `Field` class is not copying the `error_messages` attribute in a deep manner. 
+
+### Analysis
+- The `__deepcopy__` method performs a shallow copy of the field itself (`result = copy.copy(self)`) and specifically deep copies certain attributes like `widget` and `validators`.
+- The `error_messages` attribute, which is a dictionary, is not included in the deep copy process. This means the dictionary is shared between the original and copied fields, leading to the unexpected behavior observed in the test.
+
+### Further Tracing
+To understand how the `__deepcopy__` method handles copying of the field and identify the necessary changes, we should focus on the scope where the shallow copy (`result = copy.copy(self)`) and the specific deep copies are performed (`result.widget = copy.deepcopy(self.widget, memo)`).
+
+#### Next Step
+Let's examine this deeper to confirm the root cause in the code execution regarding the `error_messages`.
+
+Observed scope: `django/forms/fields.py:199-203`
+==================================================
+### Analysis of Current Observed Code and Abnormal Program Behavior
+
+The `__deepcopy__` method in the `Field` class creates a shallow copy of the `Field` object and individually deep copies the `widget` attribute. However, it does not handle deep copying the `error_messages` dictionary. This results in the shared `error_messages` dictionary between the original and copied `Field` objects.
+
+### Root Cause of the Bug
+
+The runtime trace confirms that the error occurs due to not performing a deep copy on the `error_messages` attribute within the `__deepcopy__` method. Each `Field` instance is expected to have its own unique set of `error_messages`, but shared dictionaries lead to unintended modifications across different instances.
+
+The issue is directly linked to the following code snippet:
+
+```python
+199	    result = copy.copy(self)
+200	    memo[id(self)] = result
+201	    result.widget = copy.deepcopy(self.widget, memo)
+202	    result.validators = self.validators[:]
+203	    return result
+```
+
+Specifically, the omission of deep copying `error_messages` leads to the bug.
+
+### Conclusion
+
+The buggy method responsible for this issue is the `__deepcopy__` in the `Field` class.
+
+Buggy method: `django/forms/fields.py:Field.__deepcopy__`
+==================================================
+
+
+Now, you need to fix the buggy method Field.__deepcopy__, whose method code is as follow:
+   198	    def __deepcopy__(self, memo):
+   199	        result = copy.copy(self)
+   200	        memo[id(self)] = result
+   201	        result.widget = copy.deepcopy(self.widget, memo)
+   202	        result.validators = self.validators[:]
+   203	        return result
+
+
+
+Please ensure that your patch does not disrupt the original functionality of the code.
+Generate *SEARCH/REPLACE* patches to fix the issue.
+
+Every *SEARCH/REPLACE* edit must use this format:
+1. The file path
+2. The start of search block: <<<<<<< SEARCH
+3. A contiguous chunk of lines to search for in the existing source code
+4. The dividing line: =======
+5. The lines to replace into the source code
+6. The end of the replace block: >>>>>>> REPLACE
+
+Here is an example of a *SEARCH/REPLACE* edit:
+
+```python
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+At the end of your analysis, provide edit result in the following JSON format:
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+

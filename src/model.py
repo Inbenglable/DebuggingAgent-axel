@@ -2,7 +2,7 @@ import os
 import re
 import json
 import time
-
+import tiktoken
 from pathlib import Path
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,19 +11,49 @@ from typing import Optional
 from httpx import RemoteProtocolError, HTTPError
 
 from swe_log import log_msg, log_and_print, init_logger
+from retrieve_src import retrieve_code_and_comment
 
 # Set OpenAI API key and base URL
 api_base = "https://api5.xhub.chat/v1/"  
+# api_base = "https://api.kksj.org/v1"
+# api_base = 'https://cluster1-qwen.cxpcn.site/v1'
 api_key = "sk-VrP154liNPBQ80JvAfA579Bc16E34bD7Ae6774A19cC6352e"  
+# api_key = 'sk-HC4m7yZO9mQaYIs9nCONuLQQgnc8MKGGS99GGtw7RHXaTZC8'
 
 os.environ["OPENAI_API_KEY"] = api_key
 os.environ["OPENAI_API_BASE"] = api_base  
 
+def extract_trace_reply(response: str):
 
+    # 匹配 buggy/observed method，支持带反引号和加粗 Markdown **
+    method_pattern = r"\*{0,2}([Bb]uggy [Mm]ethod|[Oo]bserved [Mm]ethod)\*{0,2}:\s*`?([^:`\n]+):([^:`\n]+)`?"
+
+    # 匹配 observed scope，可以是单行或范围，也支持加粗 key
+    scope_pattern = r"\*{0,2}[Oo]bserved [Ss]cope\*{0,2}:\s*`?([^:`\n]+):(\d+)(?:-(\d+))?`?"
+
+    if match := re.search(method_pattern, response):
+        return {
+            "type": match.group(1),
+            "file": match.group(2).strip(),
+            "method": match.group(3).strip()
+        }
+    elif match := re.search(scope_pattern, response):
+        start_line = int(match.group(2))
+        end_line = int(match.group(3)) if match.group(3) else start_line
+        return {
+            "type": "Observed scope",
+            "file": match.group(1).strip(),
+            "start_line": start_line,
+            "end_line": end_line
+        }
+    else:
+        raise ValueError("Invalid trace reply format.")
+    
+    
 def extract_json_instruction(wrapped_json_str: str) -> str:
     # ```json\nCONTENT\n```
     match_json = re.search(r'```json\s*\n(.*?)\n```', wrapped_json_str, re.DOTALL)
-    log_and_print(match_json)
+    # log_and_print(match_json)
     if match_json:
         try:
             json_obj = json.loads(match_json.group(1).strip())
@@ -36,14 +66,16 @@ def extract_json_instruction(wrapped_json_str: str) -> str:
     
 
 class LLMModel:
-    def __init__(self, model_name: str, system_message: str):
+    def __init__(self, model_name: str, system_message: str, instance):
+        self.instance = instance
         self.model = ChatOpenAI(model=model_name)
         self.system_message = system_message
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     
 
-    def query_model(self, user_message: str, retain_memory: bool = False, json_flag: bool = False) -> str:
-        
+    def query_model(self, user_message: str, retain_memory: bool = False, flag_type: str = None, instance = None) -> str:
+        encoding = tiktoken.get_encoding("cl100k_base")
+
         if retain_memory and self.memory.chat_memory.messages:
             messages = self.memory.chat_memory.messages.copy()
         else:
@@ -51,46 +83,99 @@ class LLMModel:
         
         messages.append(HumanMessage(content=user_message))
 
-        # log_and_print(user_message)
-        
+
         # Determine whether json obj is successfully generated, if not, regenerate
         success_flag = False
         response = ''
         retries = 5
 
         while not success_flag and retries > 0:
-
-            log_and_print(f'Retries left: {retries}')
             
             try:
+                start_time = time.time()
+                # input_text = ''
+                # for msg in messages:
+                #     input_text+=msg.content
+                # print(input_text)
                 query_result = self.model.invoke(messages)
 
                 response = query_result.content
-                # print(response)
 
-                if json_flag:
-                    try:
-                        extract_json_instruction(response)
-                        success_flag = True
-                    except (ValueError, json.JSONDecodeError) as e:
-                        log_msg(f"Retrying to generate a valid JSON response...\nErr: {e}")
-                        retries -= 1
-                else:
+                if not flag_type:
                     success_flag = True
+                else:
+                    if flag_type == 'json':
+                        try:
+                            extract_json_instruction(response)
+                            success_flag = True
+                        except (ValueError, json.JSONDecodeError) as e:
+                            log_and_print(f"Retrying to generate a valid JSON response...\nErr: {e}")
+                            retries -= 1
+                    elif flag_type == 'choose_method':
+                        try:
+                            trace_reply = extract_trace_reply(response)
+                            if trace_reply['type'].lower() == 'buggy method' or trace_reply['type'].lower() == 'observed method':
+                                file_name = trace_reply['file']
+                                if not os.path.exists(file_name):
+                                    abs_file_path = instance['testbed_src_path'] / file_name
+                                else:
+                                    abs_file_path = file_name
+                                if os.path.exists(abs_file_path):
+                                    retrieve_result = retrieve_code_and_comment(abs_file_path, trace_reply['method'])
+                                    if len(retrieve_result) > 0:
+                                        success_flag = True
+                            if not success_flag:
+                                raise ValueError("Invalid trace reply format.")
+                        except ValueError as e:
+                            log_and_print(f"Retrying to generate a valid METHOD CHOOSING response...\nErr: {e}")
+                            retries -= 1
+                    elif flag_type == 'choose_scope':
+                        try:
+                            trace_reply = extract_trace_reply(response)
+                            if trace_reply['type'].lower() == 'buggy method' or trace_reply['type'].lower() == 'observed scope':
+                                file_name = trace_reply['file']
+                                if not os.path.exists(file_name):
+                                    abs_file_path = instance['testbed_src_path'] / file_name
+                                else:
+                                    abs_file_path = file_name
+                                if os.path.exists(abs_file_path):
+                                    observed_start_line = trace_reply['start_line']
+                                    observed_end_line = trace_reply['end_line']
+                                    retrieve_result = retrieve_code_and_comment(abs_file_path, f'{observed_start_line}-{observed_end_line}')
+                                    if len(retrieve_result) > 0:
+                                        success_flag = True
+                            if not success_flag:
+                                raise ValueError("Invalid trace reply format.")
+                        except ValueError as e:
+                            log_and_print(f"Retrying to generate a valid SCOPE CHOOSING response...\nErr: {e}")
+                            retries -= 1
+                        
 
             except (RemoteProtocolError, HTTPError) as e:
-                log_msg(f"Connection or HTTP error occurred: {e}. Retries left: {retries}")
+                log_and_print(f"Connection or HTTP error occurred: {e}. Retries left: {retries}")
                 retries -= 1
                 time.sleep(2)  
             except Exception as e:
-                log_msg(f"An unexpected error occurred: {e}. Retries left: {retries}")
+                log_and_print(f"An unexpected error occurred: {e}. Retries left: {retries}")
                 retries -= 1
+            finally:
+                # input_text = ''
+                # for msg in messages:
+                #     input_text+=msg.content
+                # input_token_len = len(encoding.encode(input_text))
+                # output_token_len = len(encoding.encode(response))
+                end_time = time.time()
+                # print(f'input token: {input_token_len}; output token: {output_token_len}')
+                log_and_print(f"Query time: {end_time - start_time:.2f} seconds")
 
             if retries == 0:
-                log_msg("Exceeded maximum retry attempts. Raising exception.")
-                raise
-        
-        detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/chat")
+                log_and_print("Exceeded maximum retry attempts. Raising exception.")
+                raise ValueError("Exceeded maximum retry attempts.")
+
+            if not success_flag:
+                log_and_print(f'Retrying.... Times left: {retries}')
+            
+        detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{self.instance['instance_id']}/chat")
         if not detailed_chat_dir.exists():
             detailed_chat_dir.mkdir(parents=True)
         
@@ -99,19 +184,22 @@ class LLMModel:
             file_index = int(file.split("_")[0])
             if file_index > cur_index:
                 cur_index = file_index
+                
         with open(detailed_chat_dir / f"{cur_index + 1}_input.txt", "w") as f:
             for msg in messages:
+                # input_text += msg.content
                 f.write(msg.content + "\n")
         with open(detailed_chat_dir / f"{cur_index + 1}_output.txt", "w") as f:
             f.write(response + "\n")
-                
+
+
         if retain_memory:
             messages.append(HumanMessage(content=response))  
             self.memory.save_context({"input": user_message}, {"output": response})
         
-        log_and_print('='*200)
+        # log_and_print('='*200)
 
-        log_and_print(response)
+        # log_and_print(response)
 
         return response
 
