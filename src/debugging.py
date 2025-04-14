@@ -68,7 +68,6 @@ def execute_command(command: str) -> tuple:
         return e.stdout, e.stderr
 
 
-
 def init_instance_testbed(instance: dict):
     # Setup testbed for target instance
     TESTBED_DIR.mkdir(parents=True, exist_ok=True)
@@ -605,14 +604,13 @@ def evaluation(instance: dict):
     
 
 def main():
-
+    
     instance_id = 'astropy__astropy-12907'
     detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}/chat")
     if os.path.exists(detailed_chat_dir):
         shutil.rmtree(detailed_chat_dir)
     log_path = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}/{instance_id}.log")
 
-    
     init_logger(log_path)
     
     print('start load_instance_data')
@@ -625,7 +623,6 @@ def main():
     debugging_process(instance)
     
     evaluation(instance)
-
 
     # reproduce_issue(instance)
     # get_covered_filetree(instance)

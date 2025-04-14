@@ -208,3 +208,77 @@ At the end of your analysis, provide edit result in the following JSON format:
 TOO_LONG_EXEC_RESULT = '''
 The debugging test execution result is too long to display here. Please re-select your `runtime_info` lists to narrow down the scope of your analysis.
 '''
+
+REPAIR_COLLECT_HEAD = '''
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **{project}** project:
+#### ISSUE
+{issue}
+'''
+REPAIR_COLLECT_INSTRUCT = '''
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+
+Then you have two options. (Choose only one of them):
+1. If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+2. If you already have enough information, go ahead and generate the patch.
+**Important:** Once you've gathered enough code to generate the patch, stop invoking the search APIs. Retrieving too much code can cause confusion and make it harder to generate an accurate fix.
+
+### IF YOU NEED TO RETRIEVE SOURCE CODE
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method code in the specified file.
+2. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+3. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file.
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+### IF GENERATE PATCH
+Once you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready for patch generation: `True` 
+'''
+
+
+
+# ### IF GENERATE PATCH
+# If you already have the necessary information, generate the patch instead of using the search APIs.
+# Ensure your patch preserves the original functionality of the code.
+# You should generate *SEARCH/REPLACE* patches to fix the issue.
+# Every *SEARCH/REPLACE* edit must use this format:
+# 1. The file path
+# 2. The start of search block: <<<<<<< SEARCH
+# 3. A contiguous chunk of lines to search for in the existing source code
+# 4. The dividing line: =======
+# 5. The lines to replace into the source code
+# 6. The end of the replace block: >>>>>>> REPLACE
+
+# Here is an example of a *SEARCH/REPLACE* edit:
+
+# ```python
+# ### mathweb/flask/app.py
+# <<<<<<< SEARCH
+# from flask import Flask
+# =======
+# import math
+# from flask import Flask
+# >>>>>>> REPLACE
+# ```
+
+# You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
+# {
+#   "search_replace_edits": [
+#     "{SEARCH_REPLACE_EDIT_1}",
+#     "{SEARCH_REPLACE_EDIT_2}",
+#   ]
+# }

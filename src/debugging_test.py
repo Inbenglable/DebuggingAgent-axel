@@ -14,7 +14,7 @@ from retrieve_src import retrieve_code_and_comment
 from decorator_manager import modify_decorators_libcst
 from prompt import GEN_DEBUGGING_TEST, DEBUGGING_AGENT_SYSTEM_MSG, \
     ANALYSE_TEST, MODIFY_SOURCE_CODE_HEAD, MODIFY_SOURCE_CODE_INSTRUCT, TOO_LONG_EXEC_RESULT, DEBUGGING_START_AFTER_TESTING, \
-    CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD
+    CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD, REPAIR_COLLECT_HEAD, REPAIR_COLLECT_INSTRUCT
 
 sys.path.append(os.path.abspath('/data/swe-fl/SRC/SWE-Bench-Validation/src'))
 from utils import get_test_directives
@@ -331,7 +331,7 @@ def update_history(history: str, new_entry: str) -> str:
     new_history = history + new_entry + '\n' + '='*50 + '\n'
     return new_history
 
-def get_method_from_name(instance: dict, file_name: str, method_name: str) -> str:
+def get_element_from_name(instance: dict, file_name: str, method_name: str) -> str:
     if not os.path.exists(file_name):
         abs_file_path = instance['testbed_src_path'] / file_name
     else:
@@ -367,7 +367,7 @@ def deep_dive_debugging(instance: dict, debugging_agent: LLMModel, debugging_tes
         else:
             observed_method = trace_reply['method']
             observed_file = trace_reply['file']
-        observed_method_info = get_method_from_name(instance, observed_file, observed_method)
+        observed_method_info = get_element_from_name(instance, observed_file, observed_method)
         observed_file = str(observed_method_info['path'])
         observed_method_code = observed_method_info['code']
         file_line_dict = {observed_file: (observed_method_info['start_line'], observed_method_info['end_line'])}
@@ -397,7 +397,7 @@ def deep_dive_debugging(instance: dict, debugging_agent: LLMModel, debugging_tes
         
         log_and_print(f'choose scope: {observed_file}:{observed_start_line}-{observed_end_line}')
         
-        method_info = get_method_from_name(instance, observed_file, f'{observed_start_line}-{observed_end_line}')
+        method_info = get_element_from_name(instance, observed_file, f'{observed_start_line}-{observed_end_line}')
         code_snippet = method_info['code']
         observed_file = str(method_info['path'])
         file_line_dict = {observed_file: (observed_start_line, observed_end_line)}
@@ -542,7 +542,7 @@ def apply_patch(instance: dict, debugging_instruction: dict):
 
 
 def modify_code_resolve_issue(instance: dict, debugging_agent: LLMModel, file_path: str, method: str, history: str, test_code: str):
-    method_code = get_method_from_name(instance, file_path, method)['code']
+    method_code = get_element_from_name(instance, file_path, method)['code']
     modify_src_prompt = MODIFY_SOURCE_CODE_HEAD.format(
         project = instance['repo'].split('/')[1],
         issue = instance['problem_statement'],
@@ -602,14 +602,76 @@ def evaluation(instance: dict):
 
     log_and_print(result.stdout + result.stderr)
  
+
+
+# def is_api_invocation_mode(text: str) -> bool:
+#     pattern = r"```python\s+.*?```"
+#     return bool(re.search(pattern, text, flags=re.DOTALL))
+
+def extract_function_call(text):
+    function_names = {"search_method_in_file", "search_class_in_file", "search_code_in_file"}
+    results = []
+    text = '\n'.join(line.strip() for line in text.splitlines() if line.strip())
+    # Wrap the code in a dummy function to make it parsable
+    code = f"def _():\n{textwrap.indent(text, '    ')}"
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name in function_names:
+                args = []
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant):  # For Python 3.8+
+                        args.append(arg.value)
+                    elif isinstance(arg, ast.Str):  # For Python <3.8
+                        args.append(arg.s)
+                    else:
+                        args.append(ast.unparse(arg))  # fallback
+                results.append({
+                    "function": func_name,
+                    "args": args
+                })
+
+    return results
+
+def function_invoke(function_call_dict):
+    function_name = function_call_dict['function']
+    args = function_call_dict['args']
     
+    if function_name == 'search_method_in_file' or function_name == 'search_class_in_file':
+        file_path, method_name = args
+        return get_element_from_name(instance, file_path, method_name)
+
+    elif function_name == 'search_code_in_file':
+        file_path, code_snippet = args
+        return get_code_from_file(instance, file_path, code_snippet)
+    else:
+        raise ValueError(f"Unknown function call: {function_name}")
+
+def function_call_with_retry(model: LLMModel, prompt: str, retries: int = 3):
+    success = False
+    while retries > 0:
+        try:
+            response = model.query_model(prompt)
+            function_calls = extract_function_call(response)
+            for call in function_calls:
+
+
 def repair_process(instance: dict):
     repair_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
     
-    repair_initial = REPAIR_COLLECT_CODE.format(
+    repair_initial = REPAIR_COLLECT_HEAD.format(
     project=instance['repo'].split('/')[1],
-    issue=instance['problem_statement'],
-)
+    issue=instance['problem_statement']
+) + REPAIR_COLLECT_INSTRUCT
+    response = repair_agent.query_model(repair_initial)
+    
+    
+    success = False
+    retries = 0
+    while retries < 3:
+        api_invoke_instruction = extract_json_instruction(response)
+        
     
 def main():
 
