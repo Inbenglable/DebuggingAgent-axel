@@ -6,6 +6,8 @@ import time
 import shutil   
 import tiktoken
 import subprocess
+import ast
+import textwrap
 from pathlib import Path
 from datasets import load_dataset
 from swe_log import init_logger, log_msg, log_and_print, remove_ansi_escape_sequences
@@ -328,12 +330,6 @@ def analyse_debugging_test(instance: dict, debugging_agent: LLMModel, debugging_
         raise ValueError("Debugging test was not successfully generated.")
     
     #TODO the regenerate process 
-    # if retain_memory and self.memory.chat_memory.messages:
-    #     messages = self.memory.chat_memory.messages.copy()
-    # else:
-    #     messages = [SystemMessage(content=self.system_message)]
-    
-            
     start_debugging_instruction['move_to_step_3'] = False
 
     return start_debugging_instruction
@@ -412,6 +408,44 @@ def judge_scope_choose(response: str, instance) -> bool:
 
     return True
     
+
+def judge_ready_generation(response: str):
+
+    pattern = r"\*{0,2}([Rr]eady [Gg]eneration)\*{0,2}:\s*`?([^:`\n]+)`?"
+
+    if match := re.search(pattern, response):
+        if match.group(2).strip().lower() == 'true':
+            return True
+    else:
+        raise ValueError("No Ready Generation Signal found in the response.")
+
+
+
+def process_api_call(response: str, instance):
+    function_calls = extract_function_call(response)
+    if len(function_calls) > 0:
+        results = {}
+        for function_call in function_calls:
+            api_response = function_invoke(function_call, instance)
+            if len(api_response)>0:
+                results[function_call['source_line']] = api_response
+        return results
+    elif judge_ready_generation(response):
+        return 'ready'
+    else:
+        raise ValueError("No API call or Ready Generation Signal found in the response.")
+
+def build_api_call_reply_promopt(api_call_results):
+    prompt = 'Your API invoke result:\n'
+    for api_call_result in api_call_results:
+        prompt+= f'\n### API INVOKE: {api_call_result}\nRESULT:\n'
+        for retrieve_info in api_call_results[api_call_result]:
+            prompt += f'#### {retrieve_info['path']}:{retrieve_info['name']}\n'
+            prompt += f'```python\n{retrieve_info['code']}\n```\n'
+            
+    return prompt
+        
+        
 
 
 def query_model_with_retry(model: LLMModel, prompt: str, judge_function, instance, max_retries: int = 5, retry_msg: str = None):
@@ -634,9 +668,8 @@ def apply_patch(instance: dict, debugging_instruction: dict):
         log_msg(f"Applied {len(edits)} edits to {file_path}")
 
 
-
 def modify_code_resolve_issue(instance: dict, debugging_agent: LLMModel, file_path: str, method: str, history: str, test_code: str):
-    method_code = get_element_from_name(instance, file_path, method, element_type = 'method', enable_line_number = False)[0]['code']
+    method_code = get_element_from_name(instance, file_path, method, element_type = 'method')[0]['code']
     modify_src_prompt = MODIFY_SOURCE_CODE_HEAD.format(
         project = instance['repo'].split('/')[1],
         issue = instance['problem_statement'],
@@ -671,8 +704,6 @@ def modify_code_resolve_issue(instance: dict, debugging_agent: LLMModel, file_pa
     # TODO: should we apply review stage like tools+claude?
 
 
-
-
 def debugging_process(instance: dict):
     
     debugging_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
@@ -696,76 +727,98 @@ def evaluation(instance: dict):
 
     log_and_print(result.stdout + result.stderr)
  
-
-
-# def is_api_invocation_mode(text: str) -> bool:
-#     pattern = r"```python\s+.*?```"
-#     return bool(re.search(pattern, text, flags=re.DOTALL))
-
+ 
 def extract_function_call(text):
     function_names = {"search_method_in_file", "search_class_in_file", "search_code_in_file"}
     results = []
-    text = '\n'.join(line.strip() for line in text.splitlines() if line.strip())
-    # Wrap the code in a dummy function to make it parsable
-    code = f"def _():\n{textwrap.indent(text, '    ')}"
-    tree = ast.parse(code)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            func_name = node.func.id
-            if func_name in function_names:
-                args = []
-                for arg in node.args:
-                    if isinstance(arg, ast.Constant):  # For Python 3.8+
-                        args.append(arg.value)
-                    elif isinstance(arg, ast.Str):  # For Python <3.8
-                        args.append(arg.s)
+
+    # 保留行信息，为了后面能用 lineno 取出原始字符串
+    original_lines = [line for line in text.splitlines()]
+    stripped_lines = [line.strip() for line in original_lines if line.strip()]
+    text = '\n'.join(stripped_lines)
+
+    try:
+        # 包装为 dummy 函数使其可被解析
+        code = f"def _():\n{textwrap.indent(text, '    ')}"
+        tree = ast.parse(code)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                func_name = node.func.id
+                if func_name in function_names:
+                    args = []
+                    for arg in node.args:
+                        if isinstance(arg, ast.Constant):  # Python 3.8+
+                            args.append(arg.value)
+                        elif isinstance(arg, ast.Str):  # Python <3.8
+                            args.append(arg.s)
+                        else:
+                            args.append(ast.unparse(arg))  # fallback
+
+                    # 获取原始调用行（注意 -1 是因为 lineno 从 1 开始，加了 dummy 函数所以是 node.lineno - 2）
+                    source_lineno = node.lineno - 2
+                    if 0 <= source_lineno < len(stripped_lines):
+                        source_line = stripped_lines[source_lineno]
                     else:
-                        args.append(ast.unparse(arg))  # fallback
-                results.append({
-                    "function": func_name,
-                    "args": args
-                })
+                        source_line = ""
 
-    return results
+                    results.append({
+                        "function": func_name,
+                        "args": args,
+                        "source_line": source_line
+                    })
 
-# def function_invoke(function_call_dict):
-#     function_name = function_call_dict['function']
-#     args = function_call_dict['args']
+        return results
+    except SyntaxError as e:
+        raise ValueError(f"Syntax error in extracting function calls: {e}")
+
+
+
+def function_invoke(function_call_dict, instance):
+    function_name = function_call_dict['function']
+    args = function_call_dict['args']
     
-#     if function_name == 'search_method_in_file' or function_name == 'search_class_in_file':
-#         file_path, method_name = args
-#         return get_element_from_name(instance, file_path, method_name, element_type = function_name.split('_')[1], enable_line_number = True)[0]
+    if function_name == 'search_method_in_file' or function_name == 'search_class_in_file':
+        file_path, method_name = args
+        return get_element_from_name(instance, file_path, method_name, element_type = function_name.split('_')[1])
 
-#     elif function_name == 'search_code_in_file':
-#         file_path, code_snippet = args
-#         return get_code_from_file(instance, file_path, code_snippet)
-#     else:
-#         raise ValueError(f"Unknown function call: {function_name}")
-
-# def function_call_with_retry(model: LLMModel, prompt: str, retries: int = 3):
-#     success = False
-#     while retries > 0:
-#         try:
-#             response = model.query_model(prompt)
-#             function_calls = extract_function_call(response)
-#             for call in function_calls:
+    elif function_name == 'search_code_in_file':
+        file_path, code_snippet = args
+        return get_element_from_name(instance, file_path, code_snippet, element_type = 'code_snippet')
+    else:
+        raise ValueError(f"Unknown function call: {function_name}")
 
 
 
-# def repair_process(instance: dict):
-#     repair_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
+def repair_process(instance: dict, debugging_history: str = None):
+    repair_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
+    repair_head_prompt = REPAIR_COLLECT_HEAD.format(
+    project=instance['repo'].split('/')[1],
+    issue=instance['problem_statement']
+)   
+    if debugging_history:
+        repair_head_prompt += 'A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is the debugging history:\n' + debugging_history + '\n'
+    repair_initial_prompt = repair_head_prompt + REPAIR_COLLECT_INSTRUCT
+    response = query_model_with_retry(repair_agent, repair_initial_prompt, process_api_call, instance)
+    retrieve_history = 'You have retrieved some code and this is your API Call history:\n' + '=' * 50 + '\nYour Output:' + response + '\n' + '=' * 50 + '\n'
     
-#     repair_initial = REPAIR_COLLECT_HEAD.format(
-#     project=instance['repo'].split('/')[1],
-#     issue=instance['problem_statement']
-# ) + REPAIR_COLLECT_INSTRUCT
-#     response = repair_agent.query_model(repair_initial)
+    collect_retries = 0
     
-    
-#     success = False
-#     retries = 0
-#     while retries < 3:
-#         api_invoke_instruction = extract_json_instruction(response)
+    while collect_retries < 2:
+        api_result = process_api_call(response, instance)
+        if api_result == 'ready':
+            log_and_print('Ready to generate')
+            break
+        else:
+            collect_retries += 1
+            log_and_print(f'API call {collect_retries}/2')
+            api_result_prompt = build_api_call_reply_promopt(api_result)
+            retrieve_history = update_history(retrieve_history, api_result_prompt)
+            query_prompt = repair_head_prompt + retrieve_history + REPAIR_COLLECT_INSTRUCT
+            response = query_model_with_retry(repair_agent, query_prompt, process_api_call, instance)
+            retrieve_history = update_history(retrieve_history, response)
+            
+        
         
     
 def main():

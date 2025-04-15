@@ -282,8 +282,8 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
         return result
     elif element_type == 'code_snippet':
         retrieve_results = get_surrounding_lines(file, name)
-        if len(retrive_results) == 0:
-            raise ValueError(f"Code snippet '{code_snippet}' not found in file '{file_name}'.")
+        if len(retrieve_results) == 0:
+            raise ValueError(f"Code snippet '{name}' not found in file '{file}'.")
         for retrieve_result in retrieve_results:
             code = retrieve_result[0]
             start_line = retrieve_result[1]

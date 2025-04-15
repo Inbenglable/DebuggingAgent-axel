@@ -215,13 +215,14 @@ Now You need to reolve the following issue in the **{project}** project:
 #### ISSUE
 {issue}
 '''
+
 REPAIR_COLLECT_INSTRUCT = '''
 Based on these information, you need to think about how to resolve the issue and fix the bug.
 
 Then you have two options. (Choose only one of them):
 1. If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
 2. If you already have enough information, go ahead and generate the patch.
-**Important:** Once you've gathered enough code to generate the patch, stop invoking the search APIs. Retrieving too much code can cause confusion and make it harder to generate an accurate fix.
+**Important:** Once you've already got enough information to generate the patch, stop invoking the search APIs. Retrieving too much code can cause confusion and make it harder to generate an accurate fix.
 
 ### IF YOU NEED TO RETRIEVE SOURCE CODE
 You can use the following APIs to search source code.
@@ -244,9 +245,9 @@ Note the format should obeys the following rules:
 
 
 ### IF GENERATE PATCH
-Once you've gathered enough code to generate the patch, stop invoking the search APIs.
+Once you've already got enough information code to generate the patch, stop invoking the search APIs.
 At this point, instead of invoking function call, please reply with:
-Ready for patch generation: `True` 
+Ready generation: `True` 
 '''
 
 
