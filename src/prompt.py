@@ -14,9 +14,9 @@ This is the corresponding output and runtime information:
 
 '''
 
+# Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
 CHOOSE_METHOD_INSTRUCT = '''
 You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
-Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
 Now, please first analyze the current observed code and the abnormal program behavior. 
 
 Then, if you can already locate the buggy method and buggy code, reply with:  
@@ -31,9 +31,9 @@ Note that {FILE_PATH} refers to the path relative to the repository. And if you 
 # Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
 # Now, please first analyze the current observed code and the abnormal program behavior. 
 
+# Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
 CHOOSE_SCOPE_INSTRUCT = '''
 You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
-Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
 Now, please first analyze the current observed code and the abnormal program behavior. 
 
 Then, if you can already locate the buggy method and buggy code, reply with:  
@@ -191,19 +191,6 @@ At the end of your analysis, provide edit result in the following JSON format:
 }
 '''
 
-# '''
-# Based on the previous analysis, please provide the specific modified code with minimal changes and indicate the range of modifications. I will replace the code within the specified range with your modified code.
-
-# Please pay attention to indentation. The lists of modify_code and modify_range correspond one-to-one.
-# At the end of your analysis, provide the specific information in the following JSON format:
-
-# {{
-#     "modify_code": ["YOUR MODIFIED CODE", "..."],
-#     "modify_range": ["FILE_PATH:LINE_A-LINE_B", "..."]
-# }}
-# Format: `FILE_PATH:LINE_A-LINE_B` -> Example: `src/model.py:10-20`
-# '''
-
 
 TOO_LONG_EXEC_RESULT = '''
 The debugging test execution result is too long to display here. Please re-select your `runtime_info` lists to narrow down the scope of your analysis.
@@ -216,19 +203,22 @@ Now You need to reolve the following issue in the **{project}** project:
 {issue}
 '''
 
-REPAIR_COLLECT_INSTRUCT = '''
+COLLECT_INSTRUCT = '''
 Based on these information, you need to think about how to resolve the issue and fix the bug.
-
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
 Then you have two options. (Choose only one of them):
-1. If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
-2. If you already have enough information, go ahead and generate the patch.
-**Important:** Once you've already got enough information to generate the patch, stop invoking the search APIs. Retrieving too much code can cause confusion and make it harder to generate an accurate fix.
+
+### IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
 
 ### IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
 You can use the following APIs to search source code.
 1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method code in the specified file.
 2. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
-3. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file.
+3. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
 
 You should finally reply in the following format:
 ```python
@@ -244,42 +234,47 @@ Note the format should obeys the following rules:
 5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
 
 
-### IF GENERATE PATCH
-Once you've already got enough information code to generate the patch, stop invoking the search APIs.
-At this point, instead of invoking function call, please reply with:
-Ready generation: `True` 
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
 '''
 
+# Then you have two options. (Choose only one of them):
+# 1. If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+# 2. If you already have enough information, go ahead and generate the patch.
 
 
-# ### IF GENERATE PATCH
-# If you already have the necessary information, generate the patch instead of using the search APIs.
-# Ensure your patch preserves the original functionality of the code.
-# You should generate *SEARCH/REPLACE* patches to fix the issue.
-# Every *SEARCH/REPLACE* edit must use this format:
-# 1. The file path
-# 2. The start of search block: <<<<<<< SEARCH
-# 3. A contiguous chunk of lines to search for in the existing source code
-# 4. The dividing line: =======
-# 5. The lines to replace into the source code
-# 6. The end of the replace block: >>>>>>> REPLACE
+# **Important:** Once you've gathered enough code to generate the patch, stop invoking the search APIs. Retrieving too much code can cause confusion and make it harder to generate an accurate fix.
 
-# Here is an example of a *SEARCH/REPLACE* edit:
 
-# ```python
-# ### mathweb/flask/app.py
-# <<<<<<< SEARCH
-# from flask import Flask
-# =======
-# import math
-# from flask import Flask
-# >>>>>>> REPLACE
-# ```
+REPAIR_INSTRUCT = '''
+Now, you need to generate patches to resolve the issue. Please ensure that your patch does not disrupt the original functionality of the code.
+You should generate *SEARCH/REPLACE* format patches to fix the issue.
+Every *SEARCH/REPLACE* edit must use this format:
+1. The file path
+2. The start of search block: <<<<<<< SEARCH
+3. A contiguous chunk of lines to search for in the existing source code
+4. The dividing line: =======
+5. The lines to replace into the source code
+6. The end of the replace block: >>>>>>> REPLACE
 
-# You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
-# {
-#   "search_replace_edits": [
-#     "{SEARCH_REPLACE_EDIT_1}",
-#     "{SEARCH_REPLACE_EDIT_2}",
-#   ]
-# }
+Here is an example of a *SEARCH/REPLACE* edit:
+
+```python
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+
+'''

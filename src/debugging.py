@@ -16,7 +16,8 @@ from retrieve_src import retrieve_code_element
 from decorator_manager import modify_decorators_libcst
 from prompt import GEN_DEBUGGING_TEST, DEBUGGING_AGENT_SYSTEM_MSG, \
     ANALYSE_TEST, MODIFY_SOURCE_CODE_HEAD, MODIFY_SOURCE_CODE_INSTRUCT, TOO_LONG_EXEC_RESULT, DEBUGGING_START_AFTER_TESTING, \
-    CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD, REPAIR_COLLECT_HEAD, REPAIR_COLLECT_INSTRUCT
+    CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD, REPAIR_COLLECT_HEAD, \
+    COLLECT_INSTRUCT, REPAIR_INSTRUCT
 
 sys.path.append(os.path.abspath('/data/swe-fl/SRC/SWE-Bench-Validation/src'))
 from utils import get_test_directives
@@ -416,8 +417,8 @@ def judge_ready_generation(response: str):
     if match := re.search(pattern, response):
         if match.group(2).strip().lower() == 'true':
             return True
-    else:
-        raise ValueError("No Ready Generation Signal found in the response.")
+
+    return False
 
 
 
@@ -440,8 +441,11 @@ def build_api_call_reply_promopt(api_call_results):
     for api_call_result in api_call_results:
         prompt+= f'\n### API INVOKE: {api_call_result}\nRESULT:\n'
         for retrieve_info in api_call_results[api_call_result]:
-            prompt += f'#### {retrieve_info['path']}:{retrieve_info['name']}\n'
-            prompt += f'```python\n{retrieve_info['code']}\n```\n'
+            file_path = retrieve_info['path']
+            element_name = retrieve_info['name']
+            prompt += f'#### {file_path}:{element_name}\n'
+            retrieve_code = retrieve_info['code']
+            prompt += f'```python\n{retrieve_code}\n```\n'
             
     return prompt
         
@@ -462,10 +466,25 @@ def query_model_with_retry(model: LLMModel, prompt: str, judge_function, instanc
             if retry_msg:
                 log_and_print(retry_msg)
             log_and_print(f"Error occurred when querying model.\n{str(e)}\nRetrying..({retries}/{max_retries})")
-            
+        finally:
+            detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance['instance_id']}/chat")
+            if not detailed_chat_dir.exists():
+                detailed_chat_dir.mkdir(parents=True)
+            cur_index = 0
+            for file in os.listdir(detailed_chat_dir):
+                file_index = int(file.split("_")[0])
+                if file_index > cur_index:
+                    cur_index = file_index
+            with open(detailed_chat_dir / f"{cur_index + 1}_input.txt", "w") as f:
+                f.write(prompt + "\n")
+            with open(detailed_chat_dir / f"{cur_index + 1}_output.txt", "w") as f:
+                f.write(response + "\n")
+                
     if not success:
         log_and_print("Failed to get valid model response after multiple attempts.")
         raise ValueError("Failed to get valid model response after multiple attempts.")
+    
+    
     return response
     
 def deep_dive_debugging(instance: dict, debugging_agent: LLMModel, debugging_test_exec_result: str, reproduce_test_code: str):
@@ -718,8 +737,10 @@ def debugging_process(instance: dict):
     file_path, method, history = deep_dive_debugging(instance, debugging_agent, debugging_test_exec_result, reproduce_test_code)
     if file_path is None:
         raise ValueError("Failed to locate buggy method")
+    
+    return history
 
-    modify_code_resolve_issue(instance, debugging_agent, file_path, method, history, reproduce_test_code)
+    # modify_code_resolve_issue(instance, debugging_agent, file_path, method, history, reproduce_test_code)
 
 def evaluation(instance: dict):
     cmd = f"cd {instance['testbed_src_path']} && conda run -n {instance['conda_env_name']} {instance['test_cmd']}"
@@ -729,6 +750,14 @@ def evaluation(instance: dict):
  
  
 def extract_function_call(text):
+    python_code_block_pattern = r"```python\n(.*?)```"
+    match = re.search(python_code_block_pattern, text, re.DOTALL)
+    if match:
+        text = match.group(1).strip()
+    else:
+        # log_and_print("No Python code block found in the response.")
+        return []
+    
     function_names = {"search_method_in_file", "search_class_in_file", "search_code_in_file"}
     results = []
 
@@ -770,20 +799,25 @@ def extract_function_call(text):
 
         return results
     except SyntaxError as e:
-        raise ValueError(f"Syntax error in extracting function calls: {e}")
+        return []  # 解析错误，返回空列表
 
 
 
 def function_invoke(function_call_dict, instance):
     function_name = function_call_dict['function']
     args = function_call_dict['args']
+    file_path = args[0]
+    
+    if not os.path.exists(file_path):
+        file_path = instance['testbed_src_path'] / file_path
+    
     
     if function_name == 'search_method_in_file' or function_name == 'search_class_in_file':
-        file_path, method_name = args
+        method_name = args[1]
         return get_element_from_name(instance, file_path, method_name, element_type = function_name.split('_')[1])
 
     elif function_name == 'search_code_in_file':
-        file_path, code_snippet = args
+        code_snippet = args[1]
         return get_element_from_name(instance, file_path, code_snippet, element_type = 'code_snippet')
     else:
         raise ValueError(f"Unknown function call: {function_name}")
@@ -797,10 +831,10 @@ def repair_process(instance: dict, debugging_history: str = None):
     issue=instance['problem_statement']
 )   
     if debugging_history:
-        repair_head_prompt += 'A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is the debugging history:\n' + debugging_history + '\n'
-    repair_initial_prompt = repair_head_prompt + REPAIR_COLLECT_INSTRUCT
+        repair_head_prompt += 'A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is its debugging history:\n' + debugging_history + '\n'
+    repair_initial_prompt = repair_head_prompt + COLLECT_INSTRUCT
     response = query_model_with_retry(repair_agent, repair_initial_prompt, process_api_call, instance)
-    retrieve_history = 'You have retrieved some code and this is your API Call history:\n' + '=' * 50 + '\nYour Output:' + response + '\n' + '=' * 50 + '\n'
+    retrieve_history = 'You have called API to retrieve some code and this is your API call and reply history:\n' + '=' * 50 + '\nYour Output:\n' + response + '\n' + '=' * 50 + '\n'
     
     collect_retries = 0
     
@@ -814,16 +848,38 @@ def repair_process(instance: dict, debugging_history: str = None):
             log_and_print(f'API call {collect_retries}/2')
             api_result_prompt = build_api_call_reply_promopt(api_result)
             retrieve_history = update_history(retrieve_history, api_result_prompt)
-            query_prompt = repair_head_prompt + retrieve_history + REPAIR_COLLECT_INSTRUCT
+            query_prompt = repair_head_prompt + retrieve_history + COLLECT_INSTRUCT
             response = query_model_with_retry(repair_agent, query_prompt, process_api_call, instance)
-            retrieve_history = update_history(retrieve_history, response)
-            
+            retrieve_history = update_history(retrieve_history, '\nYour Output:\n' + response)
+    
+    repair_prompt = repair_head_prompt + retrieve_history + REPAIR_INSTRUCT
+    
+    success = False
+    retries = 0
+    while retries < 3:
+        try:
+            modify_src_response = query_model_with_retry(repair_agent, repair_prompt, judge_response_with_json, instance)
+            modify_src_instruction = extract_json_instruction(modify_src_response)
+            apply_patch(instance, modify_src_instruction)
+            success = True
+            break
+        except Exception as e:
+            log_and_print(f"Error applying patch: {str(e)}, Retrying..")
+            if modify_src_instruction:
+                repair_prompt += f"\nERROR! Your Reponse: {modify_src_instruction}.\nYour response format is invalid: {str(e)}\nPlease try again.\n"
+                repair_prompt += MODIFY_SOURCE_CODE_INSTRUCT
+            retries += 1
+
+    if not success:
+        log_and_print("Failed to apply patch after multiple attempts.")
+        raise ValueError("Failed to apply patch after multiple attempts.")
+    
         
         
     
 def main():
 
-    instance_id = 'astropy__astropy-12907'
+    instance_id = 'django__django-11095'
     detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}/chat")
     if os.path.exists(detailed_chat_dir):
         shutil.rmtree(detailed_chat_dir)
@@ -835,12 +891,15 @@ def main():
     print('start load_instance_data')
     instance = load_instance_data(instance_id)
     
-    # print('start init_instance_testbed')
-    # init_instance_testbed(instance)
+    print('start init_instance_testbed')
+    init_instance_testbed(instance)
     
-    print('start debugging_process')
-    debugging_process(instance)
-    # repair_agent(instance)
+    # print('start debugging_process')
+    # history = debugging_process(instance)
+    
+    print('start repair_process')
+    # repair_process(instance, history)
+    repair_process(instance)
     
     evaluation(instance)
 
