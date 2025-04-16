@@ -13,7 +13,7 @@ from datasets import load_dataset
 from swe_log import init_logger, log_msg, log_and_print, remove_ansi_escape_sequences
 from model import LLMModel
 from retrieve_src import retrieve_code_element
-from decorator_manager import modify_decorators_libcst
+from run_report import get_eval_report_for_log
 from prompt import GEN_DEBUGGING_TEST, DEBUGGING_AGENT_SYSTEM_MSG, \
     ANALYSE_TEST, MODIFY_SOURCE_CODE_HEAD, MODIFY_SOURCE_CODE_INSTRUCT, TOO_LONG_EXEC_RESULT, DEBUGGING_START_AFTER_TESTING, \
     CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD, REPAIR_COLLECT_HEAD, \
@@ -612,7 +612,7 @@ def apply_patch(instance: dict, debugging_instruction: dict):
             abs_path = instance['testbed_src_path'] / file_path
         else:
             abs_path = file_path
-        if not abs_path.exists():
+        if not os.path.exists(abs_path):
             log_msg(f"File not found: {abs_path}")
             raise FileNotFoundError(f"File not found: {abs_path}")
 
@@ -676,7 +676,7 @@ def apply_patch(instance: dict, debugging_instruction: dict):
 
         # Create backup if needed
         backup_path = abs_path.with_suffix(abs_path.suffix + '.bak')
-        if not backup_path.exists():
+        if not os.path.exists(backup_path):
             shutil.copy(abs_path, backup_path)
             log_msg(f"Created backup at {backup_path}")
 
@@ -745,8 +745,17 @@ def debugging_process(instance: dict):
 def evaluation(instance: dict):
     cmd = f"cd {instance['testbed_src_path']} && conda run -n {instance['conda_env_name']} {instance['test_cmd']}"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-
-    log_and_print(result.stdout + result.stderr)
+    
+    save_dir = f'/data/swe-fl/SRC/DebuggingAgent/log/{instance["instance_id"]}'
+    eval_log_path = os.path.join(save_dir, 'evaluation.log')
+    eval_report_path = os.path.join(save_dir, 'evaluation_report.json')
+    
+    with open(eval_log_path, 'w') as f:
+        f.write(result.stdout + result.stderr)
+    
+    report = get_eval_report_for_log(instance, eval_log_path)
+    with open(eval_report_path, 'w') as f:
+        json.dump(report, f, indent=4)
  
  
 def extract_function_call(text):
@@ -879,7 +888,7 @@ def repair_process(instance: dict, debugging_history: str = None):
     
 def main():
 
-    instance_id = 'django__django-11095'
+    instance_id = 'astropy__astropy-12907'
     detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}/chat")
     if os.path.exists(detailed_chat_dir):
         shutil.rmtree(detailed_chat_dir)
@@ -891,15 +900,15 @@ def main():
     print('start load_instance_data')
     instance = load_instance_data(instance_id)
     
-    print('start init_instance_testbed')
-    init_instance_testbed(instance)
+    # print('start init_instance_testbed')
+    # init_instance_testbed(instance)
     
-    # print('start debugging_process')
-    # history = debugging_process(instance)
+    print('start debugging_process')
+    history = debugging_process(instance)
     
     print('start repair_process')
-    # repair_process(instance, history)
-    repair_process(instance)
+    repair_process(instance, history)
+    # repair_process(instance)
     
     evaluation(instance)
 

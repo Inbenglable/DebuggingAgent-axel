@@ -203,6 +203,14 @@ Now You need to reolve the following issue in the **{project}** project:
 {issue}
 '''
 
+
+
+# 1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+# 2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+# 3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+# 4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+# 5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+# 6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
 COLLECT_INSTRUCT = '''
 Based on these information, you need to think about how to resolve the issue and fix the bug.
 Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
@@ -216,7 +224,7 @@ Ready generation: `True`
 ### IF YOU NEED TO RETRIEVE SOURCE CODE
 If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
 You can use the following APIs to search source code.
-1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method code in the specified file.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
 2. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
 3. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
 
@@ -241,7 +249,6 @@ Then choose one of the two options above and follow the format to reply.
 # Then you have two options. (Choose only one of them):
 # 1. If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
 # 2. If you already have enough information, go ahead and generate the patch.
-
 
 # **Important:** Once you've gathered enough code to generate the patch, stop invoking the search APIs. Retrieving too much code can cause confusion and make it harder to generate an accurate fix.
 

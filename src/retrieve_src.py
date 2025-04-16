@@ -243,8 +243,8 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
         if name not in code_map:
             for map_name in code_map:
                 map_name_last = map_name.split('.')[-1]
-                name = name.split('.')[-1]
-                if name == map_name_last:
+                last_name = name.split('.')[-1]
+                if last_name == map_name_last:
                     candidate_names.append(map_name)
             if len(candidate_names) == 0:
                 raise ValueError(f"No matching {element_type} found for name: {name} in file: {file}")
