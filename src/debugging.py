@@ -1041,16 +1041,14 @@ def main():
     start_time = time.time()
     with open('/data/swe-fl/SRC/DebuggingAgent/bug_list.json','r') as f:
         bug_list = json.load(f)
-    for bug in bug_list:
-        if bug != 'sphinx-doc__sphinx-8595':
-            continue
-        instance_id = bug
+    for instance_id in bug_list:
         evaluate_report_path = f'{EXP_DIR}/{instance_id}/evaluation_report.json'
-        with open(evaluate_report_path, 'r') as f:
-            evaluate_report = json.load(f)
-        if evaluate_report['status'] == 'RESOLVED_FULL':
-            print(f'{instance_id} has been repaired')
-            continue
+        if os.path.exists(evaluate_report_path):
+            with open(evaluate_report_path, 'r') as f:
+                evaluate_report = json.load(f)
+            if evaluate_report['status'] == 'RESOLVED_FULL':
+                print(f'{instance_id} has been repaired')
+                continue
         try:
 
             log_path = Path(f"{EXP_DIR}/{instance_id}/{instance_id}.log")
@@ -1060,7 +1058,7 @@ def main():
             instance = load_instance_data(instance_id)
             
             print('start init_instance_testbed')
-            # init_instance_testbed(instance)
+            init_instance_testbed(instance)
             
             total_max_exception_retry_times = 3
             cur_times = 0
@@ -1108,13 +1106,13 @@ def main():
 
 
 if __name__ == '__main__':
-    # main()
-    instance = load_instance_data('sphinx-doc__sphinx-8595')
-    agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
-    with open('tmp.txt','r') as f:
-        response = f.read()
-    result = process_api_call(response, instance, agent)
-    import pprint
-    pprint.pprint(result)
+    main()
+    # instance = load_instance_data('sphinx-doc__sphinx-8595')
+    # agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
+    # with open('tmp.txt','r') as f:
+    #     response = f.read()
+    # result = process_api_call(response, instance, agent)
+    # import pprint
+    # pprint.pprint(result)
 
 

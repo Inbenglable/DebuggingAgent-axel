@@ -1,0 +1,187 @@
+
+
+You are a debugging agent tasked with precisely using tools to resolve issues and submit pull requests.
+
+**Current Task:**  
+Resolve the following issue in the django project:
+#### ISSUE
+Migration optimizer does not reduce multiple AlterField
+Description
+	
+Let's consider the following operations: 
+operations = [
+	migrations.AddField(
+		model_name="book",
+		name="title",
+		field=models.CharField(max_length=256, null=True),
+	),
+	migrations.AlterField(
+		model_name="book",
+		name="title",
+		field=models.CharField(max_length=128, null=True),
+	),
+	migrations.AlterField(
+		model_name="book",
+		name="title",
+		field=models.CharField(max_length=128, null=True, help_text="help"),
+	),
+	migrations.AlterField(
+		model_name="book",
+		name="title",
+		field=models.CharField(max_length=128, null=True, help_text="help", default=None),
+	),
+]
+If I run the optimizer, I get only the AddField, as we could expect. However, if the AddField model is separated from the AlterField (e.g. because of a non-elidable migration, or inside a non-squashed migration), none of the AlterField are reduced:
+optimizer.optimize(operations[1:], "books") 
+[<AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
+ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
+ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>]
+Indeed, the AlterField.reduce does not consider the the case where operation is also an AlterField. 
+Is this behaviour intended? If so, could it be documented? 
+Otherwise, would it make sense to add something like
+		if isinstance(operation, AlterField) and self.is_same_field_operation(
+			operation
+		):
+			return [operation]
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+
+class Field:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def __repr__(self):
+        attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+        return f"CharField({', '.join(attrs)})"
+
+class Operation:
+    def __init__(self, model_name, name):
+        self.model_name = model_name
+        self.name = name
+
+    def is_same_model_operation(self, operation):
+        return self.model_name.lower() == operation.model_name.lower()
+
+    def is_same_field_operation(self, operation):
+        return (
+            self.is_same_model_operation(operation)
+            and self.name.lower() == operation.name.lower()
+        )
+
+    def references_field(self, model_name, name, app_label):
+        return (
+            model_name.lower() == self.model_name.lower()
+            and name.lower() == self.name.lower()
+        )
+
+    def reduce(self, operation, app_label):
+        return not operation.references_field(self.model_name, self.name, app_label)
+
+class AlterField(Operation):
+    def __init__(self, model_name, name, field):
+        super().__init__(model_name, name)
+        self.field = field
+
+    def describe(self):
+        return f"Alter field {self.name} on {self.model_name}"
+
+    def reduce(self, operation, app_label):
+        if isinstance(operation, AlterField) and self.is_same_field_operation(operation):
+            # Return the latest AlterField operation since it contains all the changes
+            return [operation]
+        return super().reduce(operation, app_label)
+
+class MigrationOptimizer:
+    def optimize(self, operations, app_label):
+        self._iterations = 0
+        while True:
+            result = self.optimize_inner(operations, app_label)
+            self._iterations += 1
+            if result == operations:
+                return result
+            operations = result
+
+    def optimize_inner(self, operations, app_label):
+        new_operations = []
+        for i, operation in enumerate(operations):
+            right = True  # Should we reduce on the right or on the left
+            # Compare it to each operation after it
+            for j, other in enumerate(operations[i + 1:]):
+                result = operation.reduce(other, app_label)
+                if isinstance(result, list):
+                    in_between = operations[i + 1:i + j + 1]
+                    if right:
+                        new_operations.extend(in_between)
+                        new_operations.extend(result)
+                    elif all(op.reduce(other, app_label) is True for op in in_between):
+                        # Perform a left reduction if all of the in-between
+                        # operations can optimize through other.
+                        new_operations.extend(result)
+                        new_operations.extend(in_between)
+                    else:
+                        # Otherwise keep trying.
+                        new_operations.append(operation)
+                        break
+                    new_operations.extend(operations[i + j + 2:])
+                    return new_operations
+                elif not result:
+                    # Can't perform a right reduction.
+                    right = False
+            else:
+                new_operations.append(operation)
+        return new_operations
+
+# Test case
+operations = [
+    AlterField(
+        model_name="book",
+        name="title",
+        field=Field(max_length=128, null=True),
+    ),
+    AlterField(
+        model_name="book",
+        name="title",
+        field=Field(max_length=128, null=True, help_text="help"),
+    ),
+    AlterField(
+        model_name="book",
+        name="title",
+        field=Field(max_length=128, null=True, help_text="help", default=None),
+    ),
+]
+
+optimizer = MigrationOptimizer()
+result = optimizer.optimize(operations, "books")
+print("Number of operations after optimization:", len(result))
+print("\nOptimized operations:")
+for op in result:
+    print(f"- {op.describe()}")
+print("\nFinal field state:", result[-1].field if result else None)
+
+**Test Execution Results:**
+
+Number of operations after optimization: 1
+
+Optimized operations:
+- Alter field title on book
+
+Final field state: CharField(max_length=128, null=True, help_text='help', default=None)
+
+
+Follow these steps to resolve the issue:
+
+1. Create a minimal debugging test based on the reproduce test.
+2. Debug by reviewing the relevant source code and monitoring runtime information.
+3. Once you have identified the root cause, modify the code with minimal changes.
+4. Rerun the reproduction script to confirm that the issue is fixed.
+
+Focus on Step 1: generate a debugging test. At the end of your analysis, provide the specific code in the following **JSON format**.
+Note: You should clearly specify the tests you are debugging as much as possible. Minimizing the amount of code will better assist you in analyzing runtime information later.
+
+
+{
+"debugging_test" : "import ... # Your debugging test code here"
+}
+
+

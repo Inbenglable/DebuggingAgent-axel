@@ -1,0 +1,111 @@
+
+
+You are a debugging agent tasked with precisely using tools to resolve issues and submit pull requests.
+
+**Current Task:**  
+Resolve the following issue in the django project:
+#### ISSUE
+Bug in posix implementation of django/core/files/locks.py
+Description
+	
+The posix version of locks (the version which supports import fcntl) has a bug. The code attempts to return True to indicate success or failure acquiring a lock, but instead it always returns False. The reason is that cpython fcntl module returns None if successful, and raises an OSError to indicate failure (see ​https://docs.python.org/3/library/fcntl.html#fcntl.flock).
+Anyone interested in using the non-blocking (i.e. locks.LOCKS_NB) requires a valid return value to know if they have successfully acquired the lock.
+I believe the correct implementation should be the following:
+diff --git a/django/core/files/locks.py b/django/core/files/locks.py
+index c46b00b905..4938347ea7 100644
+--- a/django/core/files/locks.py
++++ b/django/core/files/locks.py
+@@ -107,9 +107,15 @@ else:
+			 return True
+	 else:
+		 def lock(f, flags):
+-			ret = fcntl.flock(_fd(f), flags)
+-			return ret == 0
++			try:
++				fcntl.flock(_fd(f), flags)
++				return True
++			except OSError:
++				return False
+		 def unlock(f):
+-			ret = fcntl.flock(_fd(f), fcntl.LOCK_UN)
+-			return ret == 0
++			try:
++				fcntl.flock(_fd(f), fcntl.LOCK_UN)
++				return True
++			except OSError:
++				return False
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+
+import os
+import time
+from django.core.files import locks
+
+def test_locking():
+    # Create a test file
+    with open('test.lock', 'w') as f:
+        f.write('test')
+
+    # Test 1: Basic locking
+    with open('test.lock', 'r') as f:
+        print("Test 1: Basic exclusive lock")
+        result = locks.lock(f, locks.LOCK_EX)
+        print(f"Lock acquired: {result}")  # Should print True
+        locks.unlock(f)
+
+    # Test 2: Non-blocking lock when file is already locked
+    print("\nTest 2: Non-blocking lock when file is already locked")
+    f1 = open('test.lock', 'r')
+    f2 = open('test.lock', 'r')
+    
+    # Acquire lock with first file handle
+    result1 = locks.lock(f1, locks.LOCK_EX)
+    print(f"First lock acquired: {result1}")  # Should print True
+    
+    # Try to acquire non-blocking lock with second file handle
+    result2 = locks.lock(f2, locks.LOCK_EX | locks.LOCK_NB)
+    print(f"Second lock acquired: {result2}")  # Should print False since file is already locked
+    
+    # Cleanup
+    locks.unlock(f1)
+    f1.close()
+    f2.close()
+    os.unlink('test.lock')
+
+if __name__ == '__main__':
+    test_locking()
+
+**Test Execution Results:**
+
+Test 1: Basic exclusive lock
+Lock acquired: False
+
+Test 2: Non-blocking lock when file is already locked
+First lock acquired: False
+Traceback (most recent call last):
+  File "reproduce.py", line 37, in <module>
+    test_locking()
+  File "reproduce.py", line 27, in test_locking
+    result2 = locks.lock(f2, locks.LOCK_EX | locks.LOCK_NB)
+  File "/data/swe-fl/TMP/testbed/django__django-13410/django/core/files/locks.py", line 110, in lock
+    ret = fcntl.flock(_fd(f), flags)
+BlockingIOError: [Errno 11] Resource temporarily unavailable
+
+
+Follow these steps to resolve the issue:
+
+1. Create a minimal debugging test based on the reproduce test.
+2. Debug by reviewing the relevant source code and monitoring runtime information.
+3. Once you have identified the root cause, modify the code with minimal changes.
+4. Rerun the reproduction script to confirm that the issue is fixed.
+
+Focus on Step 1: generate a debugging test. At the end of your analysis, provide the specific code in the following **JSON format**.
+Note: You should clearly specify the tests you are debugging as much as possible. Minimizing the amount of code will better assist you in analyzing runtime information later.
+
+
+{
+"debugging_test" : "import ... # Your debugging test code here"
+}
+
+

@@ -1,0 +1,51 @@
+Based on the runtime information and the code analyzed so far, the issue arises when the unapplied state of a component migration does not correctly reflect on the squashed migration's status. Specifically, the squashed migration `0001_squashed_0002` remains applied even when its component migrations `0001_initial` and `0002_change` are unapplied.
+
+This mismanagement suggests that the logic handling the replacement of migrations within the `MigrationLoader.build_graph` method is failing to correctly update the applied status when all component migrations are unapplied.
+
+### Analysis:
+- The `MigrationLoader.build_graph` method has a critical section from lines 237 to 259 that handles replacements and their application states.
+- Line 247 is meant to remove the replacement migration (`0001_squashed_0002`) if not all component migrations (`0001_initial`, `0002_change`) are applied.
+- Line 256 should ensure that the replacement migration is correctly removed and dependencies are remapped if it's not fully applied.
+
+### Identifying the Bug:
+From the observations, the problem likely lies within the conditional logic handling within these lines. Specifically, it seems that the `self.applied_migrations.pop(key, None)` on line 247 does not process as expected when individual component migrations are unapplied, leaving the squashed migration erroneously marked as applied.
+
+### Locating the Bug:
+Given the regression occurs when checking applied statuses and attempting to unapply squashed migrations when their components are unapplied, the offending method is:
+
+Buggy method: `django/db/migrations/loader.py:MigrationLoader.build_graph`
+
+I propose the following fix for the logic inside `MigrationLoader.build_graph` to properly handle the replacement migration statuses:
+
+#### Possible Fix:
+Refactor the method to ensure it accurately reflects the unapplied state of squashed migrations when their components are unapplied.
+
+```python
+class MigrationLoader:
+    def build_graph(self):
+        # Existing code...
+
+        if self.replace_migrations:
+            for key, migration in self.replacements.items():
+                applied_statuses = [(target in self.applied_migrations) for target in migration.replaces]
+                if all(applied_statuses):
+                    self.applied_migrations[key] = migration
+                else:
+                    self.applied_migrations.pop(key, None)
+                
+                # Modify the graph removal logic to ensure correct handling
+                if not any(applied_statuses):
+                    self.graph.remove_replaced_nodes(key, migration.replaces)
+                elif all(applied_statuses):
+                    self.graph.remove_replaced_nodes(key, migration.replaces)
+                else:
+                    self.graph.remove_replacement_node(key, migration.replaces)
+        
+        # Ensure the graph is consistent.
+        try:
+            self.graph.validate_consistency()
+```
+
+This modification checks both all applied and none applied conditions precisely and adjusts the graph nodes accordingly.
+
+Proceed to test with the current approach to validate whether the logic properly handles the unapplied state transitions for squashed migrations when their component migrations are unapplied to ensure the squashed migration is properly marked as unapplied as well.

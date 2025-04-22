@@ -1,0 +1,239 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **pytest** project:
+#### ISSUE
+caplog fixture doesn't restore log level after test
+From the documentation at https://docs.pytest.org/en/6.0.0/logging.html#caplog-fixture, "The log levels set are restored automatically at the end of the test".
+It used to work, but looks broken in new 6.0 release. Minimal example to reproduce:
+
+```
+def test_foo(caplog):
+    caplog.set_level(42)
+
+def test_bar(caplog):
+    print(caplog.handler.level)
+```
+
+It prints "0" for pytest<6, "42" after.
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+To generate a patch for the issue described, I need to understand how the `caplog` fixture works, especially the part that handles setting and restoring log levels. This likely involves the method that sets the log level and ensures it's restored after a test.
+
+First, I will search for the `caplog` fixture code to understand how it manipulates log levels and find the specific method or class responsible for this behavior.
+
+```python
+search_method_in_codebase("caplog")
+```
+
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("caplog")
+RESULT:
+#### src/_pytest/logging.py:caplog
+```python
+def caplog(request: FixtureRequest) -> Generator[LogCaptureFixture, None, None]:
+    """Access and control log capturing.
+
+    Captured logs are available through the following properties/methods::
+
+    * caplog.messages        -> list of format-interpolated log messages
+    * caplog.text            -> string containing formatted log output
+    * caplog.records         -> list of logging.LogRecord instances
+    * caplog.record_tuples   -> list of (logger_name, level, message) tuples
+    * caplog.clear()         -> clear captured records and formatted log output string
+    """
+    result = LogCaptureFixture(request.node)
+    yield result
+    result._finalize()
+
+```
+
+
+==================================================
+
+Your Output:
+We have discovered that the `caplog` fixture code initializes a `LogCaptureFixture` instance and calls its `_finalize` method at the end of the test to presumably restore the original log levels or to perform cleanup operations.
+
+To confirm this and understand how the log level restoration should be implemented, we need to examine the `LogCaptureFixture` class and its methods, especially `_finalize`.
+
+Let's search for the `LogCaptureFixture` class in the file `src/_pytest/logging.py` to understand its implementation and locate the `_finalize` method.
+
+```python
+search_class_in_file("src/_pytest/logging.py", "LogCaptureFixture")
+search_method_in_file("src/_pytest/logging.py", "LogCaptureFixture._finalize")
+```
+
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_class_in_file("src/_pytest/logging.py", "LogCaptureFixture")
+RESULT:
+#### src/_pytest/logging.py:LogCaptureFixture
+```python
+class LogCaptureFixture:
+    """Provides access and control of log capturing."""
+
+    def __init__(self, item: nodes.Node) -> None:
+        ...
+
+    def _finalize(self) -> None:
+        ...
+
+    @property
+    def handler(self) -> LogCaptureHandler:
+        ...
+
+    def get_records(self, when: str) -> List[logging.LogRecord]:
+        ...
+
+    @property
+    def text(self) -> str:
+        ...
+
+    @property
+    def records(self) -> List[logging.LogRecord]:
+        ...
+
+    @property
+    def record_tuples(self) -> List[Tuple[str, int, str]]:
+        ...
+
+    @property
+    def messages(self) -> List[str]:
+        ...
+
+    def clear(self) -> None:
+        ...
+
+    def set_level(self, level: Union[int, str], logger: Optional[str] = None) -> None:
+        ...
+
+    @contextmanager
+    def at_level(
+        ...
+
+    ) -> Generator[None, None, None]:
+        """Context manager that sets the level for capturing of logs. After the end of the 'with' statement the
+        level is restored to its original value.
+
+        :param int level: the logger to level.
+        :param str logger: the logger to update the level. If not given, the root logger level is updated.
+        """
+        logger_obj = logging.getLogger(logger)
+        orig_level = logger_obj.level
+        logger_obj.setLevel(level)
+        handler_orig_level = self.handler.level
+        self.handler.setLevel(level)
+        try:
+            yield
+        finally:
+            logger_obj.setLevel(orig_level)
+            self.handler.setLevel(handler_orig_level)
+```
+
+
+### API INVOKE: search_method_in_file("src/_pytest/logging.py", "LogCaptureFixture._finalize")
+RESULT:
+#### src/_pytest/logging.py:LogCaptureFixture._finalize
+```python
+    def _finalize(self) -> None:
+        """Finalizes the fixture.
+
+        This restores the log levels changed by :meth:`set_level`.
+        """
+        # restore log levels
+        for logger_name, level in self._initial_logger_levels.items():
+            logger = logging.getLogger(logger_name)
+            logger.setLevel(level)
+
+```
+
+
+==================================================
+
+Your Output:
+The issue seems to arise from the `LogCaptureFixture._finalize` method failing to restore the log level for the `caplog.handler`. While it restores levels for loggers in `_initial_logger_levels`, it doesn't handle `caplog.handler` level restoration.
+
+I need to retrieve the source code of `LogCaptureFixture.set_level` method, since it appears to be involved with changing log levels and should provide insight on how to store the original level for `caplog.handler`. This information will be used to amend `_finalize` to restore the `caplog.handler` level.
+
+```python
+search_method_in_file("src/_pytest/logging.py", "LogCaptureFixture.set_level")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("src/_pytest/logging.py", "LogCaptureFixture.set_level")
+RESULT:
+#### src/_pytest/logging.py:LogCaptureFixture.set_level
+```python
+    def set_level(self, level: Union[int, str], logger: Optional[str] = None) -> None:
+        """Sets the level for capturing of logs. The level will be restored to its previous value at the end of
+        the test.
+
+        :param int level: the logger to level.
+        :param str logger: the logger to update the level. If not given, the root logger level is updated.
+
+        .. versionchanged:: 3.4
+            The levels of the loggers changed by this function will be restored to their initial values at the
+            end of the test.
+        """
+        logger_obj = logging.getLogger(logger)
+        # save the original log-level to restore it during teardown
+        self._initial_logger_levels.setdefault(logger, logger_obj.level)
+        logger_obj.setLevel(level)
+        self.handler.setLevel(level)
+
+```
+
+
+==================================================
+
+Your Output:
+Given the information gathered from the `LogCaptureFixture` class and its methods, we have identified the source code necessary to address the issue with the `caplog` fixture not restoring the log level of the handler after the test.
+
+The problem is that while `set_level` does set the handler level, the `_finalize` method does not restore it since it is only restoring logger levels from `_initial_logger_levels`, which does not track the handler's level.
+
+To resolve the issue, we should update `_finalize` to also restore the original level of `caplog.handler`. We know the original level of the handler needs to be tracked in `_initial_logger_levels` similarly to how logger levels are tracked.
+
+Therefore, I'm ready to generate the patch to fix the issue.
+
+Ready generation: `True`
+==================================================
+
+Now, you need to generate patches to resolve the issue. Please ensure that your patch does not disrupt the original functionality of the code.
+You should generate *SEARCH/REPLACE* format patches to fix the issue.
+Every *SEARCH/REPLACE* edit must use this format:
+```pythony
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+
+A final json reply example:
+```json
+{
+  "search_replace_edits": [
+    "### A/B.py\n<<<<<<< SEARCH
+       def foo():\n=======\n    def bar():\n>>>>>>> REPLACE\n",
+    "### A/B.py\n<<<<<<< SEARCH
+       x = x + 1\n=======\n    x = x - 1\n>>>>>>> REPLACE\n",
+}
+```
+
+
+

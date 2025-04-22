@@ -3,10 +3,12 @@ import json
 
 resolved_bugs= []
 non_resolved_bugs = []
-for dire in os.listdir("../exp"):
-    for file in os.listdir(os.path.join("../exp", dire)):
+root_dir = '/data/swe-fl/SRC/DebuggingAgent/exp_wo_debugging'
+
+for dire in os.listdir(root_dir):
+    for file in os.listdir(os.path.join(root_dir, dire)):
         if file.endswith(".json"):
-            with open(os.path.join("../exp", dire, file), "r") as f:
+            with open(os.path.join(root_dir, dire, file), "r") as f:
                 data = json.load(f)
                 if data["status"] != "RESOLVED_FULL":
                     non_resolved_bugs.append(dire)
