@@ -3,6 +3,7 @@ import ast
 import re
 from functools import cache
 from pathlib import Path
+import os
 
 @cache
 def method_and_class_ranges_in_file(file: str):
@@ -193,10 +194,53 @@ def get_surrounding_lines(file_name: str, code_snippet: str):
     return results
 
 
+def retrieve_code_element_in_database(instance: dict, name: str, element_type: str, enable_line_number: bool = False, relative_path: bool = False):
+    result = []
+    root_dir = instance['testbed_src_path']
+    for root, dirs, files in os.walk(root_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if not file_path.endswith('.py'):
+                continue
+            code_elements = None
+            try:
+                code_elements = retrieve_code_element(file_path, name, element_type, enable_line_number, relative_path, instance)
+            except Exception as e:
+                continue
 
+            if code_elements:
+                result.extend(code_elements)
+    
+    if element_type == 'method' or element_type == 'class':
+        exact_match_success = False
+        for item in result:
+            if item['name'] == name:
+                exact_match_success = True
+                break
+        if exact_match_success:
+            new_result = []
+            for item in result:
+                if item['name'] == name:
+                    new_result.append(item)
+            result = new_result
+    
+    # remove_duplicate by name and path
+    unique_result = []
+    seen = set()
+    for item in result:
+        key = (item.get("path"), item.get("name"))
+        if key not in seen:
+            seen.add(key)
+            unique_result.append(item)
+    result = unique_result
+    
+    
+    if len(result) == 0:
+        raise ValueError(f"No matching {element_type} found for: {name} in directory: {root_dir}")
+    return result
 
-def retrieve_code_element(file: str, name: str, element_type : str, enable_line_number: bool = False):
-
+def retrieve_code_element(file: str, name: str, element_type : str, enable_line_number: bool = False, relative_path: bool = False, instance: dict = None) -> list:
+    root_dir = instance['testbed_src_path'] if instance else None
     result = []
     retrieved_elements = {}
     try:
@@ -227,7 +271,10 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
             ]
             
             retrieved_elements['name'] = f"Lines {start}-{end}"
-            retrieved_elements['path'] = file
+            if relative_path:
+                retrieved_elements['path'] = os.path.relpath(file, root_dir)
+            else:
+                retrieved_elements['path'] = file
             retrieved_elements['type'] = 'line_range'
             retrieved_elements['start_line'] = start
             retrieved_elements['end_line'] = end
@@ -271,8 +318,10 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
                 else:
                     returned_code_lines = selected_lines
                 retrieved_elements['code'] = ''.join(returned_code_lines)
-                
-            retrieved_elements['path'] = file
+            if relative_path:
+                retrieved_elements['path'] = os.path.relpath(file, root_dir)
+            else:
+                retrieved_elements['path'] = file
             retrieved_elements['type'] = element_info['type']
             retrieved_elements['start_line'] = start
             retrieved_elements['end_line'] = end
@@ -290,7 +339,10 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
             end_line = retrieve_result[2]
              
             retrieved_elements['name'] = 'code_snippet'
-            retrieved_elements['path'] = file
+            if relative_path:
+                retrieved_elements['path'] = os.path.relpath(file, root_dir)
+            else:
+                retrieved_elements['path'] = file
             retrieved_elements['type'] = 'code_snippet'
             retrieved_elements['start_line'] = start_line
             retrieved_elements['end_line'] = end_line

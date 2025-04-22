@@ -1,16 +1,20 @@
-import ast
-from typing import List, Dict, Any
-import textwrap
-from retrieve_src import generate_skeleton, get_surrounding_lines
-from debugging import extract_function_call
-import pprint
+import os
+import json
 
+resolved_bugs= []
+non_resolved_bugs = []
+for dire in os.listdir("../exp"):
+    for file in os.listdir(os.path.join("../exp", dire)):
+        if file.endswith(".json"):
+            with open(os.path.join("../exp", dire, file), "r") as f:
+                data = json.load(f)
+                if data["status"] != "RESOLVED_FULL":
+                    non_resolved_bugs.append(dire)
+                elif data["status"] == "RESOLVED_FULL":
+                    resolved_bugs.append(dire)
 
+with open("resolved_bugs.json", "w") as f:
+    json.dump(resolved_bugs, f, indent=4)
 
-# print(generate_skeleton('/data/swe-fl/TMP/testbed/astropy__astropy-12907/astropy/modeling/rotations.py','RotateCelestial2Native'))
-
-# print(get_surrounding_lines('/data/swe-fl/TMP/testbed/astropy__astropy-12907/astropy/modeling/rotations.py', ' dtype=np.float64)'))
-
-with open('tmp.txt', 'r') as f:
-    text = f.read()
-print(extract_function_call(text)[2]['source_line'])
+with open("non_resolved_bugs.json", "w") as f:
+    json.dump(non_resolved_bugs, f, indent=4)

@@ -27,7 +27,7 @@ os.environ["OPENAI_API_BASE"] = api_base
 class LLMModel:
     def __init__(self, model_name: str, system_message: str, instance):
         self.instance = instance
-        self.model = ChatOpenAI(model=model_name, temperature=0.8)
+        self.model = ChatOpenAI(model=model_name)
         self.system_message = system_message
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     

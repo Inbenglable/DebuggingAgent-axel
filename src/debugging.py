@@ -8,16 +8,18 @@ import tiktoken
 import subprocess
 import ast
 import textwrap
+import inspect
+import traceback
 from pathlib import Path
-from datasets import load_dataset
+# from datasets import load_dataset
 from swe_log import init_logger, log_msg, log_and_print, remove_ansi_escape_sequences
 from model import LLMModel
-from retrieve_src import retrieve_code_element
+from retrieve_src import retrieve_code_element, retrieve_code_element_in_database
 from run_report import get_eval_report_for_log
 from prompt import GEN_DEBUGGING_TEST, DEBUGGING_AGENT_SYSTEM_MSG, \
     ANALYSE_TEST, MODIFY_SOURCE_CODE_HEAD, MODIFY_SOURCE_CODE_INSTRUCT, TOO_LONG_EXEC_RESULT, DEBUGGING_START_AFTER_TESTING, \
     CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD, REPAIR_COLLECT_HEAD, \
-    COLLECT_INSTRUCT, REPAIR_INSTRUCT
+    COLLECT_INSTRUCT, REPAIR_INSTRUCT, FILTER_INSTRUCT
 
 sys.path.append(os.path.abspath('/data/swe-fl/SRC/SWE-Bench-Validation/src'))
 from utils import get_test_directives
@@ -33,6 +35,8 @@ MODEL_NAME = 'gpt-4o'
 TESTBED_DIR = Path("/data/swe-fl/TMP/testbed/")
 DBGSNOOPER_DIR = Path("/data/swe-fl/SRC/pysnooper_axel/dbgsnooper")
 CHECKOUT_REPO_DIR = Path("/data/swe-fl/EXP/swe-evaluation/swe-verified-checkout/gold")
+
+EXP_DIR = "/data/swe-fl/SRC/DebuggingAgent/exp_wo_debugging"
 
 # os.environ['HF_DATASETS_CACHE'] = '~/.cache/huggingface/datasets/'
 
@@ -112,7 +116,77 @@ def execute_command(command: str) -> tuple:
         log_msg(e.stderr)
         return e.stdout, e.stderr
 
+def extract_filter_reply(response: str):
+    code_block_pattern = r"```(.*?)```"
+    match = re.search(code_block_pattern, response, re.DOTALL)
+    if match:
+        text = match.group(1).strip()
+    else:
+        raise ValueError("No Python code block found in the response.")
+    
+    filter_reply_results = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        filter_reply_reulst = {}
+        line = line.strip()
+        if ':' not in line:
+            continue
+        file_path, name = line.split(':')
+        filter_reply_reulst['file_path'] = file_path.strip()
+        
+        line_range_match = re.match(r'^(\d+)-(\d+)$', name)
+        if line_range_match:
+            start = int(line_range_match.group(1))
+            end = int(line_range_match.group(2))
+            filter_reply_reulst['start_line'] = start
+            filter_reply_reulst['end_line'] = end
+        else:
+            filter_reply_reulst['name'] = name.strip()
+        filter_reply_results.append(filter_reply_reulst)
+    if len(filter_reply_results) == 0:
+        raise ValueError("No valid filter reply results found.")
+    
+    return filter_reply_results    
+        
+    
+    
 
+def filter_and_choose_code_element(instance: dict, agent: LLMModel, retrieve_round_output: str, api_reply_dict):
+    key = list(api_reply_dict.keys())[0]
+    if len(api_reply_dict[key]) == 1:
+        return api_reply_dict[key]
+    
+    filtered_result = []
+    search_api_results = build_api_call_reply_promopt(api_reply_dict)
+    filter_prompt = FILTER_INSTRUCT.format(
+        project=instance['repo'].split('/')[1],
+        issue=instance['problem_statement'],
+        retrieve_round_output = retrieve_round_output,
+        search_api_results = search_api_results
+        )
+    response = query_model_with_retry(agent, filter_prompt, extract_filter_reply, instance)
+    extracted_reply = extract_filter_reply(response)
+    
+    if api_reply_dict[key][0]['type'] == 'line_range':
+        for item in extracted_reply:
+            for api_result in api_reply_dict[key]:
+                if api_result['path'] == item['file_path'] and api_result['start_line'] == item['start_line'] and api_result['end_line'] == item['end_line']:
+                    filtered_result.append(api_result)
+    
+    else:
+        for item in extracted_reply:
+            for api_result in api_reply_dict[key]:
+                if api_result['path'] == item['file_path'] and api_result['name'] == item['name']:
+                    filtered_result.append(api_result)
+    
+    if len(filtered_result) == 0:
+        raise ValueError("No valid filter reply results found.")
+    return filtered_result
+                        
+    
+    
+        
 
 def init_instance_testbed(instance: dict):
     # Setup testbed for target instance
@@ -133,7 +207,7 @@ def init_instance_testbed(instance: dict):
             shutil.rmtree(testbed_path)
             log_msg(f"Remove exist testbed_path: {testbed_path}")
         
-        shutil.copytree(raw_repo_path, testbed_path)
+        shutil.copytree(raw_repo_path, testbed_path, symlinks=True)
 
     except Exception as e:
         log_msg(f"Error copying repository: {e}")
@@ -339,12 +413,12 @@ def update_history(history: str, new_entry: str) -> str:
     new_history = history + new_entry + '\n' + '='*50 + '\n'
     return new_history
 
-def get_element_from_name(instance: dict, file_name: str, element_name: str, element_type: str, enable_line_number: bool = False):
+def get_element_from_name(instance: dict, file_name: str, element_name: str, element_type: str, enable_line_number: bool = False, relative_path: bool = True):
     if not os.path.exists(file_name):
         abs_file_path = instance['testbed_src_path'] / file_name
     else:
         abs_file_path = file_name
-    retrieve_result = retrieve_code_element(abs_file_path, element_name, element_type, enable_line_number)
+    retrieve_result = retrieve_code_element(abs_file_path, element_name, element_type, enable_line_number, relative_path, instance)
     return retrieve_result
 
 def judge_response_with_json(response: str, instance) -> bool:
@@ -421,64 +495,104 @@ def judge_ready_generation(response: str):
     return False
 
 
-
-def process_api_call(response: str, instance):
+def judge_api_call(response: str, instance: dict, agent: LLMModel):
     function_calls = extract_function_call(response)
     if len(function_calls) > 0:
         results = {}
         for function_call in function_calls:
-            api_response = function_invoke(function_call, instance)
-            if len(api_response)>0:
-                results[function_call['source_line']] = api_response
+            try:
+                api_response = function_invoke(response, function_call, instance, agent, judge=True)
+                if len(api_response)>0:
+                    results[function_call['source_line']] = api_response
+            except:
+                continue
+        if len(results) == 0:
+            raise ValueError("No valid API call result.")
         return results
     elif judge_ready_generation(response):
         return 'ready'
     else:
         raise ValueError("No API call or Ready Generation Signal found in the response.")
 
-def build_api_call_reply_promopt(api_call_results):
+def process_api_call(response: str, instance: dict, agent: LLMModel):
+    function_calls = extract_function_call(response)
+    if len(function_calls) > 0:
+        results = {}
+        for function_call in function_calls:
+            try:
+                api_response = function_invoke(response, function_call, instance, agent)
+                if len(api_response)>0:
+                    results[function_call['source_line']] = api_response
+            except Exception as e:
+                source_line = function_call['source_line']
+                log_and_print(f"Error occurred when invoking function call: {source_line}. Error: {str(e)}")
+                
+        if len(results) == 0:
+            raise ValueError("No valid API call result.")
+        return results
+    elif judge_ready_generation(response):
+        return 'ready'
+    else:
+        raise ValueError("No API call or Ready Generation Signal found in the response.")
+
+def build_api_call_reply_promopt(api_call_results) -> str:
     prompt = 'Your API invoke result:\n'
     for api_call_result in api_call_results:
         prompt+= f'\n### API INVOKE: {api_call_result}\nRESULT:\n'
         for retrieve_info in api_call_results[api_call_result]:
             file_path = retrieve_info['path']
             element_name = retrieve_info['name']
-            prompt += f'#### {file_path}:{element_name}\n'
+            if retrieve_info['type'] != 'code_snippet':
+                prompt += f'#### {file_path}:{element_name}\n'
+            else:
+                start_line = retrieve_info['start_line']
+                end_line = retrieve_info['end_line']
+                prompt += f'#### {file_path}:{start_line}-{end_line}\n'
             retrieve_code = retrieve_info['code']
-            prompt += f'```python\n{retrieve_code}\n```\n'
+            prompt += f'```python\n{retrieve_code}\n```\n\n'
             
     return prompt
         
         
-
+def save_chat(instance: dict, prompt: str, response: str):
+    detailed_chat_dir = Path(f"{EXP_DIR}/{instance['instance_id']}/chat")
+    if not detailed_chat_dir.exists():
+        detailed_chat_dir.mkdir(parents=True)
+    cur_index = 0
+    for file in os.listdir(detailed_chat_dir):
+        file_index = int(file.split("_")[0])
+        if file_index > cur_index:
+            cur_index = file_index
+    with open(detailed_chat_dir / f"{cur_index + 1}_input.txt", "w") as f:
+        f.write(prompt + "\n")
+    with open(detailed_chat_dir / f"{cur_index + 1}_output.txt", "w") as f:
+        f.write(response + "\n")
 
 def query_model_with_retry(model: LLMModel, prompt: str, judge_function, instance, max_retries: int = 5, retry_msg: str = None):
     success = False
     retries = 0
+    response = ''
     while retries < max_retries:
         retries += 1
         try:
             response = model.query_model(prompt)
-            if judge_function(response, instance):
-                success = True
-                break
+            save_chat(instance, prompt, response)
+            if len(inspect.signature(judge_function).parameters) == 1:
+                if judge_function(response):
+                    success = True
+                    break
+            if len(inspect.signature(judge_function).parameters) == 2:
+                if judge_function(response, instance):
+                    success = True
+                    break
+            elif len(inspect.signature(judge_function).parameters) == 3:
+                if judge_function(response, instance, model):
+                    success = True
+                    break
         except Exception as e:
             if retry_msg:
                 log_and_print(retry_msg)
             log_and_print(f"Error occurred when querying model.\n{str(e)}\nRetrying..({retries}/{max_retries})")
-        finally:
-            detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance['instance_id']}/chat")
-            if not detailed_chat_dir.exists():
-                detailed_chat_dir.mkdir(parents=True)
-            cur_index = 0
-            for file in os.listdir(detailed_chat_dir):
-                file_index = int(file.split("_")[0])
-                if file_index > cur_index:
-                    cur_index = file_index
-            with open(detailed_chat_dir / f"{cur_index + 1}_input.txt", "w") as f:
-                f.write(prompt + "\n")
-            with open(detailed_chat_dir / f"{cur_index + 1}_output.txt", "w") as f:
-                f.write(response + "\n")
                 
     if not success:
         log_and_print("Failed to get valid model response after multiple attempts.")
@@ -579,14 +693,14 @@ def apply_patch(instance: dict, debugging_instruction: dict):
     }
     """
     edits = debugging_instruction.get("search_replace_edits", [])
-    # save edits in log dir
-    with open(f'/data/swe-fl/SRC/DebuggingAgent/log/{instance["instance_id"]}/{instance["instance_id"]}_edits.log', 'w') as f:
-        f.write('\n'.join(edits))
+    if not edits:
+        raise ValueError("No dictionary key named 'search_replace_edits' found in debugging_instruction.")
+
     # Group edits by file path
     file_edits = {}
     for edit in edits:
-        lines = edit.split('\n')
         try:
+            lines = edit.split('\n')
             file_path = lines[0].replace('### ', '')
             file_path = file_path.strip()
             if file_path not in file_edits:
@@ -604,88 +718,103 @@ def apply_patch(instance: dict, debugging_instruction: dict):
             
         except (ValueError, IndexError) as e:
             log_msg(f"Invalid edit format: {str(e)}")
-            raise ValueError("Malformed search/replace edit block") from e
+            raise ValueError("Malformed search/replace edit block. Are you sure the format follows the example of a *SEARCH/REPLACE* edit correctly?") from e
 
+    with open(f'{EXP_DIR}/{instance["instance_id"]}/{instance["instance_id"]}_edits.log', 'w') as f:
+        f.write('\n'.join(edits))
+    
+    
+    modified_files = set()
     # Process each file
-    for file_path, edits in file_edits.items():
-        if not os.path.exists(file_path):
-            abs_path = instance['testbed_src_path'] / file_path
-        else:
-            abs_path = file_path
-        if not os.path.exists(abs_path):
-            log_msg(f"File not found: {abs_path}")
-            raise FileNotFoundError(f"File not found: {abs_path}")
-
-        # Read original content
-        with open(abs_path, 'r') as f:
-            content = f.read()
-
-        # Apply edits sequentially
-        modified = content
-        for search, replace in edits:
-            if search in modified:
-                modified = modified.replace(search, replace, 1)  # Replace first occurrence
-                continue
-            # Normalize and strip for matching
-            modified_lines = modified.split('\n')
-            modified_stripped_lines = [line.strip() for line in modified_lines]
-            modified_normalized = '\n'.join(modified_stripped_lines)
-
-            search_lines = search.split('\n')
-            search_stripped_lines = [line.strip() for line in search_lines]
-            search_normalized = '\n'.join(search_stripped_lines)
-
-            if search_normalized in modified_normalized:
-                for i in range(len(modified_lines) - len(search_lines) + 1):
-                    window = modified_lines[i:i+len(search_lines)]
-                    window_stripped = [line.strip() for line in window]
-                    if '\n'.join(window_stripped) == search_normalized:
-                        # 计算最小缩进
-                        indent_levels = [
-                            len(line) - len(line.lstrip())
-                            for line in window if line.strip() != ''
-                        ]
-                        min_indent = min(indent_levels) if indent_levels else 0
-
-                        # 应用缩进到 replace 块
-                        replace_lines = replace.split('\n')
-                        
-                        replace_indent_levels = [
-                            len(line) - len(line.lstrip())
-                            for line in replace_lines if line.strip() != ''
-                        ]
-                        replace_min_indent = min(replace_indent_levels) if replace_indent_levels else 0
-
-                        # 去除原有缩进后再加上目标缩进
-                        adjusted_replace = '\n'.join(
-                            (' ' * min_indent + line[replace_min_indent:] if line.strip() != '' else '')
-                            for line in replace_lines
-                        )
-                        # 替换原内容
-                        modified_lines = (
-                            modified_lines[:i] +
-                            adjusted_replace.split('\n') +
-                            modified_lines[i+len(search_lines):]
-                        )
-                        modified = '\n'.join(modified_lines)
-                        log_and_print('fuzzy search matched and replaced')
-                        break
+    try:
+        for file_path, edits in file_edits.items():
+            if not os.path.exists(file_path):
+                abs_path = instance['testbed_src_path'] / file_path
             else:
-                log_msg(f"Search block not found in {file_path}:\n{search}")
-                raise ValueError("Search pattern not found in file.")
+                abs_path = Path(file_path)
+            if not abs_path.exists():
+                log_msg(f"File not found: {abs_path}")
+                raise FileNotFoundError(f"File not found: {abs_path}")
 
-        # Create backup if needed
-        backup_path = abs_path.with_suffix(abs_path.suffix + '.bak')
-        if not os.path.exists(backup_path):
-            shutil.copy(abs_path, backup_path)
-            log_msg(f"Created backup at {backup_path}")
+            # Read original content
+            with open(abs_path, 'r') as f:
+                content = f.read()
 
-        # Write modified content
-        with open(abs_path, 'w') as f:
-            f.write(modified)
-            
-        log_msg(f"Applied {len(edits)} edits to {file_path}")
+            # Apply edits sequentially
+            modified = content
+            for search, replace in edits:
+                if search in modified:
+                    modified = modified.replace(search, replace)  # Replace all occurrence
+                    continue
+                # Normalize and strip for matching
+                modified_lines = modified.split('\n')
+                modified_stripped_lines = [line.strip() for line in modified_lines]
+                modified_normalized = '\n'.join(modified_stripped_lines)
 
+                search_lines = search.split('\n')
+                search_stripped_lines = [line.strip() for line in search_lines]
+                search_normalized = '\n'.join(search_stripped_lines)
+
+                if search_normalized in modified_normalized:
+                    for i in range(len(modified_lines) - len(search_lines) + 1):
+                        window = modified_lines[i:i+len(search_lines)]
+                        window_stripped = [line.strip() for line in window]
+                        if '\n'.join(window_stripped) == search_normalized:
+                            # 计算最小缩进
+                            indent_levels = [
+                                len(line) - len(line.lstrip())
+                                for line in window if line.strip() != ''
+                            ]
+                            min_indent = min(indent_levels) if indent_levels else 0
+
+                            # 应用缩进到 replace 块
+                            replace_lines = replace.split('\n')
+                            
+                            replace_indent_levels = [
+                                len(line) - len(line.lstrip())
+                                for line in replace_lines if line.strip() != ''
+                            ]
+                            replace_min_indent = min(replace_indent_levels) if replace_indent_levels else 0
+
+                            # 去除原有缩进后再加上目标缩进
+                            adjusted_replace = '\n'.join(
+                                (' ' * min_indent + line[replace_min_indent:] if line.strip() != '' else '')
+                                for line in replace_lines
+                            )
+                            # 替换原内容
+                            modified_lines = (
+                                modified_lines[:i] +
+                                adjusted_replace.split('\n') +
+                                modified_lines[i+len(search_lines):]
+                            )
+                            modified = '\n'.join(modified_lines)
+                            log_and_print('fuzzy search matched and replaced')
+                            break
+                else:
+                    log_msg(f"Search block not found in {file_path}:\n{search}")               
+                    raise ValueError("Search pattern not found in file.")
+
+            # Create backup if needed
+            modified_files.add(abs_path)
+            backup_path = abs_path.with_suffix(abs_path.suffix + '.bak')
+            if not os.path.exists(backup_path):
+                shutil.copy(abs_path, backup_path)
+                log_msg(f"Created backup at {backup_path}")
+
+            # Write modified content
+            with open(abs_path, 'w') as f:
+                f.write(modified)
+                
+            log_msg(f"Applied {len(edits)} edits to {file_path}")
+    except Exception as e:
+        for modified_file in modified_files:
+            # Cancel all modifications if one fails
+            backup_path = modified_file.with_suffix(modified_file.suffix + '.bak')
+            if os.path.exists(backup_path):
+                shutil.copy(backup_path, modified_file)
+                log_msg(f"Restored backup for {modified_file}")   
+        raise
+    return list(modified_files)
 
 def modify_code_resolve_issue(instance: dict, debugging_agent: LLMModel, file_path: str, method: str, history: str, test_code: str):
     method_code = get_element_from_name(instance, file_path, method, element_type = 'method')[0]['code']
@@ -746,7 +875,7 @@ def evaluation(instance: dict):
     cmd = f"cd {instance['testbed_src_path']} && conda run -n {instance['conda_env_name']} {instance['test_cmd']}"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     
-    save_dir = f'/data/swe-fl/SRC/DebuggingAgent/log/{instance["instance_id"]}'
+    save_dir = f'{EXP_DIR}/{instance["instance_id"]}'
     eval_log_path = os.path.join(save_dir, 'evaluation.log')
     eval_report_path = os.path.join(save_dir, 'evaluation_report.json')
     
@@ -767,7 +896,7 @@ def extract_function_call(text):
         # log_and_print("No Python code block found in the response.")
         return []
     
-    function_names = {"search_method_in_file", "search_class_in_file", "search_code_in_file"}
+    function_names = {"search_method_in_file", "search_class_in_file", "search_code_in_file","search_method_in_codebase","search_class_in_codebase","search_code_in_codebase"}
     results = []
 
     # 保留行信息，为了后面能用 lineno 取出原始字符串
@@ -812,7 +941,7 @@ def extract_function_call(text):
 
 
 
-def function_invoke(function_call_dict, instance):
+def function_invoke(previous_round_output, function_call_dict, instance, agent: LLMModel, judge = False):
     function_name = function_call_dict['function']
     args = function_call_dict['args']
     file_path = args[0]
@@ -822,12 +951,30 @@ def function_invoke(function_call_dict, instance):
     
     
     if function_name == 'search_method_in_file' or function_name == 'search_class_in_file':
-        method_name = args[1]
-        return get_element_from_name(instance, file_path, method_name, element_type = function_name.split('_')[1])
+        element_name = args[1]
+        return get_element_from_name(instance, file_path, element_name, element_type = function_name.split('_')[1])
 
     elif function_name == 'search_code_in_file':
         code_snippet = args[1]
         return get_element_from_name(instance, file_path, code_snippet, element_type = 'code_snippet')
+    elif function_name == 'search_method_in_codebase' or function_name == 'search_class_in_codebase':
+        element_name = args[0]
+        result = retrieve_code_element_in_database(instance, element_name, element_type = function_name.split('_')[1], relative_path = True)
+        if judge:
+            return result
+        source_line = function_call_dict['source_line']
+        api_response = {}
+        api_response[source_line] = result
+        return filter_and_choose_code_element(instance, agent, previous_round_output, api_response)
+    elif function_name == 'search_code_in_codebase':
+        code_snippet = args[0]
+        result = retrieve_code_element_in_database(instance, code_snippet, element_type = 'code_snippet', relative_path = True)
+        if judge:
+            return result
+        source_line = function_call_dict['source_line']
+        api_response = {}
+        api_response[source_line] = result
+        return filter_and_choose_code_element(instance, agent, previous_round_output, api_response)
     else:
         raise ValueError(f"Unknown function call: {function_name}")
 
@@ -842,26 +989,29 @@ def repair_process(instance: dict, debugging_history: str = None):
     if debugging_history:
         repair_head_prompt += 'A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is its debugging history:\n' + debugging_history + '\n'
     repair_initial_prompt = repair_head_prompt + COLLECT_INSTRUCT
-    response = query_model_with_retry(repair_agent, repair_initial_prompt, process_api_call, instance)
+    response = query_model_with_retry(repair_agent, repair_initial_prompt, judge_api_call, instance)
     retrieve_history = 'You have called API to retrieve some code and this is your API call and reply history:\n' + '=' * 50 + '\nYour Output:\n' + response + '\n' + '=' * 50 + '\n'
     
     collect_retries = 0
     
-    while collect_retries < 2:
-        api_result = process_api_call(response, instance)
+    max_collect_times = 4
+    
+    while collect_retries < max_collect_times:
+        api_result = process_api_call(response, instance, repair_agent)
         if api_result == 'ready':
             log_and_print('Ready to generate')
             break
         else:
             collect_retries += 1
-            log_and_print(f'API call {collect_retries}/2')
+            log_and_print(f'API call {collect_retries}/{max_collect_times}')
             api_result_prompt = build_api_call_reply_promopt(api_result)
             retrieve_history = update_history(retrieve_history, api_result_prompt)
             query_prompt = repair_head_prompt + retrieve_history + COLLECT_INSTRUCT
-            response = query_model_with_retry(repair_agent, query_prompt, process_api_call, instance)
+            response = query_model_with_retry(repair_agent, query_prompt, judge_api_call, instance)
             retrieve_history = update_history(retrieve_history, '\nYour Output:\n' + response)
     
     repair_prompt = repair_head_prompt + retrieve_history + REPAIR_INSTRUCT
+    
     
     success = False
     retries = 0
@@ -869,7 +1019,7 @@ def repair_process(instance: dict, debugging_history: str = None):
         try:
             modify_src_response = query_model_with_retry(repair_agent, repair_prompt, judge_response_with_json, instance)
             modify_src_instruction = extract_json_instruction(modify_src_response)
-            apply_patch(instance, modify_src_instruction)
+            modified_files = apply_patch(instance, modify_src_instruction)
             success = True
             break
         except Exception as e:
@@ -883,47 +1033,88 @@ def repair_process(instance: dict, debugging_history: str = None):
         log_and_print("Failed to apply patch after multiple attempts.")
         raise ValueError("Failed to apply patch after multiple attempts.")
     
-        
-        
+    return modified_files
+    
+         
     
 def main():
+    start_time = time.time()
+    with open('/data/swe-fl/SRC/DebuggingAgent/bug_list.json','r') as f:
+        bug_list = json.load(f)
+    for bug in bug_list:
+        if bug != 'sphinx-doc__sphinx-8595':
+            continue
+        instance_id = bug
+        evaluate_report_path = f'{EXP_DIR}/{instance_id}/evaluation_report.json'
+        with open(evaluate_report_path, 'r') as f:
+            evaluate_report = json.load(f)
+        if evaluate_report['status'] == 'RESOLVED_FULL':
+            print(f'{instance_id} has been repaired')
+            continue
+        try:
 
-    instance_id = 'astropy__astropy-12907'
-    detailed_chat_dir = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}/chat")
-    if os.path.exists(detailed_chat_dir):
-        shutil.rmtree(detailed_chat_dir)
-    log_path = Path(f"/data/swe-fl/SRC/DebuggingAgent/log/{instance_id}/{instance_id}.log")
+            log_path = Path(f"{EXP_DIR}/{instance_id}/{instance_id}.log")
+            init_logger(log_path)
+            
+            print('start load_instance_data')
+            instance = load_instance_data(instance_id)
+            
+            print('start init_instance_testbed')
+            # init_instance_testbed(instance)
+            
+            total_max_exception_retry_times = 3
+            cur_times = 0
+            success = False
+            while cur_times < total_max_exception_retry_times:
+                try:
+                    detailed_chat_dir = Path(f"{EXP_DIR}/{instance_id}/chat")
+                    if os.path.exists(detailed_chat_dir):
+                        shutil.rmtree(detailed_chat_dir)
+                    # print('start debugging_process')
+                    # history = debugging_process(instance)
+                    # print('start repair_process')
+                    # repair_process(instance, history)
+                    repair_process(instance)
+                    success = True
+                    break
+                except Exception as e:
+                    log_and_print(f"Error occurred: {e}")
+                    traceback.print_exc()
+                    cur_times += 1
+                    if cur_times == total_max_exception_retry_times:
+                        raise ValueError("Debugging and repair process failed after multiple retries.")
 
-    
-    init_logger(log_path)
-    
-    print('start load_instance_data')
-    instance = load_instance_data(instance_id)
-    
-    # print('start init_instance_testbed')
-    # init_instance_testbed(instance)
-    
-    print('start debugging_process')
-    history = debugging_process(instance)
-    
-    print('start repair_process')
-    repair_process(instance, history)
-    # repair_process(instance)
-    
-    evaluation(instance)
 
+            
+            if success:
+                log_and_print('Debugging process completed successfully. Start evaluation')
+                evaluation(instance)
+            else:
+                log_and_print('Debugging process failed after multiple attempts. Please check the logs for more details.')
 
-    # reproduce_issue(instance)
-    # get_covered_filetree(instance)
+        except Exception as e:
+            log_and_print(f"Crush in bug {instance_id}: {e}")
+            continue
+        
 
-# astropy__astropy-13579 
-# astropy__astropy-14096
-# astropy__astropy-8872
-# astropy__astropy-13453 fail
-    pass
+    end_time = time.time()
+    print(f"Total time taken: {end_time - start_time} seconds")
+
+    # astropy__astropy-13579 
+    # astropy__astropy-14096
+    # astropy__astropy-8872
+    # astropy__astropy-13453 fail
+
 
 
 if __name__ == '__main__':
-    main()
+    # main()
+    instance = load_instance_data('sphinx-doc__sphinx-8595')
+    agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
+    with open('tmp.txt','r') as f:
+        response = f.read()
+    result = process_api_call(response, instance, agent)
+    import pprint
+    pprint.pprint(result)
 
 

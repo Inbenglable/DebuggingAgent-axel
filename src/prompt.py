@@ -225,14 +225,20 @@ Ready generation: `True`
 If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
 You can use the following APIs to search source code.
 1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
-2. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
-3. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
 
 You should finally reply in the following format:
 ```python
 search_method_in_file("FILE_PATH", "METHOD_NAME")
 search_class_in_file("FILE_PATH", "CLASS_NAME")
 search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
 ```
 Note the format should obeys the following rules:
 1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
@@ -246,6 +252,36 @@ Now, please first analyze whether you need to retrieve any source code or if you
 Then choose one of the two options above and follow the format to reply.
 '''
 
+FILTER_INSTRUCT = '''
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **{project}** project:
+#### ISSUE
+{issue}
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+{retrieve_round_output}
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+{search_api_results}
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+'''
+
+
+
 # Then you have two options. (Choose only one of them):
 # 1. If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
 # 2. If you already have enough information, go ahead and generate the patch.
@@ -253,20 +289,19 @@ Then choose one of the two options above and follow the format to reply.
 # **Important:** Once you've gathered enough code to generate the patch, stop invoking the search APIs. Retrieving too much code can cause confusion and make it harder to generate an accurate fix.
 
 
+# 1. The file path
+# 2. The start of search block: <<<<<<< SEARCH
+# 3. A contiguous chunk of lines to search for in the existing source code
+# 4. The dividing line: =======
+# 5. The lines to replace into the source code
+# 6. The end of the replace block: >>>>>>> REPLACE
+
+# An example of *SEARCH/REPLACE* edit:
 REPAIR_INSTRUCT = '''
 Now, you need to generate patches to resolve the issue. Please ensure that your patch does not disrupt the original functionality of the code.
 You should generate *SEARCH/REPLACE* format patches to fix the issue.
 Every *SEARCH/REPLACE* edit must use this format:
-1. The file path
-2. The start of search block: <<<<<<< SEARCH
-3. A contiguous chunk of lines to search for in the existing source code
-4. The dividing line: =======
-5. The lines to replace into the source code
-6. The end of the replace block: >>>>>>> REPLACE
-
-Here is an example of a *SEARCH/REPLACE* edit:
-
-```python
+```pythony
 ### mathweb/flask/app.py
 <<<<<<< SEARCH
 from flask import Flask
@@ -283,5 +318,15 @@ You should finally provide edit result in the following JSON format (each {SEARC
     "{SEARCH_REPLACE_EDIT_2}",
   ]
 }
+
+A final json reply example:
+```json
+{
+  "search_replace_edits": [
+    "### A/B.py\\n<<<<<<< SEARCH\n       def foo():\\n=======\\n    def bar():\\n>>>>>>> REPLACE\\n",
+    "### A/B.py\\n<<<<<<< SEARCH\n       x = x + 1\\n=======\\n    x = x - 1\\n>>>>>>> REPLACE\\n",
+}
+```
+
 
 '''
