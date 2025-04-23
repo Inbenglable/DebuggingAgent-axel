@@ -1,0 +1,286 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+#### ISSUE
+admin.E108 is raised on fields accessible only via instance.
+Description
+	 
+		(last modified by ajcsimons)
+	 
+As part of startup django validates the ModelAdmin's list_display list/tuple for correctness (django.admin.contrib.checks._check_list_display). Having upgraded django from 2.07 to 2.2.1 I found that a ModelAdmin with a list display that used to pass the checks and work fine in admin now fails validation, preventing django from starting. A PositionField from the django-positions library triggers this bug, explanation why follows.
+from django.db import models
+from position.Fields import PositionField
+class Thing(models.Model)
+ number = models.IntegerField(default=0)
+ order = PositionField()
+from django.contrib import admin
+from .models import Thing
+@admin.register(Thing)
+class ThingAdmin(admin.ModelAdmin)
+ list_display = ['number', 'order']
+Under 2.2.1 this raises an incorrect admin.E108 message saying "The value of list_display[1] refers to 'order' which is not a callable...".
+Under 2.0.7 django starts up successfully.
+If you change 'number' to 'no_number' or 'order' to 'no_order' then the validation correctly complains about those.
+The reason for this bug is commit ​https://github.com/django/django/commit/47016adbf54b54143d4cf052eeb29fc72d27e6b1 which was proposed and accepted as a fix for bug https://code.djangoproject.com/ticket/28490. The problem is while it fixed that bug it broke the functionality of _check_list_display_item in other cases. The rationale for that change was that after field=getattr(model, item) field could be None if item was a descriptor returning None, but subsequent code incorrectly interpreted field being None as meaning getattr raised an AttributeError. As this was done after trying field = model._meta.get_field(item) and that failing that meant the validation error should be returned. However, after the above change if hasattr(model, item) is false then we no longer even try field = model._meta.get_field(item) before returning an error. The reason hasattr(model, item) is false in the case of a PositionField is its get method throws an exception if called on an instance of the PositionField class on the Thing model class, rather than a Thing instance.
+For clarity, here are the various logical tests that _check_list_display_item needs to deal with and the behaviour before the above change, after it, and the correct behaviour (which my suggested patch exhibits). Note this is assuming the first 2 tests callable(item) and hasattr(obj, item) are both false (corresponding to item is an actual function/lambda rather than string or an attribute of ThingAdmin).
+hasattr(model, item) returns True or False (which is the same as seeing if getattr(model, item) raises AttributeError)
+model._meta.get_field(item) returns a field or raises FieldDoesNotExist
+Get a field from somewhere, could either be from getattr(model,item) if hasattr was True or from get_field.
+Is that field an instance of ManyToManyField?
+Is that field None? (True in case of bug 28490)
+ hasattr get_field field is None? field ManyToMany? 2.0 returns 2.2 returns Correct behaviour Comments 
+ True ok False False [] [] [] - 
+ True ok False True E109 E109 E109 - 
+ True ok True False E108 [] [] good bit of 28490 fix, 2.0 was wrong 
+ True raises False False [] [] [] - 
+ True raises False True E109 [] E109 Another bug introduced by 28490 fix, fails to check if ManyToMany in get_field raise case 
+ True raises True False E108 [] [] good bit of 28490 fix, 2.0 was wrong 
+ False ok False False [] E108 [] bad bit of 28490 fix, bug hit with PositionField 
+ False ok False True [] E108 E109 both 2.0 and 2.2 wrong 
+ False ok True False [] E108 [] bad 28490 fix 
+ False raises False False E108 E108 E108 - 
+ False raises False True E108 E108 E108 impossible condition, we got no field assigned to be a ManyToMany 
+ False raises True False E108 E108 E108 impossible condition, we got no field assigned to be None 
+The following code exhibits the correct behaviour in all cases. The key changes are there is no longer a check for hasattr(model, item), as that being false should not prevent us form attempting to get the field via get_field, and only return an E108 in the case both of them fail. If either of those means or procuring it are successful then we need to check if it's a ManyToMany. Whether or not the field is None is irrelevant, and behaviour is contained within the exception catching blocks that should cause it instead of signalled through a variable being set to None which is a source of conflation of different cases.
+def _check_list_display_item(self, obj, item, label):
+	if callable(item):
+		return []
+	elif hasattr(obj, item):
+		return []
+	else:
+		try:
+			field = obj.model._meta.get_field(item)
+		except FieldDoesNotExist:
+			try:
+				field = getattr(obj.model, item)
+			except AttributeError:
+				return [
+					checks.Error(
+						"The value of '%s' refers to '%s', which is not a callable, "
+						"an attribute of '%s', or an attribute or method on '%s.%s'." % (
+							label, item, obj.__class__.__name__,
+							obj.model._meta.app_label, obj.model._meta.object_name,
+						),
+						obj=obj.__class__,
+						id='admin.E108',
+					)
+				]
+		if isinstance(field, models.ManyToManyField):
+			return [
+				checks.Error(
+					"The value of '%s' must not be a ManyToManyField." % label,
+					obj=obj.__class__,
+					id='admin.E109',
+				)
+			]
+		return []
+
+A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is its debugging history:
+
+==================================================
+The error being raised, `ImportError: cannot import name 'admin'`, indicates that the line `from django.contrib.admin import admin` in the test code is incorrect. The `admin` module in Django's `contrib.admin` package does not contain an `admin` attribute; the import should usually be done as `from django.contrib import admin` to access the `admin` module and its features appropriately.
+
+However, the real underlying issue is related to the `admin.E108` error being raised due to a problem in the `_check_list_display_item` function in the Django codebase, specifically when using fields like `PositionField` in the `list_display`. The issue arises because the existing code incorrectly handles cases where `hasattr(model, item)` is false, preventing checking the field via `get_field`.
+
+To trace the program's behavior to locate the buggy method in the Django codebase, we should focus on the function `_check_list_display_item` inside the Django admin check mechanism.
+
+Therefore, to further trace the behavior and locate the root cause, the next method to observe is the `_check_list_display_item` method within the Django codebase responsible for these checks.
+
+Observed method: `django/contrib/admin/checks.py:_check_list_display_item`
+==================================================
+The abnormal program behavior stems from an issue within the `_check_list_display_item` method of the Django project. The main problem is that the method incorrectly handles cases where `hasattr(model, item)` is false by preventing checking the field via `get_field`. The incorrect handling leads to the triggering of an admin.E108 error even when the `PositionField` should be acceptable.
+
+Let's analyze the code snippet for `_check_list_display_item`:
+
+```python
+718    def _check_list_display_item(self, obj, item, label):
+719        if callable(item):
+720            return []
+721        elif hasattr(obj, item):
+722            return []
+723        elif hasattr(obj.model, item):
+724            try:
+725                field = obj.model._meta.get_field(item)
+726            except FieldDoesNotExist:
+727                return []
+728            else:
+729                if isinstance(field, models.ManyToManyField):
+730                    return [
+731                        checks.Error(
+732                            "The value of '%s' must not be a ManyToManyField." % label,
+733                            obj=obj.__class__,
+734                            id='admin.E109',
+735                        )
+736                    ]
+737                return []
+738        else:
+739            return [
+740                checks.Error(
+741                    "The value of '%s' refers to '%s', which is not a callable, "
+742                    "an attribute of '%s', or an attribute or method on '%s.%s'." % (
+743                        label, item, obj.__class__.__name__,
+744                        obj.model._meta.app_label, obj.model._meta.object_name,
+745                    ),
+746                    obj=obj.__class__,
+747                    id='admin.E108',
+748                )
+749            ]
+```
+
+The current logic flow involves:
+- Checking if the `item` is callable.
+- Checking if the `item` is an attribute of `obj`.
+- Checking if the `item` is an attribute of `obj.model`.
+
+The problematic lines are involved in checking whether `hasattr(model, item)` which should not prevent attempting to get the field via `get_field`.
+
+### Analysis:
+- If `hasattr(obj.model, item)` is false, the method does not try `obj.model._meta.get_field(item)`, prematurely returning admin.E108.
+- According to the correct behavior analysis, the `hasattr` should not prevent checking `get_field(item)`.
+
+### Determination:
+The issue stems from mishandling field validation when `hasattr` returns false, which is precisely affecting the PositionField cases.
+
+### Next Step:
+Since the main issue relates to the logic following the checks, we should observe the try-except block surrounding the field acquisition via `_meta.get_field`.
+
+Therefore, I will focus next on tracing the specific lines where the `get_field` method is invoked to better determine the runtime behavior and issues.
+
+#### Observed scope:
+`django/contrib/admin/checks.py:724-727`
+==================================================
+### Analysis of Current Observed Code:
+
+The `_check_list_display_item` method is part of Django's admin validation checks. It contains logic to validate `list_display` items in ModelAdmin configurations. The specific lines observed involve the use of `obj.model._meta.get_field(item)`:
+
+```python
+724	            try:
+725	                field = obj.model._meta.get_field(item)
+726	            except FieldDoesNotExist:
+727	                return []
+```
+
+### Observations:
+
+- **Objective**: These lines aim to safely retrieve a field from the model's metadata using `get_field(item)`. If the field does not exist, `FieldDoesNotExist` is caught, which should normally allow continuation without an error in this specific context.
+- **Potential Misstep**: If `FieldDoesNotExist` is caught, it should not directly lead to returning `[]` unless absolutely necessary. This return prematurely exits the check process without performing adequate validation or attempts to retrieve the item using alternative methods.
+  
+### Abnormal Behavior:
+
+The abnormal behavior originates from handling cases where `item` may not exist as a field. The existing logic doesn't adequately handle instances derived from field descriptors, like `PositionField`, which can throw exceptions not accounted for by just checking with `hasattr(obj.model, item)`.
+
+### Determination:
+
+Having previously observed the incorrect result flow due to `hasattr(obj.model, item)` being false, this exception block (727: `return []`) should be your primary point of focus since it might contribute to falsely summarizing the issue.
+
+Considering the abnormal program behavior:
+- The premature return from exception leads to incomplete validation, especially when dealing with complex fields derived from mix-in libraries like position fields.
+- Correct handling necessitates allowing another failure scope before returning errors related to `admin.E108`.
+
+Since the logic centered around `_check_list_display_item` involves several layers around retrieving field attributes and confirms errors based on specific conditions, we can infer this code snippet contributes significantly to the conditions leading to admin.E108 errors.
+
+### Next Steps:
+
+Given that initial "try" block failure falls back on mysterious returns, the root imbalance could still reside in how checks are applied earlier in the method, affecting subsequent validation.
+
+Let's continue tracing to ensure adequate corrections by further scrutinizing method invocation, potentially above these specific lines when validation faces conditions not covered by `hasattr()`.
+
+#### Observed method:
+
+Let's observe the encompassing `_check_list_display_item` function to explore all layers affecting validation logic.
+
+Observed method: `django/contrib/admin/checks.py:ModelAdminChecks._check_list_display_item`
+==================================================
+### Analysis of Current Observed Code
+
+The `_check_list_display_item` method affects validation for ModelAdmin's `list_display` items. Here's the restatement of its flow:
+
+- **Callable Check**: If `item` is callable, it returns an empty list suggesting correctness since functions are valid in display lists.
+- **Direct Attribute Check**: Checks if `item` is an attribute of `obj`; if true, returns an empty list (correct behavior).
+- **Model Attribute Check**: Checks if `item` is an attribute of `obj.model`. If so, attempts to fetch with `get_field`:
+  - **Retrieval via `get_field`**: Encapsulated in a try-except block, returning `[]` upon `FieldDoesNotExist`.
+  - **Checking Field Type**: If `get_field` yields a field, checks if it's a `ManyToManyField`, returning an admin.E109 error.
+- **Final Check**: If none of the above, returns admin.E108 error indicating `item` isn't callable or a valid attribute.
+  
+### Observations
+
+- **Premature Return**: Issues arise because premature returns (lines 727: `return []` post `FieldDoesNotExist`) could leave other non-traditional fields or descriptors unvalidated or wrongly flagged.
+- **Positioning Field**: A field like PositionField which may have special descriptor semantics isn't managed well by just `hasattr` checks.
+- **Final Error**: If field resolution pathways are exhausted, admin.E108 is being returned even when PositionField attributes should relay valid information.
+
+### Determination
+
+The issue lies in the logic surrounding `hasattr()` and retrieval methods in `_check_list_display_item`, primarily influencing how `admin.E108` gets raised. The failure to properly cover cases where special descriptors exist signifies a bug in object attribute resolution.
+
+### Next Steps
+
+Given our understanding of immediate function flaws, especially around exception handling and premature conclusion points, deeper tracing around attribute resolution logic in this scope is critical. We need to look inside the field acquisition attempts further.
+
+Let's proceed by deeper analysis within the area critical to failure predictions, notably lines 724 to 727 (covers `get_field(item)` execution and exception handling).
+
+#### Observed scope:
+`django/contrib/admin/checks.py:724-727`
+==================================================
+Based on the analysis of the `_check_list_display_item` method in the Django codebase and the current observations, it is clear that the method incorrectly handles cases involving special descriptor fields like `PositionField` due to the logic primarily using `hasattr()` and not appropriately handling exceptions.
+
+### Current Observations:
+
+1. **`FieldDoesNotExist`**: The exception `FieldDoesNotExist` being caught and immediately returning `[]` creates a gap in correctly resolving potential fields via alternative methods.
+2. **Premature Exit**: The premature returns in the code skip further validation processes. Specifically, when `get_field` raises `FieldDoesNotExist`, it should lead to attempting further checks before concluding an `admin.E108` error.
+3. **Special Descriptor Fields**: Fields like `PositionField` can potentially trigger exceptions or behave differently from classic attribute checks, necessitating a more thorough validation strategy.
+
+### Abnormal Behavior:
+
+The abnormal behavior primarily stems from these return patterns impacting fields that don't naturally align with typical field retrieval and validation cases, such as position-related fields.
+
+### Conclusion:
+
+Given the understanding and analysis of the `_check_list_display_item` method, I can now determine that our focus should rest on this method as the core problem resides in its logic handling specific attribute-fetching methods.
+
+### Bug Identified:
+
+The buggy method, therefore, that affects the handling of list display validation for ModelAdmin objects, causing admin.E108 errors illegitimately underlined by descriptor field handling failures, is the following:
+
+Buggy method: `django/contrib/admin/checks.py:ModelAdminChecks._check_list_display_item`
+==================================================
+
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+### IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+### IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

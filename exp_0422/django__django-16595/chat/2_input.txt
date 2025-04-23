@@ -1,0 +1,510 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+#### ISSUE
+Migration optimizer does not reduce multiple AlterField
+Description
+	
+Let's consider the following operations: 
+operations = [
+	migrations.AddField(
+		model_name="book",
+		name="title",
+		field=models.CharField(max_length=256, null=True),
+	),
+	migrations.AlterField(
+		model_name="book",
+		name="title",
+		field=models.CharField(max_length=128, null=True),
+	),
+	migrations.AlterField(
+		model_name="book",
+		name="title",
+		field=models.CharField(max_length=128, null=True, help_text="help"),
+	),
+	migrations.AlterField(
+		model_name="book",
+		name="title",
+		field=models.CharField(max_length=128, null=True, help_text="help", default=None),
+	),
+]
+If I run the optimizer, I get only the AddField, as we could expect. However, if the AddField model is separated from the AlterField (e.g. because of a non-elidable migration, or inside a non-squashed migration), none of the AlterField are reduced:
+optimizer.optimize(operations[1:], "books") 
+[<AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
+ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>,
+ <AlterField model_name='book', name='title', field=<django.db.models.fields.CharField>>]
+Indeed, the AlterField.reduce does not consider the the case where operation is also an AlterField. 
+Is this behaviour intended? If so, could it be documented? 
+Otherwise, would it make sense to add something like
+		if isinstance(operation, AlterField) and self.is_same_field_operation(
+			operation
+		):
+			return [operation]
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+class Field:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def __repr__(self):
+        attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+        return f"CharField({', '.join(attrs)})"
+
+class Operation:
+    def __init__(self, model_name, name):
+        self.model_name = model_name
+        self.name = name
+
+    def is_same_model_operation(self, operation):
+        return self.model_name.lower() == operation.model_name.lower()
+
+    def is_same_field_operation(self, operation):
+        return (
+            self.is_same_model_operation(operation)
+            and self.name.lower() == operation.name.lower()
+        )
+
+    def reduce(self, operation, app_label):
+        return not operation.references_field(self.model_name, self.name, app_label)
+
+class AlterField(Operation):
+    def __init__(self, model_name, name, field):
+        super().__init__(model_name, name)
+        self.field = field
+
+    def describe(self):
+        return f"Alter field {self.name} on {self.model_name}"
+
+    def reduce(self, operation, app_label):
+        if isinstance(operation, AlterField) and self.is_same_field_operation(operation):
+            return [operation]
+        return super().reduce(operation, app_label)
+
+class MigrationOptimizer:
+    def optimize(self, operations, app_label):
+        self._iterations = 0
+        while True:
+            result = self.optimize_inner(operations, app_label)
+            self._iterations += 1
+            if result == operations:
+                return result
+            operations = result
+
+    def optimize_inner(self, operations, app_label):
+        new_operations = []
+        for i, operation in enumerate(operations):
+            right = True
+            for j, other in enumerate(operations[i + 1:]):
+                result = operation.reduce(other, app_label)
+                if isinstance(result, list):
+                    in_between = operations[i + 1:i + j + 1]
+                    if right:
+                        new_operations.extend(in_between)
+                        new_operations.extend(result)
+                    elif all(op.reduce(other, app_label) is True for op in in_between):
+                        new_operations.extend(result)
+                        new_operations.extend(in_between)
+                    else:
+                        new_operations.append(operation)
+                        break
+                    new_operations.extend(operations[i + j + 2:])
+                    return new_operations
+                elif not result:
+                    right = False
+            else:
+                new_operations.append(operation)
+        return new_operations
+
+# Minimal test
+operations = [
+    AlterField(
+        model_name="book",
+        name="title",
+        field=Field(max_length=128, null=True),
+    ),
+    AlterField(
+        model_name="book",
+        name="title",
+        field=Field(max_length=128, null=True, help_text="help"),
+    ),
+    AlterField(
+        model_name="book",
+        name="title",
+        field=Field(max_length=128, null=True, help_text="help", default=None),
+    ),
+]
+
+optimizer = MigrationOptimizer()
+result = optimizer.optimize(operations, "books")
+print("Number of operations after optimization:", len(result))
+print("\nOptimized operations:")
+for op in result:
+    print(f"- {op.describe()}")
+print("\nFinal field state:", result[-1].field if result else None)
+
+
+This is the corresponding output and runtime information:
+Number of operations after optimization: 1
+
+Optimized operations:
+- Alter field title on book
+
+Final field state: CharField(max_length=128, null=True, help_text='help', default=None)
+
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16595/debugging_test.py
+    Starting var:.. __name__ = '__main__'
+    Starting var:.. __doc__ = None
+    Starting var:.. __package__ = ''
+    Starting var:.. __loader__ = None
+    Starting var:.. __spec__ = None
+    Starting var:.. __file__ = '/data/swe-fl/TMP/testbed/django__django-16595/debugging_test.py'
+    Starting var:.. __cached__ = None
+    Starting var:.. __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+     call         0 print("\nFinal field state:", result[-1].field if result else None)
+     line         1 class Field:
+         call         1 class Field:
+         line         1 class Field:
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'Field'
+         line         2     def __init__(self, **kwargs):
+        New var:....... __init__ = <function Field.__init__ at 0x7f1f3ceb0860>
+         line         5     def __repr__(self):
+        New var:....... __repr__ = <function Field.__repr__ at 0x7f1f3ceb09a0>
+         return       5     def __repr__(self):
+        Return value:.. None
+        New var:....... Field = <class '__main__.Field'>
+     line         9 class Operation:
+         call         9 class Operation:
+         line         9 class Operation:
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'Operation'
+         line        10     def __init__(self, model_name, name):
+        New var:....... __init__ = <function Operation.__init__ at 0x7f1f3ceb07c0>
+         line        14     def is_same_model_operation(self, operation):
+        New var:....... is_same_model_operation = <function Operation.is_same_model_operation at 0x7f1f3ceb0ae0>
+         line        17     def is_same_field_operation(self, operation):
+        New var:....... is_same_field_operation = <function Operation.is_same_field_operation at 0x7f1f3ceb0b80>
+         line        23     def reduce(self, operation, app_label):
+        New var:....... reduce = <function Operation.reduce at 0x7f1f3ceb0c20>
+         return      23     def reduce(self, operation, app_label):
+        Return value:.. None
+        New var:....... Operation = <class '__main__.Operation'>
+     line        26 class AlterField(Operation):
+         call        26 class AlterField(Operation):
+         line        26 class AlterField(Operation):
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'AlterField'
+         line        27     def __init__(self, model_name, name, field):
+        New var:....... __init__ = <function AlterField.__init__ at 0x7f1f3ceb0d60>
+         line        31     def describe(self):
+        New var:....... describe = <function AlterField.describe at 0x7f1f3ceb0e00>
+         line        34     def reduce(self, operation, app_label):
+        New var:....... reduce = <function AlterField.reduce at 0x7f1f3ceb0ea0>
+        New var:....... __classcell__ = <cell at 0x7f1f3ceb97b0: empty>
+         return      34     def reduce(self, operation, app_label):
+        Return value:.. <cell at 0x7f1f3ceb97b0: empty>
+        New var:....... AlterField = <class '__main__.AlterField'>
+     line        39 class MigrationOptimizer:
+         call        39 class MigrationOptimizer:
+         line        39 class MigrationOptimizer:
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'MigrationOptimizer'
+         line        40     def optimize(self, operations, app_label):
+        New var:....... optimize = <function MigrationOptimizer.optimize at 0x7f1f3ceb0a40>
+         line        49     def optimize_inner(self, operations, app_label):
+        New var:....... optimize_inner = <function MigrationOptimizer.optimize_inner at 0x7f1f3ceb0fe0>
+         return      49     def optimize_inner(self, operations, app_label):
+        Return value:.. None
+        New var:....... MigrationOptimizer = <class '__main__.MigrationOptimizer'>
+     line        76     AlterField(
+     line        77         model_name="book",
+     line        78         name="title",
+     line        79         field=Field(max_length=128, null=True),
+        Starting var:.. self = REPR FAILED
+        Starting var:.. kwargs = {'max_length': 128, 'null': True}
+         call         2     def __init__(self, **kwargs):
+         line         3         self.kwargs = kwargs
+        Modified var:.. self = CharField(max_length=128, null=True)
+         return       3         self.kwargs = kwargs
+        Return value:.. None
+         line        76     AlterField(
+        Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec5dd0>
+        Starting var:.. model_name = 'book'
+        Starting var:.. name = 'title'
+        Starting var:.. field = CharField(max_length=128, null=True)
+        Starting var:.. __class__ = <class '__main__.AlterField'>
+         call        27     def __init__(self, model_name, name, field):
+         line        28         super().__init__(model_name, name)
+            Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec5dd0>
+            Starting var:.. model_name = 'book'
+            Starting var:.. name = 'title'
+             call        10     def __init__(self, model_name, name):
+             line        11         self.model_name = model_name
+             line        12         self.name = name
+             return      12         self.name = name
+            Return value:.. None
+                 line        29         self.field = field
+         return      29         self.field = field
+        Return value:.. None
+         line        81     AlterField(
+     line        82         model_name="book",
+     line        83         name="title",
+     line        84         field=Field(max_length=128, null=True, help_text="help"),
+        Starting var:.. self = REPR FAILED
+        Starting var:.. kwargs = {'max_length': 128, 'null': True, 'help_text': 'help'}
+         call         2     def __init__(self, **kwargs):
+         line         3         self.kwargs = kwargs
+        Modified var:.. self = CharField(max_length=128, null=True, help_text='help')
+         return       3         self.kwargs = kwargs
+        Return value:.. None
+         line        81     AlterField(
+        Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec6d90>
+        Starting var:.. model_name = 'book'
+        Starting var:.. name = 'title'
+        Starting var:.. field = CharField(max_length=128, null=True, help_text='help')
+        Starting var:.. __class__ = <class '__main__.AlterField'>
+         call        27     def __init__(self, model_name, name, field):
+         line        28         super().__init__(model_name, name)
+            Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec6d90>
+            Starting var:.. model_name = 'book'
+            Starting var:.. name = 'title'
+             call        10     def __init__(self, model_name, name):
+             line        11         self.model_name = model_name
+             line        12         self.name = name
+             return      12         self.name = name
+            Return value:.. None
+                 line        29         self.field = field
+         return      29         self.field = field
+        Return value:.. None
+         line        86     AlterField(
+     line        87         model_name="book",
+     line        88         name="title",
+     line        89         field=Field(max_length=128, null=True, help_text="help", default=None),
+        Starting var:.. self = REPR FAILED
+        Starting var:.. kwargs = {'max_length': 128, 'null': True, 'help_text': 'help', 'default': None}
+         call         2     def __init__(self, **kwargs):
+         line         3         self.kwargs = kwargs
+        Modified var:.. self = CharField(max_length=128, null=True, help_text='help', default=None)
+         return       3         self.kwargs = kwargs
+        Return value:.. None
+         line        86     AlterField(
+        Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec73d0>
+        Starting var:.. model_name = 'book'
+        Starting var:.. name = 'title'
+        Starting var:.. field = CharField(max_length=128, null=True, help_text='help', default=None)
+        Starting var:.. __class__ = <class '__main__.AlterField'>
+         call        27     def __init__(self, model_name, name, field):
+         line        28         super().__init__(model_name, name)
+            Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec73d0>
+            Starting var:.. model_name = 'book'
+            Starting var:.. name = 'title'
+             call        10     def __init__(self, model_name, name):
+             line        11         self.model_name = model_name
+             line        12         self.name = name
+             return      12         self.name = name
+            Return value:.. None
+                 line        29         self.field = field
+         return      29         self.field = field
+        Return value:.. None
+         line        75 operations = [
+    New var:....... operations = [<__main__.AlterField object at 0x7f1f3cec5dd0>,..., <__main__.AlterField object at 0x7f1f3cec73d0>]
+     line        93 optimizer = MigrationOptimizer()
+    New var:....... optimizer = <__main__.MigrationOptimizer object at 0x7f1f3cec7b10>
+     line        94 result = optimizer.optimize(operations, "books")
+        Starting var:.. self = <__main__.MigrationOptimizer object at 0x7f1f3cec7b10>
+        Starting var:.. operations = [<__main__.AlterField object at 0x7f1f3cec5dd0>,..., <__main__.AlterField object at 0x7f1f3cec73d0>]
+        Starting var:.. app_label = 'books'
+         call        40     def optimize(self, operations, app_label):
+         line        41         self._iterations = 0
+         line        42         while True:
+         line        43             result = self.optimize_inner(operations, app_label)
+            Starting var:.. self = <__main__.MigrationOptimizer object at 0x7f1f3cec7b10>
+            Starting var:.. operations = [<__main__.AlterField object at 0x7f1f3cec5dd0>,..., <__main__.AlterField object at 0x7f1f3cec73d0>]
+            Starting var:.. app_label = 'books'
+             call        49     def optimize_inner(self, operations, app_label):
+             line        50         new_operations = []
+            New var:....... new_operations = []
+             line        51         for i, operation in enumerate(operations):
+            New var:....... i = 0
+            New var:....... operation = <__main__.AlterField object at 0x7f1f3cec5dd0>
+             line        52             right = True
+            New var:....... right = True
+             line        53             for j, other in enumerate(operations[i + 1:]):
+            New var:....... j = 0
+            New var:....... other = <__main__.AlterField object at 0x7f1f3cec6d90>
+             line        54                 result = operation.reduce(other, app_label)
+                Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec5dd0>
+                Starting var:.. operation = <__main__.AlterField object at 0x7f1f3cec6d90>
+                Starting var:.. app_label = 'books'
+                Starting var:.. __class__ = <class '__main__.AlterField'>
+                 call        34     def reduce(self, operation, app_label):
+                 line        35         if isinstance(operation, AlterField) and self.is_same_field_operation(operation):
+                    Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec5dd0>
+                    Starting var:.. operation = <__main__.AlterField object at 0x7f1f3cec6d90>
+                     call        17     def is_same_field_operation(self, operation):
+                     line        19             self.is_same_model_operation(operation)
+                        Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec5dd0>
+                        Starting var:.. operation = <__main__.AlterField object at 0x7f1f3cec6d90>
+                         call        14     def is_same_model_operation(self, operation):
+                         line        15         return self.model_name.lower() == operation.model_name.lower()
+                         return      15         return self.model_name.lower() == operation.model_name.lower()
+                        Return value:.. True
+                                         line        20             and self.name.lower() == operation.name.lower()
+                     line        18         return (
+                     return      18         return (
+                    Return value:.. True
+                                 line        36             return [operation]
+                 return      36             return [operation]
+                Return value:.. [<__main__.AlterField object at 0x7f1f3cec6d90>]
+                        New var:....... result = [<__main__.AlterField object at 0x7f1f3cec6d90>]
+             line        55                 if isinstance(result, list):
+             line        56                     in_between = operations[i + 1:i + j + 1]
+            New var:....... in_between = []
+             line        57                     if right:
+             line        58                         new_operations.extend(in_between)
+             line        59                         new_operations.extend(result)
+            Modified var:.. new_operations = [<__main__.AlterField object at 0x7f1f3cec6d90>]
+             line        66                     new_operations.extend(operations[i + j + 2:])
+            Modified var:.. new_operations = [<__main__.AlterField object at 0x7f1f3cec6d90>, <__main__.AlterField object at 0x7f1f3cec73d0>]
+             line        67                     return new_operations
+             return      67                     return new_operations
+            Return value:.. [<__main__.AlterField object at 0x7f1f3cec6d90>, <__main__.AlterField object at 0x7f1f3cec73d0>]
+                New var:....... result = [<__main__.AlterField object at 0x7f1f3cec6d90>, <__main__.AlterField object at 0x7f1f3cec73d0>]
+         line        44             self._iterations += 1
+         line        45             if result == operations:
+         line        47             operations = result
+        Modified var:.. operations = [<__main__.AlterField object at 0x7f1f3cec6d90>, <__main__.AlterField object at 0x7f1f3cec73d0>]
+         line        42         while True:
+         line        43             result = self.optimize_inner(operations, app_label)
+            Starting var:.. self = <__main__.MigrationOptimizer object at 0x7f1f3cec7b10>
+            Starting var:.. operations = [<__main__.AlterField object at 0x7f1f3cec6d90>, <__main__.AlterField object at 0x7f1f3cec73d0>]
+            Starting var:.. app_label = 'books'
+             call        49     def optimize_inner(self, operations, app_label):
+             line        50         new_operations = []
+            New var:....... new_operations = []
+             line        51         for i, operation in enumerate(operations):
+            New var:....... i = 0
+            New var:....... operation = <__main__.AlterField object at 0x7f1f3cec6d90>
+             line        52             right = True
+            New var:....... right = True
+             line        53             for j, other in enumerate(operations[i + 1:]):
+            New var:....... j = 0
+            New var:....... other = <__main__.AlterField object at 0x7f1f3cec73d0>
+             line        54                 result = operation.reduce(other, app_label)
+                Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec6d90>
+                Starting var:.. operation = <__main__.AlterField object at 0x7f1f3cec73d0>
+                Starting var:.. app_label = 'books'
+                Starting var:.. __class__ = <class '__main__.AlterField'>
+                 call        34     def reduce(self, operation, app_label):
+                 line        35         if isinstance(operation, AlterField) and self.is_same_field_operation(operation):
+                    Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec6d90>
+                    Starting var:.. operation = <__main__.AlterField object at 0x7f1f3cec73d0>
+                     call        17     def is_same_field_operation(self, operation):
+                     line        19             self.is_same_model_operation(operation)
+                        Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec6d90>
+                        Starting var:.. operation = <__main__.AlterField object at 0x7f1f3cec73d0>
+                         call        14     def is_same_model_operation(self, operation):
+                         line        15         return self.model_name.lower() == operation.model_name.lower()
+                         return      15         return self.model_name.lower() == operation.model_name.lower()
+                        Return value:.. True
+                                         line        20             and self.name.lower() == operation.name.lower()
+                     line        18         return (
+                     return      18         return (
+                    Return value:.. True
+                                 line        36             return [operation]
+                 return      36             return [operation]
+                Return value:.. [<__main__.AlterField object at 0x7f1f3cec73d0>]
+                        New var:....... result = [<__main__.AlterField object at 0x7f1f3cec73d0>]
+             line        55                 if isinstance(result, list):
+             line        56                     in_between = operations[i + 1:i + j + 1]
+            New var:....... in_between = []
+             line        57                     if right:
+             line        58                         new_operations.extend(in_between)
+             line        59                         new_operations.extend(result)
+            Modified var:.. new_operations = [<__main__.AlterField object at 0x7f1f3cec73d0>]
+             line        66                     new_operations.extend(operations[i + j + 2:])
+             line        67                     return new_operations
+             return      67                     return new_operations
+            Return value:.. [<__main__.AlterField object at 0x7f1f3cec73d0>]
+                Modified var:.. result = [<__main__.AlterField object at 0x7f1f3cec73d0>]
+         line        44             self._iterations += 1
+         line        45             if result == operations:
+         line        47             operations = result
+        Modified var:.. operations = [<__main__.AlterField object at 0x7f1f3cec73d0>]
+         line        42         while True:
+         line        43             result = self.optimize_inner(operations, app_label)
+            Starting var:.. self = <__main__.MigrationOptimizer object at 0x7f1f3cec7b10>
+            Starting var:.. operations = [<__main__.AlterField object at 0x7f1f3cec73d0>]
+            Starting var:.. app_label = 'books'
+             call        49     def optimize_inner(self, operations, app_label):
+             line        50         new_operations = []
+            New var:....... new_operations = []
+             line        51         for i, operation in enumerate(operations):
+            New var:....... i = 0
+            New var:....... operation = <__main__.AlterField object at 0x7f1f3cec73d0>
+             line        52             right = True
+            New var:....... right = True
+             line        53             for j, other in enumerate(operations[i + 1:]):
+             line        71                 new_operations.append(operation)
+            Modified var:.. new_operations = [<__main__.AlterField object at 0x7f1f3cec73d0>]
+             line        51         for i, operation in enumerate(operations):
+             line        72         return new_operations
+             return      72         return new_operations
+            Return value:.. [<__main__.AlterField object at 0x7f1f3cec73d0>]
+                 line        44             self._iterations += 1
+         line        45             if result == operations:
+         line        46                 return result
+         return      46                 return result
+        Return value:.. [<__main__.AlterField object at 0x7f1f3cec73d0>]
+        New var:....... result = [<__main__.AlterField object at 0x7f1f3cec73d0>]
+     line        95 print("Number of operations after optimization:", len(result))
+     line        96 print("\nOptimized operations:")
+     line        97 for op in result:
+    New var:....... op = <__main__.AlterField object at 0x7f1f3cec73d0>
+     line        98     print(f"- {op.describe()}")
+        Starting var:.. self = <__main__.AlterField object at 0x7f1f3cec73d0>
+         call        31     def describe(self):
+         line        32         return f"Alter field {self.name} on {self.model_name}"
+         return      32         return f"Alter field {self.name} on {self.model_name}"
+        Return value:.. 'Alter field title on book'
+         line        97 for op in result:
+     line        99 print("\nFinal field state:", result[-1].field if result else None)
+        Starting var:.. self = CharField(max_length=128, null=True, help_text='help', default=None)
+         call         5     def __repr__(self):
+         line         6         attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+            Starting var:.. .0 = <dict_itemiterator object at 0x7f1f3cebd4e0>
+             call         6         attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+             line         6         attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+            New var:....... k = 'max_length'
+            New var:....... v = 128
+             line         6         attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+            Modified var:.. k = 'null'
+            Modified var:.. v = True
+             line         6         attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+            Modified var:.. k = 'help_text'
+            Modified var:.. v = 'help'
+             line         6         attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+            Modified var:.. k = 'default'
+            Modified var:.. v = None
+             line         6         attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+             return       6         attrs = [f"{k}={v!r}" for k, v in self.kwargs.items()]
+            Return value:.. ['max_length=128', 'null=True', "help_text='help'", 'default=None']
+                New var:....... attrs = ['max_length=128', 'null=True', "help_text='help'", 'default=None']
+         line         7         return f"CharField({', '.join(attrs)})"
+         return       7         return f"CharField({', '.join(attrs)})"
+        Return value:.. "CharField(max_length=128, null=True, help_text='help', default=None)"
+         return      99 print("\nFinal field state:", result[-1].field if result else None)
+    Return value:.. None
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

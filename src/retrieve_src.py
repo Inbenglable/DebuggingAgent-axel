@@ -274,7 +274,7 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
             if relative_path:
                 retrieved_elements['path'] = os.path.relpath(file, root_dir)
             else:
-                retrieved_elements['path'] = file
+                retrieved_elements['path'] = os.path.abspath(file)
             retrieved_elements['type'] = 'line_range'
             retrieved_elements['start_line'] = start
             retrieved_elements['end_line'] = end
@@ -321,7 +321,7 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
             if relative_path:
                 retrieved_elements['path'] = os.path.relpath(file, root_dir)
             else:
-                retrieved_elements['path'] = file
+                retrieved_elements['path'] = os.path.abspath(file)
             retrieved_elements['type'] = element_info['type']
             retrieved_elements['start_line'] = start
             retrieved_elements['end_line'] = end
@@ -342,7 +342,7 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
             if relative_path:
                 retrieved_elements['path'] = os.path.relpath(file, root_dir)
             else:
-                retrieved_elements['path'] = file
+                retrieved_elements['path'] = os.path.abspath(file)
             retrieved_elements['type'] = 'code_snippet'
             retrieved_elements['start_line'] = start_line
             retrieved_elements['end_line'] = end_line
