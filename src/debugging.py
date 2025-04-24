@@ -19,7 +19,7 @@ from run_report import get_eval_report_for_log
 from prompt import GEN_DEBUGGING_TEST, DEBUGGING_AGENT_SYSTEM_MSG, \
     ANALYSE_TEST, MODIFY_SOURCE_CODE_HEAD, MODIFY_SOURCE_CODE_INSTRUCT, TOO_LONG_EXEC_RESULT, DEBUGGING_START_AFTER_TESTING, \
     CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD, REPAIR_COLLECT_HEAD, \
-    COLLECT_INSTRUCT, REPAIR_INSTRUCT, FILTER_INSTRUCT, REVIEW_PATCH_INSTRUCT
+    COLLECT_INSTRUCT, REPAIR_INSTRUCT, FILTER_INSTRUCT, REVIEW_PATCH_INSTRUCT, REGENERATION_INSTRUCT
 
 sys.path.append(os.path.abspath('/data/swe-fl/SRC/SWE-Bench-Validation/src'))
 from utils import get_test_directives
@@ -36,7 +36,7 @@ TESTBED_DIR = Path("/data/swe-fl/TMP/testbed/")
 DBGSNOOPER_DIR = Path("/data/swe-fl/SRC/pysnooper_axel/dbgsnooper")
 CHECKOUT_REPO_DIR = Path("/data/swe-fl/EXP/swe-evaluation/swe-verified-checkout/gold")
 
-EXP_DIR = "/data/swe-fl/SRC/DebuggingAgent/exp_0423"
+EXP_DIR = "/data/swe-fl/SRC/DebuggingAgent/exp/exp_0423"
 
 # os.environ['HF_DATASETS_CACHE'] = '~/.cache/huggingface/datasets/'
 
@@ -285,18 +285,15 @@ def load_instance_data(instance_id: str):
 
 
 def gen_debugging_test(instance: dict, debugging_agent: LLMModel) -> str:
-    # reproduce_test_path = Path(f"/data/SWE/SRC/approach/data/claude_reproduce_test/{instance['instance_id']}.py")
+    # reproduce_test_path = f'/data/swe-fl/SRC/DebuggingAgent/reproduce_tests.json'
     # with open(reproduce_test_path, 'r') as f:
-    #     reproduce_test_code = f.read()
-    reproduce_test_path = f'/data/swe-fl/SRC/DebuggingAgent/reproduce_tests.json'
+    #     reproduce_tests = json.load(f)
+    # if instance['instance_id'] in reproduce_tests:
+    #     reproduce_test_code = reproduce_tests[instance['instance_id']]["test_code"]
+    # else:
+    reproduce_test_path = f'/data/swe-fl/DATA/reproduce_test/claude_reproduction_tests.json'
     with open(reproduce_test_path, 'r') as f:
-        reproduce_tests = json.load(f)
-    if instance['instance_id'] in reproduce_tests:
-        reproduce_test_code = reproduce_tests[instance['instance_id']]["test_code"]
-    else:
-        reproduce_test_path = f'/data/swe-fl/DATA/reproduce_test/claude_reproduction_tests.json'
-        with open(reproduce_test_path, 'r') as f:
-            reproduce_test_code = json.load(f)[instance['instance_id']][0]
+        reproduce_test_code = json.load(f)[instance['instance_id']][0]
 
     with open(instance['testbed_src_path'] / 'reproduce.py', 'w') as f:
         f.write(reproduce_test_code)
@@ -858,15 +855,14 @@ def evaluation(instance: dict):
     
     save_dir = f'{EXP_DIR}/{instance["instance_id"]}'
     eval_log_path = os.path.join(save_dir, 'evaluation.log')
-    eval_report_path = os.path.join(save_dir, 'evaluation_report.json')
     
     with open(eval_log_path, 'w') as f:
         f.write(result.stdout + result.stderr)
     
     report = get_eval_report_for_log(instance, eval_log_path)
-    with open(eval_report_path, 'w') as f:
-        json.dump(report, f, indent=4)
- 
+    
+    return report
+
  
 def extract_function_call(text):
     python_code_block_pattern = r"```python\n(.*?)```"
@@ -960,7 +956,7 @@ def function_invoke(previous_round_output, function_call_dict, instance, agent: 
         raise ValueError(f"Unknown function call: {function_name}")
 
 
-def repair_process(instance: dict, debugging_history: str = None):
+def collect_repair_code(instance: dict, debugging_history: str = None):
     repair_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
     repair_head_prompt = REPAIR_COLLECT_HEAD.format(
     project=instance['repo'].split('/')[1],
@@ -991,7 +987,10 @@ def repair_process(instance: dict, debugging_history: str = None):
             retrieve_history = update_history(retrieve_history, '\nYour Output:\n' + response)
     
     repair_prompt = repair_head_prompt + retrieve_history + REPAIR_INSTRUCT
-    
+    return repair_prompt
+
+def generate_patch(instance: dict, repair_prompt: str):
+    repair_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
     success = False
     retries = 0
     while retries < 3:
@@ -1042,7 +1041,7 @@ def review_patch(instance: dict, patched_output: str, original_output: str, test
     )
     review_model = LLMModel(model_name=MODEL_NAME, system_message='', instance = instance)
     response = query_model_with_retry(review_model, review_prompt, judge_review_reply, instance)
-    return extract_review_reply(response)
+    return response, extract_review_reply(response)
 
     
 def main():
@@ -1050,8 +1049,8 @@ def main():
     with open('/data/swe-fl/SRC/DebuggingAgent/bug_list.json','r') as f:
         bug_list = json.load(f)
     for instance_id in bug_list:
-        # if instance_id != 'django__django-16595':
-        #     continue
+        if instance_id != 'django__django-12155':
+            continue
         evaluate_report_path = f'{EXP_DIR}/{instance_id}/evaluation_report.json'
         if os.path.exists(evaluate_report_path):
             with open(evaluate_report_path, 'r') as f:
@@ -1084,26 +1083,48 @@ def main():
         
                     original_test_exec_result_depth1 = exec_debugging_test(instance, depth = -1)
                     print('start repair_process')
-                    modify_src_response = repair_process(instance, history)
-                    # repair_process(instance)
+                    repair_prompt = collect_repair_code(instance, history)
                     
-                    patched_test_exec_result = exec_debugging_test(instance, depth = -1)
-                    review_result = review_patch(instance, patched_test_exec_result, original_test_exec_result_depth1, reproduce_test_code, modify_src_response)
-                    log_and_print(f"Review result: {review_result}")
-                    success = True
-                    break
+                    max_regenerate_times = 3
+                    curr_regenerate_times = 0
+                    modify_src_response = generate_patch(instance, repair_prompt)
+                    retry_history = '='*50 + '\n' + modify_src_response + '\n' + '='*50 + '\n'
+                    while curr_regenerate_times < max_regenerate_times:
+                        patched_test_exec_result = exec_debugging_test(instance, depth = -1)
+                        reviewer_feedback, review_result = review_patch(instance, patched_test_exec_result, original_test_exec_result_depth1, reproduce_test_code, modify_src_response)
+                        if review_result:
+                            success = True
+                            break
+                        if curr_regenerate_times == max_regenerate_times - 1:
+                            break
+                        
+                        retry_prompt = repair_prompt + REGENERATION_INSTRUCT.format(
+                            history = retry_history,
+                            patched_output = patched_test_exec_result,
+                            reviewer_feedback = reviewer_feedback
+                        )
+                        modify_src_response = generate_patch(instance, retry_prompt)
+                        retry_history = update_history(retry_history, modify_src_response)
+                        log_and_print(f"Unable to pass patch LLM review. Retry...({curr_regenerate_times + 1}/{max_regenerate_times})")
+                    
+                    if success:
+                        break
+                    else:
+                        raise ValueError("Unable to pass patch LLM review")
                 except Exception as e:
                     log_and_print(f"Whole Process crushed: {e}\nRestart..({cur_times}/{total_max_exception_retry_times})")
                     traceback.print_exc()
                     cur_times += 1
                     if cur_times == total_max_exception_retry_times:
                         raise ValueError("Debugging and repair process failed after multiple retries.")
-
-
             
             if success:
                 log_and_print('Debugging process completed successfully. Start evaluation')
-                evaluation(instance)
+                report = evaluation(instance)
+                report['llm_review'] =  review_result
+                eval_report_path = os.path.join(f'{EXP_DIR}/{instance["instance_id"]}', 'evaluation_report.json')
+                with open(eval_report_path, 'w') as f:
+                    json.dump(report, f, indent=4)
             else:
                 log_and_print('Debugging process failed after multiple attempts. Please check the logs for more details.')
 
