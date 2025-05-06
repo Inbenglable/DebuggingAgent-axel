@@ -1,0 +1,241 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To address the issue, we need to understand how Django's SQLite backend handles migrations, specifically when adding fields like OneToOneField with UNIQUE constraints. The error message indicates that there's an issue with adding UNIQUE columns in SQLite using an `ALTER TABLE` statement.
+
+It's likely that resolving this requires altering how migrations interact with SQLite for such operations. To generate a patch, reviewing the implementation of migration operations in the SQLite backend of Django will be necessary.
+
+Let's start by searching for relevant code, such as SQLite backend operations or migration operations.
+
+```python
+search_method_in_codebase("execute")
+search_method_in_codebase("add_field")
+search_code_in_codebase("ALTER TABLE")
+search_class_in_codebase("SQLiteCursorWrapper")
+search_class_in_codebase("Operation")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("add_field")
+RESULT:
+#### django/db/migrations/state.py:ProjectState.add_field
+```python
+    def add_field(self, app_label, model_name, name, field, preserve_default):
+        # If preserve default is off, don't use the default for future state.
+        if not preserve_default:
+            field = field.clone()
+            field.default = NOT_PROVIDED
+        else:
+            field = field
+        model_key = app_label, model_name
+        self.models[model_key].fields[name] = field
+        if self._relations is not None:
+            self.resolve_model_field_relations(model_key, name, field)
+        # Delay rendering of relationships if it's not a relational field.
+        delay = not field.is_relation
+        self.reload_model(*model_key, delay=delay)
+
+```
+
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """
+        Create a field on a model. Usually involves adding a column, but may
+        involve adding a table instead (for M2M fields).
+        """
+        # Special-case implicit M2M tables
+        if field.many_to_many and field.remote_field.through._meta.auto_created:
+            return self.create_model(field.remote_field.through)
+        # Get the column's definition
+        definition, params = self.column_sql(model, field, include_default=True)
+        # It might not actually have a column behind it
+        if definition is None:
+            return
+        # Check constraints can go on the column SQL here
+        db_params = field.db_parameters(connection=self.connection)
+        if db_params['check']:
+            definition += " " + self.sql_check_constraint % db_params
+        if field.remote_field and self.connection.features.supports_foreign_keys and field.db_constraint:
+            constraint_suffix = '_fk_%(to_table)s_%(to_column)s'
+            # Add FK constraint inline, if supported.
+            if self.sql_create_column_inline_fk:
+                to_table = field.remote_field.model._meta.db_table
+                to_column = field.remote_field.model._meta.get_field(field.remote_field.field_name).column
+                namespace, _ = split_identifier(model._meta.db_table)
+                definition += " " + self.sql_create_column_inline_fk % {
+                    'name': self._fk_constraint_name(model, field, constraint_suffix),
+                    'namespace': '%s.' % self.quote_name(namespace) if namespace else '',
+                    'column': self.quote_name(field.column),
+                    'to_table': self.quote_name(to_table),
+                    'to_column': self.quote_name(to_column),
+                    'deferrable': self.connection.ops.deferrable_sql()
+                }
+            # Otherwise, add FK constraints later.
+            else:
+                self.deferred_sql.append(self._create_fk_sql(model, field, constraint_suffix))
+        # Build the SQL and run it
+        sql = self.sql_create_column % {
+            "table": self.quote_name(model._meta.db_table),
+            "column": self.quote_name(field.column),
+            "definition": definition,
+        }
+        self.execute(sql, params)
+        # Drop the default if we need to
+        # (Django usually does not use in-database defaults)
+        if not self.skip_default_on_alter(field) and self.effective_default(field) is not None:
+            changes_sql, params = self._alter_column_default_sql(model, None, field, drop=True)
+            sql = self.sql_alter_column % {
+                "table": self.quote_name(model._meta.db_table),
+                "changes": changes_sql,
+            }
+            self.execute(sql, params)
+        # Add an index, if required
+        self.deferred_sql.extend(self._field_indexes_sql(model, field))
+        # Reset connection if required
+        if self.connection.features.connection_persists_old_columns:
+            self.connection.close()
+
+```
+
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """Create a field on a model."""
+        # Fields with default values cannot by handled by ALTER TABLE ADD
+        # COLUMN statement because DROP DEFAULT is not supported in
+        # ALTER TABLE.
+        if not field.null or self.effective_default(field) is not None:
+            self._remake_table(model, create_field=field)
+        else:
+            super().add_field(model, field)
+
+```
+
+#### django/db/backends/mysql/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        super().add_field(model, field)
+
+        # Simulate the effect of a one-off default.
+        # field.default may be unhashable, so a set isn't used for "in" check.
+        if self.skip_default(field) and field.default not in (None, NOT_PROVIDED):
+            effective_default = self.effective_default(field)
+            self.execute('UPDATE %(table)s SET %(column)s = %%s' % {
+                'table': self.quote_name(model._meta.db_table),
+                'column': self.quote_name(field.column),
+            }, [effective_default])
+
+```
+
+#### django/db/models/options.py:Options.add_field
+```python
+    def add_field(self, field, private=False):
+        # Insert the given field in the order in which it was created, using
+        # the "creation_counter" attribute of the field.
+        # Move many-to-many related fields from self.fields into
+        # self.many_to_many.
+        if private:
+            self.private_fields.append(field)
+        elif field.is_relation and field.many_to_many:
+            bisect.insort(self.local_many_to_many, field)
+        else:
+            bisect.insort(self.local_fields, field)
+            self.setup_pk(field)
+
+        # If the field being added is a relation to another known field,
+        # expire the cache on this field and the forward cache on the field
+        # being referenced, because there will be new relationships in the
+        # cache. Otherwise, expire the cache of references *to* this field.
+        # The mechanism for getting at the related model is slightly odd -
+        # ideally, we'd just ask for field.related_model. However, related_model
+        # is a cached property, and all the models haven't been loaded yet, so
+        # we need to make sure we don't cache a string reference.
+        if field.is_relation and hasattr(field.remote_field, 'model') and field.remote_field.model:
+            try:
+                field.remote_field.model._meta._expire_cache(forward=False)
+            except AttributeError:
+                pass
+            self._expire_cache()
+        else:
+            self._expire_cache(reverse=False)
+
+```
+
+#### django/contrib/gis/db/backends/oracle/schema.py:OracleGISSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        super().add_field(model, field)
+        self.run_geometry_sql()
+
+```
+
+#### django/contrib/gis/db/backends/spatialite/schema.py:SpatialiteSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        from django.contrib.gis.db.models import GeometryField
+        if isinstance(field, GeometryField):
+            # Populate self.geometry_sql
+            self.column_sql(model, field)
+            for sql in self.geometry_sql:
+                self.execute(sql)
+            self.geometry_sql = []
+        else:
+            super().add_field(model, field)
+
+```
+
+#### django/contrib/gis/db/backends/mysql/schema.py:MySQLGISSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        super().add_field(model, field)
+        self.create_spatial_indexes()
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

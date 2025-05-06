@@ -1,0 +1,620 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Set default FILE_UPLOAD_PERMISSION to 0o644.
+Description
+	
+Hello,
+As far as I can see, the ​File Uploads documentation page does not mention any permission issues.
+What I would like to see is a warning that in absence of explicitly configured FILE_UPLOAD_PERMISSIONS, the permissions for a file uploaded to FileSystemStorage might not be consistent depending on whether a MemoryUploadedFile or a TemporaryUploadedFile was used for temporary storage of the uploaded data (which, with the default FILE_UPLOAD_HANDLERS, in turn depends on the uploaded data size).
+The tempfile.NamedTemporaryFile + os.rename sequence causes the resulting file permissions to be 0o0600 on some systems (I experience it here on CentOS 7.4.1708 and Python 3.6.5). In all probability, the implementation of Python's built-in tempfile module explicitly sets such permissions for temporary files due to security considerations.
+I found mentions of this issue ​on GitHub, but did not manage to find any existing bug report in Django's bug tracker.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import tempfile
+import traceback
+import sys
+from django.core.files.uploadedfile import TemporaryUploadedFile, InMemoryUploadedFile
+from django.core.files.storage import FileSystemStorage
+from django.conf import settings
+from io import BytesIO
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+def create_test_file():
+    # Create a small file in memory
+    file_content = b'This is a test file content.'
+    return InMemoryUploadedFile(
+        BytesIO(file_content),
+        field_name='file',
+        name='testfile.txt',
+        content_type='text/plain',
+        size=len(file_content),
+        charset=None
+    )
+
+def create_large_test_file():
+    # Create a large file that will be stored as a TemporaryUploadedFile
+    file_content = b'This is a large test file content.' * 1000000  # Large enough to trigger TemporaryUploadedFile
+    temp_file = tempfile.NamedTemporaryFile(delete=False)
+    temp_file.write(file_content)
+    temp_file.close()
+    return TemporaryUploadedFile(
+        name=temp_file.name,
+        content_type='text/plain',
+        size=len(file_content),
+        charset=None
+    )
+
+def check_file_permissions(file_obj, storage):
+    file_name = storage.save('testfile.txt', file_obj)
+    file_path = storage.path(file_name)
+    file_permissions = os.stat(file_path).st_mode & 0o777
+    os.remove(file_path)  # Clean up the file after checking
+    return file_permissions
+
+def main():
+    # Set up Django settings
+    settings.configure(
+        MEDIA_ROOT=tempfile.mkdtemp(),
+        FILE_UPLOAD_HANDLERS=[
+            'django.core.files.uploadhandler.MemoryFileUploadHandler',
+            'django.core.files.uploadhandler.TemporaryFileUploadHandler',
+        ]
+    )
+
+    storage = FileSystemStorage()
+
+    # Test with InMemoryUploadedFile
+    small_file = create_test_file()
+    permissions = check_file_permissions(small_file, storage)
+    assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"
+
+    # Test with TemporaryUploadedFile
+    large_file = create_large_test_file()
+    permissions = check_file_permissions(large_file, storage)
+    assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"
+
+    print("File permissions are as expected (0o644). Issue is fixed.")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except AssertionError as e:
+        print_stacktrace(e)
+        sys.exit(1)
+    except Exception as e:
+        print_stacktrace(e)
+        sys.exit(1)
+    else:
+        sys.exit(0)
+
+This is the corresponding output and runtime information:
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    Starting var:.. __name__ = '__main__'
+    Starting var:.. __doc__ = None
+    Starting var:.. __package__ = ''
+    Starting var:.. __loader__ = None
+    Starting var:.. __spec__ = None
+    Starting var:.. __file__ = '/data/swe-fl/TMP/testbed/django__django-10914/reproduce.py'
+    Starting var:.. __cached__ = None
+    Starting var:.. __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+     call         1 import os
+     line         1 import os
+    New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/os.py'>
+     line         2 import tempfile
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'tempfile'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fd3aedf2030>
+        Return value:.. <module 'tempfile' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    New var:....... tempfile = <module 'tempfile' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py'>
+     line         3 import traceback
+    New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/traceback.py'>
+     line         4 import sys
+    New var:....... sys = <module 'sys' (built-in)>
+     line         5 from django.core.files.uploadedfile import TemporaryUploadedFile, InMemoryUploadedFile
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.core.files.uploadedfile'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fd3aedf2030>
+        Return value:.. <module 'django.core.files.uploadedfile' from '/..._django-10914/django/core/files/uploadedfile.py'>
+        Starting var:.. module = <module 'django.core.files.uploadedfile' from '/..._django-10914/django/core/files/uploadedfile.py'>
+        Starting var:.. fromlist = ('TemporaryUploadedFile', 'InMemoryUploadedFile')
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        Return value:.. <module 'django.core.files.uploadedfile' from '/..._django-10914/django/core/files/uploadedfile.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    New var:....... TemporaryUploadedFile = <class 'django.core.files.uploadedfile.TemporaryUploadedFile'>
+    New var:....... InMemoryUploadedFile = <class 'django.core.files.uploadedfile.InMemoryUploadedFile'>
+     line         6 from django.core.files.storage import FileSystemStorage
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.core.files.storage'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fd3aedf2030>
+        Return value:.. <module 'django.core.files.storage' from '/data/...ango__django-10914/django/core/files/storage.py'>
+        Starting var:.. module = <module 'django.core.files.storage' from '/data/...ango__django-10914/django/core/files/storage.py'>
+        Starting var:.. fromlist = ('FileSystemStorage',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        Return value:.. <module 'django.core.files.storage' from '/data/...ango__django-10914/django/core/files/storage.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    New var:....... FileSystemStorage = <class 'django.core.files.storage.FileSystemStorage'>
+     line         7 from django.conf import settings
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-10914/django/conf/__init__.py'>
+        Starting var:.. fromlist = ('settings',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'settings'
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-10914/django/conf/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    New var:....... settings = <LazySettings [Unevaluated]>
+     line         8 from io import BytesIO
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'io' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/io.py'>
+        Starting var:.. fromlist = ('BytesIO',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        Return value:.. <module 'io' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/io.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    New var:....... BytesIO = <class '_io.BytesIO'>
+     line        10 def print_stacktrace(e: Exception):
+    New var:....... print_stacktrace = <function print_stacktrace at 0x7fd3ae8e0158>
+     line        20 def create_test_file():
+    New var:....... create_test_file = <function create_test_file at 0x7fd3ae478950>
+     line        32 def create_large_test_file():
+    New var:....... create_large_test_file = <function create_large_test_file at 0x7fd3ae4788c8>
+     line        45 def check_file_permissions(file_obj, storage):
+    New var:....... check_file_permissions = <function check_file_permissions at 0x7fd3ae4789d8>
+     line        52 def main():
+    New var:....... main = <function main at 0x7fd3aea3d510>
+     line        76 if __name__ == '__main__':
+     line        77     try:
+     line        78         main()
+         call        52 def main():
+         line        54     settings.configure(
+         line        55         MEDIA_ROOT=tempfile.mkdtemp(),
+            Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py
+            Starting var:.. suffix = None
+            Starting var:.. prefix = None
+            Starting var:.. dir = None
+             call       347 def mkdtemp(suffix=None, prefix=None, dir=None):
+             line       360     prefix, suffix, dir, output_type = _sanitize_params(prefix, suffix, dir)
+            Modified var:.. suffix = ''
+            Modified var:.. prefix = 'tmp'
+            Modified var:.. dir = '/tmp'
+            New var:....... output_type = <class 'str'>
+             line       362     names = _get_candidate_names()
+            New var:....... names = <tempfile._RandomNameSequence object at 0x7fd3ae2527f0>
+             line       363     if output_type is bytes:
+             line       366     for seq in range(TMP_MAX):
+            New var:....... seq = 0
+             line       367         name = next(names)
+            New var:....... name = '507h7p6v'
+             line       368         file = _os.path.join(dir, prefix + name + suffix)
+            New var:....... file = '/tmp/tmp507h7p6v'
+             line       369         try:
+             line       370             _os.mkdir(file, 0o700)
+             line       381         return file
+             return     381         return file
+            Return value:.. '/tmp/tmp507h7p6v'
+        Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+         line        57             'django.core.files.uploadhandler.MemoryFileUploadHandler',
+         line        58             'django.core.files.uploadhandler.TemporaryFileUploadHandler',
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/conf/__init__.py
+            Starting var:.. self = <LazySettings [Unevaluated]>
+            Starting var:.. default_settings = <module 'django.conf.global_settings' from '/dat...go__django-10914/django/conf/global_settings.py'>
+            Starting var:.. options = {'MEDIA_ROOT': '/tmp/tmp507h7p6v', 'FILE_UPLOAD_...files.uploadhandler.TemporaryFileUploadHandler']}
+             call        97     def configure(self, default_settings=global_settings, **options):
+             line       103         if self._wrapped is not empty:
+             line       105         holder = UserSettingsHolder(default_settings)
+            New var:....... holder = <UserSettingsHolder>
+             line       106         for name, value in options.items():
+            New var:....... name = 'MEDIA_ROOT'
+            New var:....... value = '/tmp/tmp507h7p6v'
+             line       107             setattr(holder, name, value)
+             line       106         for name, value in options.items():
+            Modified var:.. name = 'FILE_UPLOAD_HANDLERS'
+            Modified var:.. value = ['django.core.files.uploadhandler.MemoryFileUplo....files.uploadhandler.TemporaryFileUploadHandler']
+             line       107             setattr(holder, name, value)
+             line       106         for name, value in options.items():
+             line       108         self._wrapped = holder
+            Modified var:.. self = <LazySettings "None">
+             return     108         self._wrapped = holder
+            Return value:.. None
+        Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+         line        62     storage = FileSystemStorage()
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/utils/deconstruct.py
+            Starting var:.. cls = <class 'django.core.files.storage.FileSystemStorage'>
+            Starting var:.. args = ()
+            Starting var:.. kwargs = {}
+            Starting var:.. klass = <class 'django.core.files.storage.FileSystemStorage'>
+             call        14         def __new__(cls, *args, **kwargs):
+             line        16             obj = super(klass, cls).__new__(cls)
+            New var:....... obj = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+             line        17             obj._constructor_args = (args, kwargs)
+             line        18             return obj
+             return      18             return obj
+            Return value:.. <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/core/files/storage.py
+            Starting var:.. self = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+            Starting var:.. location = None
+            Starting var:.. base_url = None
+            Starting var:.. file_permissions_mode = None
+            Starting var:.. directory_permissions_mode = None
+             call       178     def __init__(self, location=None, base_url=None, file_permissions_mode=None,
+             line       180         self._location = location
+             line       181         self._base_url = base_url
+             line       182         self._file_permissions_mode = file_permissions_mode
+             line       183         self._directory_permissions_mode = directory_permissions_mode
+             line       184         setting_changed.connect(self._clear_cached_properties)
+             return     184         setting_changed.connect(self._clear_cached_properties)
+            Return value:.. None
+        Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+        New var:....... storage = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+         line        65     small_file = create_test_file()
+             call        20 def create_test_file():
+             line        22     file_content = b'This is a test file content.'
+            New var:....... file_content = b'This is a test file content.'
+             line        23     return InMemoryUploadedFile(
+             line        24         BytesIO(file_content),
+             line        25         field_name='file',
+             line        26         name='testfile.txt',
+             line        27         content_type='text/plain',
+             line        28         size=len(file_content),
+             line        29         charset=None
+                Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/core/files/uploadedfile.py
+                Starting var:.. self = REPR FAILED
+                Starting var:.. file = <_io.BytesIO object at 0x7fd3ae25cdb0>
+                Starting var:.. field_name = 'file'
+                Starting var:.. name = 'testfile.txt'
+                Starting var:.. content_type = 'text/plain'
+                Starting var:.. size = 28
+                Starting var:.. charset = None
+                Starting var:.. content_type_extra = None
+                Starting var:.. __class__ = <class 'django.core.files.uploadedfile.InMemoryUploadedFile'>
+                 call        82     def __init__(self, file, field_name, name, content_type, size, charset, content_type_extra=None):
+                 line        83         super().__init__(file, name, content_type, size, charset, content_type_extra)
+                Modified var:.. self = <InMemoryUploadedFile: testfile.txt (text/plain)>
+                 line        84         self.field_name = field_name
+                 return      84         self.field_name = field_name
+                Return value:.. None
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+             return      29         charset=None
+            Return value:.. <InMemoryUploadedFile: testfile.txt (text/plain)>
+                New var:....... small_file = <InMemoryUploadedFile: testfile.txt (text/plain)>
+         line        66     permissions = check_file_permissions(small_file, storage)
+            Starting var:.. file_obj = <InMemoryUploadedFile: testfile.txt (text/plain)>
+            Starting var:.. storage = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+             call        45 def check_file_permissions(file_obj, storage):
+             line        46     file_name = storage.save('testfile.txt', file_obj)
+                Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/core/files/storage.py
+                Starting var:.. self = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+                Starting var:.. name = 'testfile.txt'
+                Starting var:.. content = <InMemoryUploadedFile: testfile.txt (text/plain)>
+                Starting var:.. max_length = None
+                 call        38     def save(self, name, content, max_length=None):
+                 line        45         if name is None:
+                 line        48         if not hasattr(content, 'chunks'):
+                 line        51         name = self.get_available_name(name, max_length=max_length)
+                 line        52         return self._save(name, content)
+                 return      52         return self._save(name, content)
+                Return value:.. 'testfile.txt'
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+            New var:....... file_name = 'testfile.txt'
+             line        47     file_path = storage.path(file_name)
+                Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/core/files/storage.py
+                Starting var:.. self = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+                Starting var:.. name = 'testfile.txt'
+                 call       316     def path(self, name):
+                 line       317         return safe_join(self.location, name)
+                 return     317         return safe_join(self.location, name)
+                Return value:.. '/tmp/tmp507h7p6v/testfile.txt'
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+            New var:....... file_path = '/tmp/tmp507h7p6v/testfile.txt'
+             line        48     file_permissions = os.stat(file_path).st_mode & 0o777
+            New var:....... file_permissions = 420
+             line        49     os.remove(file_path)  # Clean up the file after checking
+             line        50     return file_permissions
+             return      50     return file_permissions
+            Return value:.. 420
+                New var:....... permissions = 420
+         line        67     assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"
+         line        70     large_file = create_large_test_file()
+             call        32 def create_large_test_file():
+             line        34     file_content = b'This is a large test file content.' * 1000000  # Large enough to trigger TemporaryUploadedFile
+            New var:....... file_content = b'This is a large test file content.This is a la... file content.This is a large test file content.'
+             line        35     temp_file = tempfile.NamedTemporaryFile(delete=False)
+                Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py
+                Starting var:.. mode = 'w+b'
+                Starting var:.. buffering = -1
+                Starting var:.. encoding = None
+                Starting var:.. newline = None
+                Starting var:.. suffix = None
+                Starting var:.. prefix = None
+                Starting var:.. dir = None
+                Starting var:.. delete = False
+                 call       524 def NamedTemporaryFile(mode='w+b', buffering=-1, encoding=None,
+                 line       542     prefix, suffix, dir, output_type = _sanitize_params(prefix, suffix, dir)
+                Modified var:.. suffix = ''
+                Modified var:.. prefix = 'tmp'
+                Modified var:.. dir = '/tmp'
+                New var:....... output_type = <class 'str'>
+                 line       544     flags = _bin_openflags
+                New var:....... flags = 131266
+                 line       548     if _os.name == 'nt' and delete:
+                 line       551     (fd, name) = _mkstemp_inner(dir, prefix, suffix, flags, output_type)
+                New var:....... fd = 4
+                New var:....... name = '/tmp/tmp9va6w7ll'
+                 line       552     try:
+                 line       553         file = _io.open(fd, mode, buffering=buffering,
+                 line       554                         newline=newline, encoding=encoding)
+                New var:....... file = <_io.BufferedRandom name=4>
+                 line       556         return _TemporaryFileWrapper(file, name, delete)
+                 return     556         return _TemporaryFileWrapper(file, name, delete)
+                Return value:.. <tempfile._TemporaryFileWrapper object at 0x7fd3ae252dd8>
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+            New var:....... temp_file = <tempfile._TemporaryFileWrapper object at 0x7fd3ae252dd8>
+             line        36     temp_file.write(file_content)
+                Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py
+                Starting var:.. self = <tempfile._TemporaryFileWrapper object at 0x7fd3ae252dd8>
+                Starting var:.. name = 'write'
+                 call       475     def __getattr__(self, name):
+                 line       479         file = self.__dict__['file']
+                New var:....... file = <_io.BufferedRandom name=4>
+                 line       480         a = getattr(file, name)
+                New var:....... a = <built-in method write of _io.BufferedRandom object at 0x7fd3ae8de0f8>
+                 line       481         if hasattr(a, '__call__'):
+                 line       482             func = a
+                New var:....... func = <built-in method write of _io.BufferedRandom object at 0x7fd3ae8de0f8>
+                 line       483             @_functools.wraps(func)
+                New var:....... func_wrapper = <function BufferedRandom.write at 0x7fd3aea3d8c8>
+                 line       488             func_wrapper._closer = self._closer
+                 line       489             a = func_wrapper
+                Modified var:.. a = <function BufferedRandom.write at 0x7fd3aea3d8c8>
+                 line       490         if not isinstance(a, int):
+                 line       491             setattr(self, name, a)
+                 line       492         return a
+                 return     492         return a
+                Return value:.. <function BufferedRandom.write at 0x7fd3aea3d8c8>
+                Starting var:.. args = (b'This is a large test file content.This is a l...ile content.This is a large test file content.',)
+                Starting var:.. kwargs = {}
+                Starting var:.. func = <built-in method write of _io.BufferedRandom object at 0x7fd3ae8de0f8>
+                 call       484             def func_wrapper(*args, **kwargs):
+                 line       485                 return func(*args, **kwargs)
+                 return     485                 return func(*args, **kwargs)
+                Return value:.. 34000000
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+             line        37     temp_file.close()
+                Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py
+                Starting var:.. self = <tempfile._TemporaryFileWrapper object at 0x7fd3ae252dd8>
+                 call       507     def close(self):
+                 line       511         self._closer.close()
+                 return     511         self._closer.close()
+                Return value:.. None
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+             line        38     return TemporaryUploadedFile(
+             line        39         name=temp_file.name,
+             line        40         content_type='text/plain',
+             line        41         size=len(file_content),
+             line        42         charset=None
+                Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/core/files/uploadedfile.py
+                Starting var:.. self = REPR FAILED
+                Starting var:.. name = '/tmp/tmp9va6w7ll'
+                Starting var:.. content_type = 'text/plain'
+                Starting var:.. size = 34000000
+                Starting var:.. charset = None
+                Starting var:.. content_type_extra = None
+                Starting var:.. __class__ = <class 'django.core.files.uploadedfile.TemporaryUploadedFile'>
+                 call        59     def __init__(self, name, content_type, size, charset, content_type_extra=None):
+                 line        60         _, ext = os.path.splitext(name)
+                New var:....... _ = '/tmp/tmp9va6w7ll'
+                New var:....... ext = ''
+                 line        61         file = tempfile.NamedTemporaryFile(suffix='.upload' + ext, dir=settings.FILE_UPLOAD_TEMP_DIR)
+                New var:....... file = <tempfile._TemporaryFileWrapper object at 0x7fd3ae252e10>
+                 line        62         super().__init__(file, name, content_type, size, charset, content_type_extra)
+                Modified var:.. self = <TemporaryUploadedFile: tmp9va6w7ll (text/plain)>
+                 return      62         super().__init__(file, name, content_type, size, charset, content_type_extra)
+                Return value:.. None
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+             return      42         charset=None
+            Return value:.. <TemporaryUploadedFile: tmp9va6w7ll (text/plain)>
+                    Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py
+            Starting var:.. self = <tempfile._TemporaryFileCloser object at 0x7fd3ae252c88>
+             call       451         def __del__(self):
+             line       452             self.close()
+             return     452             self.close()
+            Return value:.. None
+        Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+        New var:....... large_file = <TemporaryUploadedFile: tmp9va6w7ll (text/plain)>
+         line        71     permissions = check_file_permissions(large_file, storage)
+            Starting var:.. file_obj = <TemporaryUploadedFile: tmp9va6w7ll (text/plain)>
+            Starting var:.. storage = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+             call        45 def check_file_permissions(file_obj, storage):
+             line        46     file_name = storage.save('testfile.txt', file_obj)
+                Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/core/files/storage.py
+                Starting var:.. self = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+                Starting var:.. name = 'testfile.txt'
+                Starting var:.. content = <TemporaryUploadedFile: tmp9va6w7ll (text/plain)>
+                Starting var:.. max_length = None
+                 call        38     def save(self, name, content, max_length=None):
+                 line        45         if name is None:
+                 line        48         if not hasattr(content, 'chunks'):
+                 line        51         name = self.get_available_name(name, max_length=max_length)
+                 line        52         return self._save(name, content)
+                 return      52         return self._save(name, content)
+                Return value:.. 'testfile.txt'
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+            New var:....... file_name = 'testfile.txt'
+             line        47     file_path = storage.path(file_name)
+                Source path:... /data/swe-fl/TMP/testbed/django__django-10914/django/core/files/storage.py
+                Starting var:.. self = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+                Starting var:.. name = 'testfile.txt'
+                 call       316     def path(self, name):
+                 line       317         return safe_join(self.location, name)
+                 return     317         return safe_join(self.location, name)
+                Return value:.. '/tmp/tmp507h7p6v/testfile.txt'
+            Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+            New var:....... file_path = '/tmp/tmp507h7p6v/testfile.txt'
+             line        48     file_permissions = os.stat(file_path).st_mode & 0o777
+            New var:....... file_permissions = 384
+             line        49     os.remove(file_path)  # Clean up the file after checking
+             line        50     return file_permissions
+             return      50     return file_permissions
+            Return value:.. 384
+                Modified var:.. permissions = 384
+         line        72     assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"
+         exception   72     assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"
+        Exception:..... AssertionError: Expected permissions 0o644, got 0o600
+        New var:....... storage = <django.core.files.storage.FileSystemStorage object at 0x7fd3ae252978>
+    New var:....... small_file = <InMemoryUploadedFile: testfile.txt (text/plain)>
+    New var:....... permissions = 384
+    New var:....... large_file = <TemporaryUploadedFile: tmp9va6w7ll (text/plain)>
+    Call ended by exception
+Modified var:.. settings = <LazySettings "None">
+ exception   78         main()
+Exception:..... AssertionError: Expected permissions 0o644, got 0o600
+New var:....... __name__ = '__main__'
+New var:....... __doc__ = None
+New var:....... __package__ = ''
+New var:....... __loader__ = None
+New var:....... __spec__ = None
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-10914/reproduce.py'
+New var:....... __cached__ = None
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/os.py'>
+New var:....... tempfile = <module 'tempfile' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py'>
+New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/traceback.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... TemporaryUploadedFile = <class 'django.core.files.uploadedfile.TemporaryUploadedFile'>
+New var:....... InMemoryUploadedFile = <class 'django.core.files.uploadedfile.InMemoryUploadedFile'>
+New var:....... FileSystemStorage = <class 'django.core.files.storage.FileSystemStorage'>
+New var:....... settings = <LazySettings "None">
+New var:....... BytesIO = <class '_io.BytesIO'>
+New var:....... print_stacktrace = <function print_stacktrace at 0x7fd3ae8e0158>
+New var:....... create_test_file = <function create_test_file at 0x7fd3ae478950>
+New var:....... create_large_test_file = <function create_large_test_file at 0x7fd3ae4788c8>
+New var:....... check_file_permissions = <function check_file_permissions at 0x7fd3ae4789d8>
+New var:....... main = <function main at 0x7fd3aea3d510>
+ line        79     except AssertionError as e:
+New var:....... e = AssertionError('Expected permissions 0o644, got 0o600',)
+ line        80         print_stacktrace(e)
+    Starting var:.. e = AssertionError('Expected permissions 0o644, got 0o600',)
+     call        10 def print_stacktrace(e: Exception):
+     line        11     tb = traceback.extract_tb(e.__traceback__)
+        Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/traceback.py
+        Starting var:.. tb = <traceback object at 0x7fd3ae26c888>
+        Starting var:.. limit = None
+         call        59 def extract_tb(tb, limit=None):
+         line        72     return StackSummary.extract(walk_tb(tb), limit=limit)
+         return      72     return StackSummary.extract(walk_tb(tb), limit=limit)
+        Return value:.. [<FrameSummary file /data/swe-fl/TMP/testbed/dja...ngo__django-10914/reproduce.py, line 72 in main>]
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    New var:....... tb = [<FrameSummary file /data/swe-fl/TMP/testbed/dja...ngo__django-10914/reproduce.py, line 72 in main>]
+     line        12     print("Traceback (most recent call last):", file=sys.stderr)
+Traceback (most recent call last):
+     line        13     for frame in tb:
+    New var:....... frame = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py, line 78 in <module>>
+     line        14         line_number = frame.lineno
+    New var:....... line_number = 78
+     line        15         code_context = frame.line.strip() if frame.line else "Unknown"
+        Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/traceback.py
+        Starting var:.. self = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py, line 78 in <module>>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'main()'
+        Starting var:.. self = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py, line 78 in <module>>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'main()'
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    New var:....... code_context = 'main()'
+     line        16         print(f'  File "{frame.filename}"', file=sys.stderr)
+  File "/data/swe-fl/TMP/testbed/django__django-10914/reproduce.py"
+     line        17         print(f"    {line_number}: {code_context}", file=sys.stderr)
+    78: main()
+     line        13     for frame in tb:
+    Modified var:.. frame = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py, line 72 in main>
+     line        14         line_number = frame.lineno
+    Modified var:.. line_number = 72
+     line        15         code_context = frame.line.strip() if frame.line else "Unknown"
+        Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/traceback.py
+        Starting var:.. self = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py, line 72 in main>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"'
+        Starting var:.. self = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py, line 72 in main>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"'
+    Source path:... /data/swe-fl/TMP/testbed/django__django-10914/reproduce.py
+    Modified var:.. code_context = 'assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"'
+     line        16         print(f'  File "{frame.filename}"', file=sys.stderr)
+  File "/data/swe-fl/TMP/testbed/django__django-10914/reproduce.py"
+     line        17         print(f"    {line_number}: {code_context}", file=sys.stderr)
+    72: assert permissions == 0o644, f"Expected permissions 0o644, got {oct(permissions)}"
+     line        13     for frame in tb:
+     line        18     print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+AssertionError: Expected permissions 0o644, got 0o600
+     return      18     print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+    Return value:.. None
+ line        81         sys.exit(1)
+ exception   81         sys.exit(1)
+Exception:..... SystemExit: 1
+New var:....... __name__ = '__main__'
+New var:....... __doc__ = None
+New var:....... __package__ = ''
+New var:....... __loader__ = None
+New var:....... __spec__ = None
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-10914/reproduce.py'
+New var:....... __cached__ = None
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/os.py'>
+New var:....... tempfile = <module 'tempfile' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/tempfile.py'>
+New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/traceback.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... TemporaryUploadedFile = <class 'django.core.files.uploadedfile.TemporaryUploadedFile'>
+New var:....... InMemoryUploadedFile = <class 'django.core.files.uploadedfile.InMemoryUploadedFile'>
+New var:....... FileSystemStorage = <class 'django.core.files.storage.FileSystemStorage'>
+New var:....... settings = <LazySettings "None">
+New var:....... BytesIO = <class '_io.BytesIO'>
+New var:....... print_stacktrace = <function print_stacktrace at 0x7fd3ae8e0158>
+New var:....... create_test_file = <function create_test_file at 0x7fd3ae478950>
+
+The debugging test execution result is too long to display here. Please re-select your `runtime_info` lists to narrow down the scope of your analysis.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

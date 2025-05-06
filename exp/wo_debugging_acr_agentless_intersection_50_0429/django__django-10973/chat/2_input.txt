@@ -1,0 +1,192 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Use subprocess.run and PGPASSWORD for client in postgres backend
+Description
+	
+​subprocess.run was added in python 3.5 (which is the minimum version since Django 2.1). This function allows you to pass a custom environment for the subprocess.
+Using this in django.db.backends.postgres.client to set PGPASSWORD simplifies the code and makes it more reliable.
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To address the issue regarding the use of `subprocess.run` and `PGPASSWORD` for the client in the PostgreSQL backend, I need to inspect the relevant method in the Django PostgreSQL backend to understand its current implementation. This will guide how the subprocess call should be modified.
+
+The issue mentions modifying the method in `django.db.backends.postgres.client`, so I need to find and inspect the relevant code in that file. Given this, I will search for the method responsible for executing the database client command, which might be the `DatabaseClient` class's methods within this file.
+
+Let's start by searching for this method in the PostgreSQL backend client file.
+
+```python
+search_method_in_codebase("DatabaseClient")
+```
+
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("DatabaseClient")
+RESULT:
+#### django/db/backends/oracle/client.py:DatabaseClient
+```python
+class DatabaseClient(BaseDatabaseClient):
+    executable_name = 'sqlplus'
+    wrapper_name = 'rlwrap'
+
+    def runshell(self):
+        conn_string = self.connection._connect_string()
+        args = [self.executable_name, "-L", conn_string]
+        wrapper_path = shutil.which(self.wrapper_name)
+        if wrapper_path:
+            args = [wrapper_path, *args]
+        subprocess.check_call(args)
+
+```
+
+#### django/db/backends/sqlite3/client.py:DatabaseClient
+```python
+class DatabaseClient(BaseDatabaseClient):
+    executable_name = 'sqlite3'
+
+    def runshell(self):
+        args = [self.executable_name,
+                self.connection.settings_dict['NAME']]
+        subprocess.check_call(args)
+
+```
+
+#### django/db/backends/postgresql/client.py:DatabaseClient
+```python
+class DatabaseClient(BaseDatabaseClient):
+    executable_name = 'psql'
+
+    @classmethod
+    def runshell_db(cls, conn_params):
+        args = [cls.executable_name]
+
+        host = conn_params.get('host', '')
+        port = conn_params.get('port', '')
+        dbname = conn_params.get('database', '')
+        user = conn_params.get('user', '')
+        passwd = conn_params.get('password', '')
+
+        if user:
+            args += ['-U', user]
+        if host:
+            args += ['-h', host]
+        if port:
+            args += ['-p', str(port)]
+        args += [dbname]
+
+        temp_pgpass = None
+        sigint_handler = signal.getsignal(signal.SIGINT)
+        try:
+            if passwd:
+                # Create temporary .pgpass file.
+                temp_pgpass = NamedTemporaryFile(mode='w+')
+                try:
+                    print(
+                        _escape_pgpass(host) or '*',
+                        str(port) or '*',
+                        _escape_pgpass(dbname) or '*',
+                        _escape_pgpass(user) or '*',
+                        _escape_pgpass(passwd),
+                        file=temp_pgpass,
+                        sep=':',
+                        flush=True,
+                    )
+                    os.environ['PGPASSFILE'] = temp_pgpass.name
+                except UnicodeEncodeError:
+                    # If the current locale can't encode the data, let the
+                    # user input the password manually.
+                    pass
+            # Allow SIGINT to pass to psql to abort queries.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            subprocess.check_call(args)
+        finally:
+            # Restore the original SIGINT handler.
+            signal.signal(signal.SIGINT, sigint_handler)
+            if temp_pgpass:
+                temp_pgpass.close()
+                if 'PGPASSFILE' in os.environ:  # unit tests need cleanup
+                    del os.environ['PGPASSFILE']
+
+    def runshell(self):
+        DatabaseClient.runshell_db(self.connection.get_connection_params())
+
+```
+
+#### django/db/backends/dummy/base.py:DatabaseClient
+```python
+class DatabaseClient(BaseDatabaseClient):
+    runshell = complain
+
+```
+
+#### django/db/backends/mysql/client.py:DatabaseClient
+```python
+class DatabaseClient(BaseDatabaseClient):
+    executable_name = 'mysql'
+
+    @classmethod
+    def settings_to_cmd_args(cls, settings_dict):
+        args = [cls.executable_name]
+        db = settings_dict['OPTIONS'].get('db', settings_dict['NAME'])
+        user = settings_dict['OPTIONS'].get('user', settings_dict['USER'])
+        passwd = settings_dict['OPTIONS'].get('passwd', settings_dict['PASSWORD'])
+        host = settings_dict['OPTIONS'].get('host', settings_dict['HOST'])
+        port = settings_dict['OPTIONS'].get('port', settings_dict['PORT'])
+        server_ca = settings_dict['OPTIONS'].get('ssl', {}).get('ca')
+        client_cert = settings_dict['OPTIONS'].get('ssl', {}).get('cert')
+        client_key = settings_dict['OPTIONS'].get('ssl', {}).get('key')
+        defaults_file = settings_dict['OPTIONS'].get('read_default_file')
+        # Seems to be no good way to set sql_mode with CLI.
+
+        if defaults_file:
+            args += ["--defaults-file=%s" % defaults_file]
+        if user:
+            args += ["--user=%s" % user]
+        if passwd:
+            args += ["--password=%s" % passwd]
+        if host:
+            if '/' in host:
+                args += ["--socket=%s" % host]
+            else:
+                args += ["--host=%s" % host]
+        if port:
+            args += ["--port=%s" % port]
+        if server_ca:
+            args += ["--ssl-ca=%s" % server_ca]
+        if client_cert:
+            args += ["--ssl-cert=%s" % client_cert]
+        if client_key:
+            args += ["--ssl-key=%s" % client_key]
+        if db:
+            args += [db]
+        return args
+
+    def runshell(self):
+        args = DatabaseClient.settings_to_cmd_args(self.connection.settings_dict)
+        subprocess.check_call(args)
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

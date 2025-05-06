@@ -1,0 +1,377 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Migration crashes deleting an index_together if there is a unique_together on the same fields
+Description
+	
+Happens with Django 1.11.10
+Steps to reproduce:
+1) Create models with 2 fields, add 2 same fields to unique_together and to index_together
+2) Delete index_together -> Fail
+It will fail at django/db/backends/base/schema.py, line 378, in _delete_composed_index(), ValueError: Found wrong number (2) of constraints for as this one will find two constraints, the _uniq and the _idx one. No way to get out of this...
+The worst in my case is that happened as I wanted to refactor my code to use the "new" (Dj 1.11) Options.indexes feature. I am actually not deleting the index, just the way it is declared in my code.
+I think there are 2 different points here:
+1) The deletion of index_together should be possible alone or made coherent (migrations side?) with unique_together
+2) Moving the declaration of an index should not result in an index re-creation
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+from django.conf import settings
+from django.core.management import call_command
+from django.db import models
+from django.db.migrations import Migration, operations
+
+# Configure Django settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': 'test_db.sqlite3',
+        }
+    },
+    INSTALLED_APPS=[
+        'django.contrib.contenttypes',
+        'django.contrib.auth',
+        'test_app',
+    ],
+    MIDDLEWARE_CLASSES=(),
+    ROOT_URLCONF='test_app.urls',
+    TEMPLATES=[],
+    SECRET_KEY='fake-key',
+)
+
+# Create a test application directory
+os.makedirs('test_app/migrations', exist_ok=True)
+
+# Define the models in a separate file
+with open('test_app/models.py', 'w') as f:
+    f.write("""
+from django.db import models
+
+class TestModel(models.Model):
+    field1 = models.CharField(max_length=100)
+    field2 = models.CharField(max_length=100)
+
+    class Meta:
+        unique_together = ('field1', 'field2')
+        index_together = ('field1', 'field2')
+""")
+
+# Create initial migration
+with open('test_app/migrations/0001_initial.py', 'w') as f:
+    f.write("""
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+
+    initial = True
+
+    dependencies = [
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name='TestModel',
+            fields=[
+                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('field1', models.CharField(max_length=100)),
+                ('field2', models.CharField(max_length=100)),
+            ],
+            options={
+                'unique_together': {('field1', 'field2')},
+                'index_together': {('field1', 'field2')},
+            },
+        ),
+    ]
+""")
+
+# Create a migration to remove index_together
+with open('test_app/migrations/0002_remove_index_together.py', 'w') as f:
+    f.write("""
+from django.db import migrations
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('test_app', '0001_initial'),
+    ]
+
+    operations = [
+        migrations.AlterIndexTogether(
+            name='testmodel',
+            index_together=set(),
+        ),
+    ]
+""")
+
+# Function to print stack trace
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Initialize Django
+import django
+django.setup()
+
+# Run migrations
+try:
+    call_command('makemigrations', 'test_app', interactive=False)
+    call_command('migrate', 'test_app', interactive=False)
+    call_command('migrate', 'test_app', '0002', interactive=False)
+except Exception as e:
+    print_stacktrace(e)
+    raise AssertionError("Migration failed with an unexpected error")
+
+# If no exception was raised, the issue is fixed
+print("No issues found. The migration was successful.")
+sys.exit(0)
+
+
+This is the tracing and analysis history:
+
+==================================================
+The issue appears to be related to how Django's migration framework processes the deletion of a combination of constraints (`index_together` and `unique_together`) on model fields. The error occurs due to the migration framework finding an unexpected number of constraints when attempting to delete the `index_together`.
+
+The error traceback indicates that the relevant method involved in handling this error is `_delete_composed_index` in the `django/db/backends/base/schema.py` file. This method is responsible for deleting indices defined on model fields, and it encounters a `ValueError` when the actual number of constraints does not match the expected number.
+
+Let's delve into the observed method where this behavior occurs:
+
+Observed method: `django/db/backends/base/schema.py:_delete_composed_index`
+==================================================
+
+
+Now you choose downstream method BaseDatabaseSchemaEditor._delete_composed_index to further observe, tracing the abnormal program behavior.
+This is the method code:
+   402	    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):
+   403	        meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+   404	        meta_index_names = {constraint.name for constraint in model._meta.indexes}
+   405	        columns = [model._meta.get_field(field).column for field in fields]
+   406	        constraint_names = self._constraint_names(
+   407	            model, columns, exclude=meta_constraint_names | meta_index_names,
+   408	            **constraint_kwargs
+   409	        )
+   410	        if len(constraint_names) != 1:
+   411	            raise ValueError("Found wrong number (%s) of constraints for %s(%s)" % (
+   412	                len(constraint_names),
+   413	                model._meta.db_table,
+   414	                ", ".join(columns),
+   415	            ))
+   416	        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))
+
+
+This is the runtime information of BaseDatabaseSchemaEditor._delete_composed_index:
+
+No changes detected in app 'test_app'
+Operations to perform:
+  Apply all migrations: test_app
+Running migrations:
+  Applying test_app.0002_remove_index_together...Error occurred during script execution:Migration failed with an unexpected error
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-12708/django/db/backends/base/schema.py
+New var:....... __module__ = 'django.db.backends.base.schema'
+New var:....... __qualname__ = 'BaseDatabaseSchemaEditor'
+New var:....... __doc__ = '\n    This class and its subclasses are respons...\n    renaming, index fiddling, and so on.\n    '
+New var:....... sql_create_table = 'CREATE TABLE %(table)s (%(definition)s)'
+New var:....... sql_rename_table = 'ALTER TABLE %(old_table)s RENAME TO %(new_table)s'
+New var:....... sql_retablespace_table = 'ALTER TABLE %(table)s SET TABLESPACE %(new_tablespace)s'
+New var:....... sql_delete_table = 'DROP TABLE %(table)s CASCADE'
+New var:....... sql_create_column = 'ALTER TABLE %(table)s ADD COLUMN %(column)s %(definition)s'
+New var:....... sql_alter_column = 'ALTER TABLE %(table)s %(changes)s'
+New var:....... sql_alter_column_type = 'ALTER COLUMN %(column)s TYPE %(type)s'
+New var:....... sql_alter_column_null = 'ALTER COLUMN %(column)s DROP NOT NULL'
+New var:....... sql_alter_column_not_null = 'ALTER COLUMN %(column)s SET NOT NULL'
+New var:....... sql_alter_column_default = 'ALTER COLUMN %(column)s SET DEFAULT %(default)s'
+New var:....... sql_alter_column_no_default = 'ALTER COLUMN %(column)s DROP DEFAULT'
+New var:....... sql_delete_column = 'ALTER TABLE %(table)s DROP COLUMN %(column)s CASCADE'
+New var:....... sql_rename_column = 'ALTER TABLE %(table)s RENAME COLUMN %(old_column)s TO %(new_column)s'
+New var:....... sql_update_with_default = 'UPDATE %(table)s SET %(column)s = %(default)s WHERE %(column)s IS NULL'
+New var:....... sql_unique_constraint = 'UNIQUE (%(columns)s)'
+New var:....... sql_check_constraint = 'CHECK (%(check)s)'
+New var:....... sql_delete_constraint = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_constraint = 'CONSTRAINT %(name)s %(constraint)s'
+New var:....... sql_create_check = 'ALTER TABLE %(table)s ADD CONSTRAINT %(name)s CHECK (%(check)s)'
+New var:....... sql_delete_check = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_create_unique = 'ALTER TABLE %(table)s ADD CONSTRAINT %(name)s UNIQUE (%(columns)s)'
+New var:....... sql_delete_unique = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_create_fk = 'ALTER TABLE %(table)s ADD CONSTRAINT %(name)s F...ENCES %(to_table)s (%(to_column)s)%(deferrable)s'
+New var:....... sql_create_inline_fk = None
+New var:....... sql_create_column_inline_fk = None
+New var:....... sql_delete_fk = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_create_index = 'CREATE INDEX %(name)s ON %(table)s (%(columns)s)%(extra)s%(condition)s'
+New var:....... sql_create_unique_index = 'CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)%(condition)s'
+New var:....... sql_delete_index = 'DROP INDEX %(name)s'
+New var:....... sql_create_pk = 'ALTER TABLE %(table)s ADD CONSTRAINT %(name)s PRIMARY KEY (%(columns)s)'
+New var:....... sql_delete_pk = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_delete_procedure = 'DROP PROCEDURE %(procedure)s'
+New var:....... __init__ = <function BaseDatabaseSchemaEditor.__init__ at 0x7f29342f2400>
+New var:....... __enter__ = <function BaseDatabaseSchemaEditor.__enter__ at 0x7f29342f2488>
+New var:....... __exit__ = <function BaseDatabaseSchemaEditor.__exit__ at 0x7f29342f2510>
+New var:....... execute = <function BaseDatabaseSchemaEditor.execute at 0x7f29342f2598>
+New var:....... quote_name = <function BaseDatabaseSchemaEditor.quote_name at 0x7f29342f2620>
+New var:....... table_sql = <function BaseDatabaseSchemaEditor.table_sql at 0x7f29342f26a8>
+New var:....... column_sql = <function BaseDatabaseSchemaEditor.column_sql at 0x7f29342f2730>
+New var:....... skip_default = <function BaseDatabaseSchemaEditor.skip_default at 0x7f29342f27b8>
+New var:....... prepare_default = <function BaseDatabaseSchemaEditor.prepare_default at 0x7f29342f2840>
+New var:....... _column_default_sql = <function BaseDatabaseSchemaEditor._column_default_sql at 0x7f29342f28c8>
+New var:....... _effective_default = <staticmethod object at 0x7f29342e4518>
+New var:....... effective_default = <function BaseDatabaseSchemaEditor.effective_default at 0x7f29342f29d8>
+New var:....... quote_value = <function BaseDatabaseSchemaEditor.quote_value at 0x7f29342f2a60>
+New var:....... create_model = <function BaseDatabaseSchemaEditor.create_model at 0x7f29342f2ae8>
+New var:....... delete_model = <function BaseDatabaseSchemaEditor.delete_model at 0x7f29342f2b70>
+New var:....... add_index = <function BaseDatabaseSchemaEditor.add_index at 0x7f29342f2bf8>
+New var:....... remove_index = <function BaseDatabaseSchemaEditor.remove_index at 0x7f29342f2c80>
+New var:....... add_constraint = <function BaseDatabaseSchemaEditor.add_constraint at 0x7f29342f2d08>
+New var:....... remove_constraint = <function BaseDatabaseSchemaEditor.remove_constraint at 0x7f29342f2d90>
+New var:....... alter_unique_together = <function BaseDatabaseSchemaEditor.alter_unique_together at 0x7f29342f2e18>
+New var:....... alter_index_together = <function BaseDatabaseSchemaEditor.alter_index_together at 0x7f29342f2ea0>
+ line       402     def _delete_composed_index(self, model, fields, constraint_kwargs, sql):
+Starting var:.. self = <django.db.backends.sqlite3.schema.DatabaseSchemaEditor object at 0x7f2934163cf8>
+Starting var:.. model = <class '__fake__.TestModel'>
+Starting var:.. fields = ('field1', 'field2')
+Starting var:.. constraint_kwargs = {'index': True}
+Starting var:.. sql = 'DROP INDEX %(name)s'
+ call       402     def _delete_composed_index(self, model, fields, constraint_kwargs, sql):
+ line       403         meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+    Starting var:.. .0 = <list_iterator object at 0x7f29341d4748>
+     call       403         meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+     line       403         meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+     return     403         meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+    Return value:.. set()
+New var:....... meta_constraint_names = set()
+ line       404         meta_index_names = {constraint.name for constraint in model._meta.indexes}
+    Starting var:.. .0 = <list_iterator object at 0x7f29341d4748>
+     call       404         meta_index_names = {constraint.name for constraint in model._meta.indexes}
+     line       404         meta_index_names = {constraint.name for constraint in model._meta.indexes}
+     return     404         meta_index_names = {constraint.name for constraint in model._meta.indexes}
+    Return value:.. set()
+New var:....... meta_index_names = set()
+ line       405         columns = [model._meta.get_field(field).column for field in fields]
+    Starting var:.. .0 = <tuple_iterator object at 0x7f29341d46a0>
+    Starting var:.. model = <class '__fake__.TestModel'>
+     call       405         columns = [model._meta.get_field(field).column for field in fields]
+     line       405         columns = [model._meta.get_field(field).column for field in fields]
+    New var:....... field = 'field1'
+     line       405         columns = [model._meta.get_field(field).column for field in fields]
+    Modified var:.. field = 'field2'
+     line       405         columns = [model._meta.get_field(field).column for field in fields]
+     return     405         columns = [model._meta.get_field(field).column for field in fields]
+    Return value:.. ['field1', 'field2']
+New var:....... columns = ['field1', 'field2']
+ line       406         constraint_names = self._constraint_names(
+ line       407             model, columns, exclude=meta_constraint_names | meta_index_names,
+ line       408             **constraint_kwargs
+New var:....... constraint_names = ['test_app_testmodel_field1_field2_f0eaf8ac_idx', 'test_app_testmodel_field1_field2_f0eaf8ac_uniq']
+ line       410         if len(constraint_names) != 1:
+ line       411             raise ValueError("Found wrong number (%s) of constraints for %s(%s)" % (
+ line       412                 len(constraint_names),
+ line       413                 model._meta.db_table,
+ line       414                 ", ".join(columns),
+ exception  414                 ", ".join(columns),
+Exception:..... ValueError: Found wrong number (2) of constraints for test_app_testmodel(field1, field2)
+New var:....... self = <django.db.backends.sqlite3.schema.DatabaseSchemaEditor object at 0x7f2934163cf8>
+New var:....... model = <class '__fake__.TestModel'>
+New var:....... fields = ('field1', 'field2')
+New var:....... constraint_kwargs = {'index': True}
+New var:....... sql = 'DROP INDEX %(name)s'
+New var:....... meta_constraint_names = set()
+New var:....... meta_index_names = set()
+New var:....... columns = ['field1', 'field2']
+New var:....... constraint_names = ['test_app_testmodel_field1_field2_f0eaf8ac_idx', 'test_app_testmodel_field1_field2_f0eaf8ac_uniq']
+Call ended by exception
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-12708/reproduce.py"
+    111: call_command('migrate', 'test_app', interactive=False)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/core/management/__init__.py"
+    168: return command.execute(*args, **defaults)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/core/management/base.py"
+    371: output = self.handle(*args, **options)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/core/management/base.py"
+    85: res = handle_func(*args, **kwargs)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/core/management/commands/migrate.py"
+    244: fake_initial=fake_initial,
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/executor.py"
+    117: state = self._migrate_all_forwards(state, plan, full_plan, fake=fake, fake_initial=fake_initial)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/executor.py"
+    147: state = self.apply_migration(state, migration, fake=fake, fake_initial=fake_initial)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/executor.py"
+    227: state = migration.apply(state, schema_editor)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/migration.py"
+    124: operation.database_forwards(self.app_label, schema_editor, old_state, project_state)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/operations/models.py"
+    511: getattr(new_model._meta, self.option_name, set()),
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/backends/base/schema.py"
+    396: self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/backends/base/schema.py"
+    414: ", ".join(columns),
+ValueError: Found wrong number (2) of constraints for test_app_testmodel(field1, field2)
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-12708/reproduce.py", line 111, in <module>
+    call_command('migrate', 'test_app', interactive=False)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/core/management/__init__.py", line 168, in call_command
+    return command.execute(*args, **defaults)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/core/management/base.py", line 371, in execute
+    output = self.handle(*args, **options)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/core/management/base.py", line 85, in wrapped
+    res = handle_func(*args, **kwargs)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/core/management/commands/migrate.py", line 244, in handle
+    fake_initial=fake_initial,
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/executor.py", line 117, in migrate
+    state = self._migrate_all_forwards(state, plan, full_plan, fake=fake, fake_initial=fake_initial)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/executor.py", line 147, in _migrate_all_forwards
+    state = self.apply_migration(state, migration, fake=fake, fake_initial=fake_initial)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/executor.py", line 227, in apply_migration
+    state = migration.apply(state, schema_editor)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/migration.py", line 124, in apply
+    operation.database_forwards(self.app_label, schema_editor, old_state, project_state)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/migrations/operations/models.py", line 511, in database_forwards
+    getattr(new_model._meta, self.option_name, set()),
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/backends/base/schema.py", line 396, in alter_index_together
+    self._delete_composed_index(model, fields, {'index': True}, self.sql_delete_index)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/django/db/backends/base/schema.py", line 414, in _delete_composed_index
+    ", ".join(columns),
+ValueError: Found wrong number (2) of constraints for test_app_testmodel(field1, field2)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.1/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.1/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.1/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-12708/reproduce.py", line 115, in <module>
+    raise AssertionError("Migration failed with an unexpected error")
+AssertionError: Migration failed with an unexpected error
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

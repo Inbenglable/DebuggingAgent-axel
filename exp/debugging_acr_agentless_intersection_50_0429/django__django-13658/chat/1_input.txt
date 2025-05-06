@@ -1,0 +1,283 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+ManagementUtility instantiates CommandParser without passing already-computed prog argument
+Description
+	
+ManagementUtility ​goes to the trouble to parse the program name from the argv it's passed rather than from sys.argv: 
+	def __init__(self, argv=None):
+		self.argv = argv or sys.argv[:]
+		self.prog_name = os.path.basename(self.argv[0])
+		if self.prog_name == '__main__.py':
+			self.prog_name = 'python -m django'
+But then when it needs to parse --pythonpath and --settings, it ​uses the program name from sys.argv: 
+		parser = CommandParser(usage='%(prog)s subcommand [options] [args]', add_help=False, allow_abbrev=False)
+Above "%(prog)s" ​refers to sys.argv[0]. Instead, it should refer to self.prog_name. This can fixed as follows:
+		parser = CommandParser(
+			prog=self.prog_name,
+			usage='%(prog)s subcommand [options] [args]',
+			add_help=False,
+			allow_abbrev=False)
+I'm aware that execute_from_command_line is a private API, but it'd be really convenient for me if it worked properly in my weird embedded environment where sys.argv[0] is ​incorrectly None. If passing my own argv to execute_from_command_line avoided all the ensuing exceptions, I wouldn't have to modify sys.argv[0] globally as I'm doing in the meantime.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import sys
+import os
+import traceback
+from django.core.management import ManagementUtility
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+def main():
+    # Simulate an environment where sys.argv[0] is None
+    original_argv = sys.argv[:]
+    sys.argv = [None, 'subcommand', '--pythonpath', '/some/path', '--settings', 'my.settings']
+
+    try:
+        # Create an instance of ManagementUtility with the modified sys.argv
+        utility = ManagementUtility(argv=sys.argv)
+        # This will use the incorrect prog_name from sys.argv[0] which is None
+        parser = utility.fetch_command('subcommand').create_parser('subcommand', 'subcommand')
+        # If the issue is present, this will raise an exception because prog_name is None
+        usage = parser.format_usage()
+        # Check if the usage string contains 'None' which indicates the issue is present
+        assert 'None' not in usage, "The usage string contains 'None', indicating the issue is present."
+    except Exception as e:
+        print_stacktrace(e)
+        raise AssertionError("The issue is present: prog_name is not correctly set in CommandParser.")
+    finally:
+        # Restore the original sys.argv
+        sys.argv = original_argv
+
+if __name__ == '__main__':
+    main()
+
+This is the corresponding output and runtime information:
+Error occurred during script execution:The issue is present: prog_name is not correctly set in CommandParser.
+
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py
+    Starting var:.. __name__ = '__main__'
+    Starting var:.. __doc__ = None
+    Starting var:.. __package__ = ''
+    Starting var:.. __loader__ = None
+    Starting var:.. __spec__ = None
+    Starting var:.. __file__ = '/data/swe-fl/TMP/testbed/django__django-13658/reproduce.py'
+    Starting var:.. __cached__ = None
+    Starting var:.. __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+     call         1 import sys
+     line         1 import sys
+    New var:....... sys = <module 'sys' (built-in)>
+     line         2 import os
+    New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/os.py'>
+     line         3 import traceback
+    New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py'>
+     line         4 from django.core.management import ManagementUtility
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.core.management'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f55127db030>
+        Return value:.. <module 'django.core.management' from '/data/swe...django-13658/django/core/management/__init__.py'>
+        Starting var:.. module = <module 'django.core.management' from '/data/swe...django-13658/django/core/management/__init__.py'>
+        Starting var:.. fromlist = ('ManagementUtility',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'ManagementUtility'
+        Return value:.. <module 'django.core.management' from '/data/swe...django-13658/django/core/management/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py
+    New var:....... ManagementUtility = <class 'django.core.management.ManagementUtility'>
+     line         6 def print_stacktrace(e: Exception):
+    New var:....... print_stacktrace = <function print_stacktrace at 0x7f551240c620>
+     line        16 def main():
+    New var:....... main = <function main at 0x7f551240c9d8>
+     line        37 if __name__ == '__main__':
+     line        38     main()
+         call        16 def main():
+         line        18     original_argv = sys.argv[:]
+        New var:....... original_argv = ['/data/swe-fl/TMP/testbed/django__django-13658/...o-13658/reproduce.py": [0, 38]}', '--depth', '2']
+         line        19     sys.argv = [None, 'subcommand', '--pythonpath', '/some/path', '--settings', 'my.settings']
+         line        21     try:
+         line        23         utility = ManagementUtility(argv=sys.argv)
+            Source path:... /data/swe-fl/TMP/testbed/django__django-13658/django/core/management/__init__.py
+            Starting var:.. self = <django.core.management.ManagementUtility object at 0x7f551275e940>
+            Starting var:.. argv = [None, 'subcommand', '--pythonpath', '/some/path', '--settings', 'my.settings']
+             call       188     def __init__(self, argv=None):
+             line       189         self.argv = argv or sys.argv[:]
+             line       190         self.prog_name = os.path.basename(self.argv[0])
+             exception  190         self.prog_name = os.path.basename(self.argv[0])
+            Exception:..... TypeError: expected str, bytes or os.PathLike object, not NoneType
+        Call ended by exception
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py
+     exception   23         utility = ManagementUtility(argv=sys.argv)
+    Exception:..... TypeError: expected str, bytes or os.PathLike object, not NoneType
+New var:....... original_argv = ['/data/swe-fl/TMP/testbed/django__django-13658/...o-13658/reproduce.py": [0, 38]}', '--depth', '2']
+ line        30     except Exception as e:
+New var:....... e = TypeError('expected str, bytes or os.PathLike object, not NoneType',)
+ line        31         print_stacktrace(e)
+    Starting var:.. e = TypeError('expected str, bytes or os.PathLike object, not NoneType',)
+     call         6 def print_stacktrace(e: Exception):
+     line         7     tb = traceback.extract_tb(e.__traceback__)
+        Source path:... /root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py
+        Starting var:.. tb = <traceback object at 0x7f55118dee48>
+        Starting var:.. limit = None
+         call        59 def extract_tb(tb, limit=None):
+         line        72     return StackSummary.extract(walk_tb(tb), limit=limit)
+         return      72     return StackSummary.extract(walk_tb(tb), limit=limit)
+        Return value:.. [<FrameSummary file /data/swe-fl/TMP/testbed/dja...ib/python3.6/posixpath.py, line 146 in basename>]
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py
+    New var:....... tb = [<FrameSummary file /data/swe-fl/TMP/testbed/dja...ib/python3.6/posixpath.py, line 146 in basename>]
+     line         8     print("Traceback (most recent call last):", file=sys.stderr)
+Traceback (most recent call last):
+     line         9     for frame in tb:
+    New var:....... frame = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py, line 23 in main>
+     line        10         line_number = frame.lineno
+    New var:....... line_number = 23
+     line        11         code_context = frame.line.strip() if frame.line else "Unknown"
+        Source path:... /root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py
+        Starting var:.. self = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py, line 23 in main>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'utility = ManagementUtility(argv=sys.argv)'
+        Starting var:.. self = <FrameSummary file /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py, line 23 in main>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'utility = ManagementUtility(argv=sys.argv)'
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py
+    New var:....... code_context = 'utility = ManagementUtility(argv=sys.argv)'
+     line        12         print(f'  File "{frame.filename}"', file=sys.stderr)
+  File "/data/swe-fl/TMP/testbed/django__django-13658/reproduce.py"
+     line        13         print(f"    {line_number}: {code_context}", file=sys.stderr)
+    23: utility = ManagementUtility(argv=sys.argv)
+     line         9     for frame in tb:
+    Modified var:.. frame = <FrameSummary file /data/swe-fl/TMP/testbed/djan...ore/management/__init__.py, line 190 in __init__>
+     line        10         line_number = frame.lineno
+    Modified var:.. line_number = 190
+     line        11         code_context = frame.line.strip() if frame.line else "Unknown"
+        Source path:... /root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py
+        Starting var:.. self = <FrameSummary file /data/swe-fl/TMP/testbed/djan...ore/management/__init__.py, line 190 in __init__>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'self.prog_name = os.path.basename(self.argv[0])'
+        Starting var:.. self = <FrameSummary file /data/swe-fl/TMP/testbed/djan...ore/management/__init__.py, line 190 in __init__>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'self.prog_name = os.path.basename(self.argv[0])'
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py
+    Modified var:.. code_context = 'self.prog_name = os.path.basename(self.argv[0])'
+     line        12         print(f'  File "{frame.filename}"', file=sys.stderr)
+  File "/data/swe-fl/TMP/testbed/django__django-13658/django/core/management/__init__.py"
+     line        13         print(f"    {line_number}: {code_context}", file=sys.stderr)
+    190: self.prog_name = os.path.basename(self.argv[0])
+     line         9     for frame in tb:
+    Modified var:.. frame = <FrameSummary file /root/miniforge3/envs/django_...lib/python3.6/posixpath.py, line 146 in basename>
+     line        10         line_number = frame.lineno
+    Modified var:.. line_number = 146
+     line        11         code_context = frame.line.strip() if frame.line else "Unknown"
+        Source path:... /root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py
+        Starting var:.. self = <FrameSummary file /root/miniforge3/envs/django_...lib/python3.6/posixpath.py, line 146 in basename>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'p = os.fspath(p)'
+        Starting var:.. self = <FrameSummary file /root/miniforge3/envs/django_...lib/python3.6/posixpath.py, line 146 in basename>
+         call       284     def line(self):
+         line       285         if self._line is None:
+         line       287         return self._line
+         return     287         return self._line
+        Return value:.. 'p = os.fspath(p)'
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13658/reproduce.py
+    Modified var:.. code_context = 'p = os.fspath(p)'
+     line        12         print(f'  File "{frame.filename}"', file=sys.stderr)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/posixpath.py"
+     line        13         print(f"    {line_number}: {code_context}", file=sys.stderr)
+    146: p = os.fspath(p)
+     line         9     for frame in tb:
+     line        14     print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+TypeError: expected str, bytes or os.PathLike object, not NoneType
+     return      14     print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+    Return value:.. None
+ line        32         raise AssertionError("The issue is present: prog_name is not correctly set in CommandParser.")
+ exception   32         raise AssertionError("The issue is present: prog_name is not correctly set in CommandParser.")
+Exception:..... AssertionError: The issue is present: prog_name is not correctly set in CommandParser.
+New var:....... original_argv = ['/data/swe-fl/TMP/testbed/django__django-13658/...o-13658/reproduce.py": [0, 38]}', '--depth', '2']
+ line        35         sys.argv = original_argv
+Call ended by exception
+ exception   38     main()
+Exception:..... AssertionError: The issue is present: prog_name is not correctly set in CommandParser.
+New var:....... __name__ = '__main__'
+New var:....... __doc__ = None
+New var:....... __package__ = ''
+New var:....... __loader__ = None
+New var:....... __spec__ = None
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-13658/reproduce.py'
+New var:....... __cached__ = None
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/os.py'>
+New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py'>
+New var:....... ManagementUtility = <class 'django.core.management.ManagementUtility'>
+New var:....... print_stacktrace = <function print_stacktrace at 0x7f551240c620>
+New var:....... main = <function main at 0x7f551240c9d8>
+Call ended by exception
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-13658/reproduce.py", line 23, in main
+    utility = ManagementUtility(argv=sys.argv)
+  File "/data/swe-fl/TMP/testbed/django__django-13658/django/core/management/__init__.py", line 190, in __init__
+    self.prog_name = os.path.basename(self.argv[0])
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/posixpath.py", line 146, in basename
+    p = os.fspath(p)
+TypeError: expected str, bytes or os.PathLike object, not NoneType
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-13658/reproduce.py", line 38, in <module>
+    main()
+  File "/data/swe-fl/TMP/testbed/django__django-13658/reproduce.py", line 32, in main
+    raise AssertionError("The issue is present: prog_name is not correctly set in CommandParser.")
+AssertionError: The issue is present: prog_name is not correctly set in CommandParser.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

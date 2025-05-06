@@ -1,0 +1,190 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **sympy** project:
+## ISSUE
+<ISSUE>
+UnboundLocalError in evalf
+```
+>>> Mul(x, Max(0, y), evaluate=False).evalf()
+x*Max(0, y)
+>>> Mul(Max(0, y), x, evaluate=False).evalf()
+Traceback (most recent call last):
+  File "./sympy/core/evalf.py", line 1285, in evalf
+    rf = evalf_table[x.func]
+KeyError: Max
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "./sympy/core/evalf.py", line 1394, in evalf
+    result = evalf(self, prec + 4, options)
+  File "./sympy/core/evalf.py", line 1286, in evalf
+    r = rf(x, prec, options)
+  File "./sympy/core/evalf.py", line 538, in evalf_mul
+    arg = evalf(arg, prec, options)
+  File "./sympy/core/evalf.py", line 1308, in evalf
+    r = re, im, reprec, imprec
+UnboundLocalError: local variable 'reprec' referenced before assignment
+```
+
+I found this after changing the order of Mul args in https://github.com/sympy/sympy/pull/13059.
+
+Based on the code, I think the elif clauses that define reprec and imprec should have an `else: raise NotImplementedError`. That appears to fix it, although I didn't try to debug to see why the arg order is mattering here. 
+
+</ISSUE>
+
+
+A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is its debugging history:
+
+==================================================
+The error encountered is an `UnboundLocalError`, which indicates local variables `reprec` and `imprec` are being referenced before assignment. The traceback indicates this occurred in the `evalf` method in the file `sympy/core/evalf.py`.
+
+The call sequence leading to the error is as follows:
+
+1. An instance of `Mul`, with arguments `Max(0, y)` and `x`, is created and `evalf()` is called on it.
+2. During the evaluation, the `evalf` method attempts to resolve `Max(0, y)` by looking up its function in `evalf_table`. Since `Max` is not found, it raises a `KeyError`.
+3. This falls into an exception block that tries to work with `reprec` and `imprec`, which have not been defined in all code paths, leading to an `UnboundLocalError`.
+
+To resolve the issue, we need to determine why `reprec` and `imprec` are not being assigned in certain execution paths. The problem likely stems from the logic within `evalf`, specifically where `reprec` and `imprec` are expected to be set.
+
+Next, I will observe the `evalf` method within `sympy/core/evalf.py`:
+
+```plaintext
+Observed method: sympy/core/evalf.py:evalf
+```
+==================================================
+The error encountered is an `UnboundLocalError`, which indicates that the local variable `reprec` is being referenced before it is assigned. From the trace and the provided code, we can identify the issue occurring in the `evalf` method within the `sympy/core/evalf.py` file. Here's the summary of the observation:
+
+1. The order of `Mul` elements affects how `evalf` processes the expression.
+2. The issue arises in the generic handling of `_eval_evalf` when the `evalf_table` lookup does not find an entry for `Max`.
+3. In the attempt to fall back to generic `evalf`, due to a missing case for non-numeric results of `Max`, the necessary assignments to `reprec` and `imprec` are skipped, leading to the error.
+4. Specifically, the code paths that determine and set `reprec` and `imprec` do not cover all possible cases, especially when the real and imaginary parts cannot immediately be identified as numbers.
+
+The problematic area of code can be seen here:
+```python
+if re == 0:
+    re = None
+    reprec = None
+elif re.is_number:
+    re = re._to_mpmath(prec, allow_ints=False)._mpf_
+    reprec = prec
+# Missing case: else clause for non-number `re`
+```
+
+Given this understanding, the part that needs addressing to avoid the `UnboundLocalError` is the handling of the `re` variable when it is neither zero nor a number.
+
+Thus, based on the current analysis, I can locate the buggy method as:
+
+Buggy method: `sympy/core/evalf.py:evalf`
+==================================================
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+Based on the debugging information, the issue is in the `evalf` method within the `sympy/core/evalf.py` file. To generate a patch, I need to retrieve the source code of this method to understand the logic and make necessary changes to resolve the issue. Therefore, I will search for the `evalf` method in the specified file.
+
+```python
+search_method_in_file("sympy/core/evalf.py", "evalf")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("sympy/core/evalf.py", "evalf")
+RESULT:
+#### sympy/core/evalf.py:evalf
+```python
+def evalf(x, prec, options):
+    from sympy import re as re_, im as im_
+    try:
+        rf = evalf_table[x.func]
+        r = rf(x, prec, options)
+    except KeyError:
+        try:
+            # Fall back to ordinary evalf if possible
+            if 'subs' in options:
+                x = x.subs(evalf_subs(prec, options['subs']))
+            xe = x._eval_evalf(prec)
+            re, im = xe.as_real_imag()
+            if re.has(re_) or im.has(im_):
+                raise NotImplementedError
+            if re == 0:
+                re = None
+                reprec = None
+            elif re.is_number:
+                re = re._to_mpmath(prec, allow_ints=False)._mpf_
+                reprec = prec
+            if im == 0:
+                im = None
+                imprec = None
+            elif im.is_number:
+                im = im._to_mpmath(prec, allow_ints=False)._mpf_
+                imprec = prec
+            r = re, im, reprec, imprec
+        except AttributeError:
+            raise NotImplementedError
+    if options.get("verbose"):
+        print("### input", x)
+        print("### output", to_str(r[0] or fzero, 50))
+        print("### raw", r) # r[0], r[2]
+        print()
+    chop = options.get('chop', False)
+    if chop:
+        if chop is True:
+            chop_prec = prec
+        else:
+            # convert (approximately) from given tolerance;
+            # the formula here will will make 1e-i rounds to 0 for
+            # i in the range +/-27 while 2e-i will not be chopped
+            chop_prec = int(round(-3.321*math.log10(chop) + 2.5))
+            if chop_prec == 3:
+                chop_prec -= 1
+        r = chop_parts(r, chop_prec)
+    if options.get("strict"):
+        check_target(x, r, prec)
+    return r
+
+```
+
+
+==================================================
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+## IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+## IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

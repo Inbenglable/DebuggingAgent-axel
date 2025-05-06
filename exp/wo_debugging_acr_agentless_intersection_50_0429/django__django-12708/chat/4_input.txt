@@ -1,0 +1,142 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Migration crashes deleting an index_together if there is a unique_together on the same fields
+Description
+	
+Happens with Django 1.11.10
+Steps to reproduce:
+1) Create models with 2 fields, add 2 same fields to unique_together and to index_together
+2) Delete index_together -> Fail
+It will fail at django/db/backends/base/schema.py, line 378, in _delete_composed_index(), ValueError: Found wrong number (2) of constraints for as this one will find two constraints, the _uniq and the _idx one. No way to get out of this...
+The worst in my case is that happened as I wanted to refactor my code to use the "new" (Dj 1.11) Options.indexes feature. I am actually not deleting the index, just the way it is declared in my code.
+I think there are 2 different points here:
+1) The deletion of index_together should be possible alone or made coherent (migrations side?) with unique_together
+2) Moving the declaration of an index should not result in an index re-creation
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To tackle this issue, we need to ensure we understand how constraints are identified and managed, particularly when both `unique_together` and `index_together` are present. 
+
+We've reviewed the `_delete_composed_index` method, which is responsible for deleting constraints, and we've looked at the `Options` class, although its definition doesn't include specific management of indexes or unique constraints. 
+
+The next logical step is to understand how migration files handle both the index and unique constraints, especially in terms of defining and deleting them. We will need to inspect migration methods or classes that interact with `unique_together` and `index_together`.
+
+I will look into migration-related logic that might affect these constraints:
+
+```python
+search_class_in_codebase("IndexConstraint")
+search_method_in_codebase("_generate_index_name")
+search_method_in_codebase("_create_index_sql")
+search_method_in_codebase("_delete_constraint_sql")
+```
+
+This search will help us understand how Django generates, creates, and deletes indexes and constraints, giving us a clearer picture of where adjustments are necessary to resolve the issue at hand.
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("_create_index_sql")
+RESULT:
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor._create_index_sql
+```python
+    def _create_index_sql(self, model, fields, *, name=None, suffix='', using='',
+                          db_tablespace=None, col_suffixes=(), sql=None, opclasses=(),
+                          condition=None):
+        """
+        Return the SQL statement to create the index for one or several fields.
+        `sql` can be specified if the syntax differs from the standard (GIS
+        indexes, ...).
+        """
+        tablespace_sql = self._get_index_tablespace_sql(model, fields, db_tablespace=db_tablespace)
+        columns = [field.column for field in fields]
+        sql_create_index = sql or self.sql_create_index
+        table = model._meta.db_table
+
+        def create_index_name(*args, **kwargs):
+            nonlocal name
+            if name is None:
+                name = self._create_index_name(*args, **kwargs)
+            return self.quote_name(name)
+
+        return Statement(
+            sql_create_index,
+            table=Table(table, self.quote_name),
+            name=IndexName(table, columns, suffix, create_index_name),
+            using=using,
+            columns=self._index_columns(table, columns, col_suffixes, opclasses),
+            extra=tablespace_sql,
+            condition=(' WHERE ' + condition) if condition else '',
+        )
+
+```
+
+#### django/db/backends/postgresql/schema.py:DatabaseSchemaEditor._create_index_sql
+```python
+    def _create_index_sql(
+        self, model, fields, *, name=None, suffix='', using='',
+        db_tablespace=None, col_suffixes=(), sql=None, opclasses=(),
+        condition=None, concurrently=False,
+    ):
+        sql = self.sql_create_index if not concurrently else self.sql_create_index_concurrently
+        return super()._create_index_sql(
+            model, fields, name=name, suffix=suffix, using=using, db_tablespace=db_tablespace,
+            col_suffixes=col_suffixes, sql=sql, opclasses=opclasses, condition=condition,
+        )
+
+```
+
+#### django/contrib/gis/db/backends/postgis/schema.py:PostGISSchemaEditor._create_index_sql
+```python
+    def _create_index_sql(self, model, fields, **kwargs):
+        if len(fields) != 1 or not hasattr(fields[0], 'geodetic'):
+            return super()._create_index_sql(model, fields, **kwargs)
+
+        field = fields[0]
+        field_column = self.quote_name(field.column)
+
+        if field.geom_type == 'RASTER':
+            # For raster fields, wrap index creation SQL statement with ST_ConvexHull.
+            # Indexes on raster columns are based on the convex hull of the raster.
+            field_column = self.rast_index_wrapper % field_column
+        elif field.dim > 2 and not field.geography:
+            # Use "nd" ops which are fast on multidimensional cases
+            field_column = "%s %s" % (field_column, self.geom_index_ops_nd)
+        if kwargs.get('name') is None:
+            index_name = '%s_%s_id' % (model._meta.db_table, field.column)
+        else:
+            index_name = kwargs['name']
+
+        return Statement(
+            self.sql_create_index,
+            name=self.quote_name(index_name),
+            table=self.quote_name(model._meta.db_table),
+            using=' USING %s' % self.geom_index_type,
+            columns=field_column,
+            extra='',
+            condition='',
+        )
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

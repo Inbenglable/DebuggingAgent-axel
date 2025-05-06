@@ -1,0 +1,295 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+The issue is related to an `OperationalError` when trying to add a `OneToOneField` using SQLite3. In general, this issue stems from SQLite's inability to add a unique column after the table has been created.
+
+To resolve this issue, I first need to explore potential fixes or workarounds that have been discussed or implemented in the Django codebase, especially concerning adding unique constraints in SQLite. This would involve understanding how Django manages schema alterations and any related methods. Specifically, I will need to examine the methods that handle `OneToOneField` creation in SQLite migrations.
+
+Let's start by looking into the Django codebase to investigate how schema alterations involving unique columns are handled in SQLite databases. I will search for implementations or references to SQL ALTER TABLE operations that add unique columns and how Django's migration system processes these operations.
+
+To proceed with this, I will search for relevant methods or classes likely involved with this functionality.
+
+```python
+search_method_in_codebase("add_field")
+search_class_in_codebase("SchemaEditor")
+search_method_in_codebase("execute")
+```
+
+These searches will give me an insight into the schema alteration, specifically `ALTER TABLE` operations and how SQLite might be treated differently for such cases in Django. With this, I'll gather the required information to generate a patch.
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("execute")
+RESULT:
+#### django/db/backends/utils.py:CursorDebugWrapper.execute
+```python
+    def execute(self, sql, params=None):
+        with self.debug_sql(sql, params, use_last_executed_query=True):
+            return super().execute(sql, params)
+
+```
+
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor.execute
+```python
+    def execute(self, sql, params=()):
+        """Execute the given SQL statement, with optional parameters."""
+        # Don't perform the transactional DDL check if SQL is being collected
+        # as it's not going to be executed anyway.
+        if not self.collect_sql and self.connection.in_atomic_block and not self.connection.features.can_rollback_ddl:
+            raise TransactionManagementError(
+                "Executing DDL statements while in a transaction on databases "
+                "that can't perform a rollback is prohibited."
+            )
+        # Account for non-string statement objects.
+        sql = str(sql)
+        # Log the command we're running, then run it
+        logger.debug("%s; (params %r)", sql, params, extra={'params': params, 'sql': sql})
+        if self.collect_sql:
+            ending = "" if sql.rstrip().endswith(";") else ";"
+            if params is not None:
+                self.collected_sql.append((sql % tuple(map(self.quote_value, params))) + ending)
+            else:
+                self.collected_sql.append(sql + ending)
+        else:
+            with self.connection.cursor() as cursor:
+                cursor.execute(sql, params)
+
+```
+
+#### django/db/backends/oracle/base.py:FormatStylePlaceholderCursor.execute
+```python
+    def execute(self, query, params=None):
+        query, params = self._fix_for_params(query, params, unify_by_values=True)
+        self._guess_input_sizes([params])
+        with wrap_oracle_errors():
+            return self.cursor.execute(query, self._param_generator(params))
+
+```
+
+#### django/db/backends/sqlite3/base.py:SQLiteCursorWrapper.execute
+```python
+    def execute(self, query, params=None):
+        if params is None:
+            return Database.Cursor.execute(self, query)
+        query = self.convert_query(query)
+        return Database.Cursor.execute(self, query, params)
+
+```
+
+#### django/db/backends/mysql/base.py:CursorWrapper.execute
+```python
+    def execute(self, query, args=None):
+        try:
+            # args is None means no string interpolation
+            return self.cursor.execute(query, args)
+        except Database.OperationalError as e:
+            # Map some error codes to IntegrityError, since they seem to be
+            # misclassified and Django would prefer the more logical place.
+            if e.args[0] in self.codes_for_integrityerror:
+                raise IntegrityError(*tuple(e.args))
+            raise
+
+```
+
+#### django/core/management/base.py:BaseCommand.execute
+```python
+    def execute(self, *args, **options):
+        """
+        Try to execute this command, performing system checks if needed (as
+        controlled by the ``requires_system_checks`` attribute, except if
+        force-skipped).
+        """
+        if options['force_color'] and options['no_color']:
+            raise CommandError("The --no-color and --force-color options can't be used together.")
+        if options['force_color']:
+            self.style = color_style(force_color=True)
+        elif options['no_color']:
+            self.style = no_style()
+            self.stderr.style_func = None
+        if options.get('stdout'):
+            self.stdout = OutputWrapper(options['stdout'])
+        if options.get('stderr'):
+            self.stderr = OutputWrapper(options['stderr'])
+
+        if self.requires_system_checks and not options['skip_checks']:
+            if self.requires_system_checks == ALL_CHECKS:
+                self.check()
+            else:
+                self.check(tags=self.requires_system_checks)
+        if self.requires_migrations_checks:
+            self.check_migrations()
+        output = self.handle(*args, **options)
+        if output:
+            if self.output_transaction:
+                connection = connections[options.get('database', DEFAULT_DB_ALIAS)]
+                output = '%s\n%s\n%s' % (
+                    self.style.SQL_KEYWORD(connection.ops.start_transaction_sql()),
+                    output,
+                    self.style.SQL_KEYWORD(connection.ops.end_transaction_sql()),
+                )
+            self.stdout.write(output)
+        return output
+
+```
+
+#### django/core/management/__init__.py:ManagementUtility.execute
+```python
+    def execute(self):
+        """
+        Given the command-line arguments, figure out which subcommand is being
+        run, create a parser appropriate to that command, and run it.
+        """
+        try:
+            subcommand = self.argv[1]
+        except IndexError:
+            subcommand = 'help'  # Display help if no arguments were given.
+
+        # Preprocess options to extract --settings and --pythonpath.
+        # These options could affect the commands that are available, so they
+        # must be processed early.
+        parser = CommandParser(
+            prog=self.prog_name,
+            usage='%(prog)s subcommand [options] [args]',
+            add_help=False,
+            allow_abbrev=False,
+        )
+        parser.add_argument('--settings')
+        parser.add_argument('--pythonpath')
+        parser.add_argument('args', nargs='*')  # catch-all
+        try:
+            options, args = parser.parse_known_args(self.argv[2:])
+            handle_default_options(options)
+        except CommandError:
+            pass  # Ignore any option errors at this point.
+
+        try:
+            settings.INSTALLED_APPS
+        except ImproperlyConfigured as exc:
+            self.settings_exception = exc
+        except ImportError as exc:
+            self.settings_exception = exc
+
+        if settings.configured:
+            # Start the auto-reloading dev server even if the code is broken.
+            # The hardcoded condition is a code smell but we can't rely on a
+            # flag on the command class because we haven't located it yet.
+            if subcommand == 'runserver' and '--noreload' not in self.argv:
+                try:
+                    autoreload.check_errors(django.setup)()
+                except Exception:
+                    # The exception will be raised later in the child process
+                    # started by the autoreloader. Pretend it didn't happen by
+                    # loading an empty list of applications.
+                    apps.all_models = defaultdict(dict)
+                    apps.app_configs = {}
+                    apps.apps_ready = apps.models_ready = apps.ready = True
+
+                    # Remove options not compatible with the built-in runserver
+                    # (e.g. options for the contrib.staticfiles' runserver).
+                    # Changes here require manually testing as described in
+                    # #27522.
+                    _parser = self.fetch_command('runserver').create_parser('django', 'runserver')
+                    _options, _args = _parser.parse_known_args(self.argv[2:])
+                    for _arg in _args:
+                        self.argv.remove(_arg)
+
+            # In all other cases, django.setup() is required to succeed.
+            else:
+                django.setup()
+
+        self.autocomplete()
+
+        if subcommand == 'help':
+            if '--commands' in args:
+                sys.stdout.write(self.main_help_text(commands_only=True) + '\n')
+            elif not options.args:
+                sys.stdout.write(self.main_help_text() + '\n')
+            else:
+                self.fetch_command(options.args[0]).print_help(self.prog_name, options.args[0])
+        # Special-cases: We want 'django-admin --version' and
+        # 'django-admin --help' to work, for backwards compatibility.
+        elif subcommand == 'version' or self.argv[1:] == ['--version']:
+            sys.stdout.write(django.get_version() + '\n')
+        elif self.argv[1:] in (['--help'], ['-h']):
+            sys.stdout.write(self.main_help_text() + '\n')
+        else:
+            self.fetch_command(subcommand).run_from_argv(self.argv)
+
+```
+
+#### django/core/management/commands/runserver.py:Command.execute
+```python
+    def execute(self, *args, **options):
+        if options['no_color']:
+            # We rely on the environment because it's currently the only
+            # way to reach WSGIRequestHandler. This seems an acceptable
+            # compromise considering `runserver` runs indefinitely.
+            os.environ["DJANGO_COLORS"] = "nocolor"
+        super().execute(*args, **options)
+
+```
+
+#### django/core/management/commands/sqlmigrate.py:Command.execute
+```python
+    def execute(self, *args, **options):
+        # sqlmigrate doesn't support coloring its output but we need to force
+        # no_color=True so that the BEGIN/COMMIT statements added by
+        # output_transaction don't get colored either.
+        options['no_color'] = True
+        return super().execute(*args, **options)
+
+```
+
+#### django/contrib/auth/management/commands/createsuperuser.py:Command.execute
+```python
+    def execute(self, *args, **options):
+        self.stdin = options.get('stdin', sys.stdin)  # Used for testing
+        return super().execute(*args, **options)
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

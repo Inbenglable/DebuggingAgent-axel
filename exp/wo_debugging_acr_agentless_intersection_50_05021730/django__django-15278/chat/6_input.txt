@@ -1,0 +1,285 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+The issue is related to an `OperationalError` when trying to add a `OneToOneField` using SQLite3. In general, this issue stems from SQLite's inability to add a unique column after the table has been created.
+
+To resolve this issue, I first need to explore potential fixes or workarounds that have been discussed or implemented in the Django codebase, especially concerning adding unique constraints in SQLite. This would involve understanding how Django manages schema alterations and any related methods. Specifically, I will need to examine the methods that handle `OneToOneField` creation in SQLite migrations.
+
+Let's start by looking into the Django codebase to investigate how schema alterations involving unique columns are handled in SQLite databases. I will search for implementations or references to SQL ALTER TABLE operations that add unique columns and how Django's migration system processes these operations.
+
+To proceed with this, I will search for relevant methods or classes likely involved with this functionality.
+
+```python
+search_method_in_codebase("add_field")
+search_class_in_codebase("SchemaEditor")
+search_method_in_codebase("execute")
+```
+
+These searches will give me an insight into the schema alteration, specifically `ALTER TABLE` operations and how SQLite might be treated differently for such cases in Django. With this, I'll gather the required information to generate a patch.
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("add_field")
+RESULT:
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """
+        Create a field on a model. Usually involves adding a column, but may
+        involve adding a table instead (for M2M fields).
+        """
+        # Special-case implicit M2M tables
+        if field.many_to_many and field.remote_field.through._meta.auto_created:
+            return self.create_model(field.remote_field.through)
+        # Get the column's definition
+        definition, params = self.column_sql(model, field, include_default=True)
+        # It might not actually have a column behind it
+        if definition is None:
+            return
+        # Check constraints can go on the column SQL here
+        db_params = field.db_parameters(connection=self.connection)
+        if db_params['check']:
+            definition += " " + self.sql_check_constraint % db_params
+        if field.remote_field and self.connection.features.supports_foreign_keys and field.db_constraint:
+            constraint_suffix = '_fk_%(to_table)s_%(to_column)s'
+            # Add FK constraint inline, if supported.
+            if self.sql_create_column_inline_fk:
+                to_table = field.remote_field.model._meta.db_table
+                to_column = field.remote_field.model._meta.get_field(field.remote_field.field_name).column
+                namespace, _ = split_identifier(model._meta.db_table)
+                definition += " " + self.sql_create_column_inline_fk % {
+                    'name': self._fk_constraint_name(model, field, constraint_suffix),
+                    'namespace': '%s.' % self.quote_name(namespace) if namespace else '',
+                    'column': self.quote_name(field.column),
+                    'to_table': self.quote_name(to_table),
+                    'to_column': self.quote_name(to_column),
+                    'deferrable': self.connection.ops.deferrable_sql()
+                }
+            # Otherwise, add FK constraints later.
+            else:
+                self.deferred_sql.append(self._create_fk_sql(model, field, constraint_suffix))
+        # Build the SQL and run it
+        sql = self.sql_create_column % {
+            "table": self.quote_name(model._meta.db_table),
+            "column": self.quote_name(field.column),
+            "definition": definition,
+        }
+        self.execute(sql, params)
+        # Drop the default if we need to
+        # (Django usually does not use in-database defaults)
+        if not self.skip_default_on_alter(field) and self.effective_default(field) is not None:
+            changes_sql, params = self._alter_column_default_sql(model, None, field, drop=True)
+            sql = self.sql_alter_column % {
+                "table": self.quote_name(model._meta.db_table),
+                "changes": changes_sql,
+            }
+            self.execute(sql, params)
+        # Add an index, if required
+        self.deferred_sql.extend(self._field_indexes_sql(model, field))
+        # Reset connection if required
+        if self.connection.features.connection_persists_old_columns:
+            self.connection.close()
+
+```
+
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """Create a field on a model."""
+        # Fields with default values cannot by handled by ALTER TABLE ADD
+        # COLUMN statement because DROP DEFAULT is not supported in
+        # ALTER TABLE.
+        if not field.null or self.effective_default(field) is not None:
+            self._remake_table(model, create_field=field)
+        else:
+            super().add_field(model, field)
+
+```
+
+
+### API INVOKE: search_method_in_codebase("execute")
+RESULT:
+#### django/db/backends/sqlite3/base.py:SQLiteCursorWrapper.execute
+```python
+    def execute(self, query, params=None):
+        if params is None:
+            return Database.Cursor.execute(self, query)
+        query = self.convert_query(query)
+        return Database.Cursor.execute(self, query, params)
+
+```
+
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor.execute
+```python
+    def execute(self, sql, params=()):
+        """Execute the given SQL statement, with optional parameters."""
+        # Don't perform the transactional DDL check if SQL is being collected
+        # as it's not going to be executed anyway.
+        if not self.collect_sql and self.connection.in_atomic_block and not self.connection.features.can_rollback_ddl:
+            raise TransactionManagementError(
+                "Executing DDL statements while in a transaction on databases "
+                "that can't perform a rollback is prohibited."
+            )
+        # Account for non-string statement objects.
+        sql = str(sql)
+        # Log the command we're running, then run it
+        logger.debug("%s; (params %r)", sql, params, extra={'params': params, 'sql': sql})
+        if self.collect_sql:
+            ending = "" if sql.rstrip().endswith(";") else ";"
+            if params is not None:
+                self.collected_sql.append((sql % tuple(map(self.quote_value, params))) + ending)
+            else:
+                self.collected_sql.append(sql + ending)
+        else:
+            with self.connection.cursor() as cursor:
+                cursor.execute(sql, params)
+
+```
+
+
+==================================================
+
+Your Output:
+To address the issue identified with adding a nullable `OneToOneField` that results in a SQLite `OperationalError` due to the unique column constraint during a migration, we need to modify the behavior in the SQLite-specific `add_field` method. The solution involves checking for the unique constraint in addition to the nullability and default value before deciding to use `_remake_table`. If a field has a unique constraint, SQLite will have trouble directly altering the table to add such a column, hence requiring a table re-creation.
+
+I need to retrieve the source code of the `DatabaseSchemaEditor` class from the SQLite backend to understand the context and generate an appropriate patch. 
+
+Based on the already retrieved information, I'll now proceed to search for the source code of the `DatabaseSchemaEditor` class.
+
+```python
+search_class_in_file("django/db/backends/sqlite3/schema.py", "DatabaseSchemaEditor")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_class_in_file("django/db/backends/sqlite3/schema.py", "DatabaseSchemaEditor")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor
+```python
+class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+
+    sql_delete_table = "DROP TABLE %(table)s"
+    sql_create_fk = None
+    sql_create_inline_fk = "REFERENCES %(to_table)s (%(to_column)s) DEFERRABLE INITIALLY DEFERRED"
+    sql_create_column_inline_fk = sql_create_inline_fk
+    sql_create_unique = "CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)"
+    sql_delete_unique = "DROP INDEX %(name)s"
+
+    def __enter__(self):
+        ...
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        ...
+
+    def quote_value(self, value):
+        ...
+
+    def prepare_default(self, value):
+        ...
+
+    def _is_referenced_by_fk_constraint(self, table_name, column_name=None, ignore_self=False):
+        ...
+
+    def alter_db_table(self, model, old_db_table, new_db_table, disable_constraints=True):
+        ...
+
+    def alter_field(self, model, old_field, new_field, strict=False):
+        ...
+
+    def _remake_table(self, model, create_field=None, delete_field=None, alter_field=None):
+        ...
+
+    def delete_model(self, model, handle_autom2m=True):
+        ...
+
+    def add_field(self, model, field):
+        ...
+
+    def remove_field(self, model, field):
+        ...
+
+    def _alter_field(self, model, old_field, new_field, old_type, new_type,
+        ...
+
+    def _alter_many_to_many(self, model, old_field, new_field, strict):
+        ...
+
+    def add_constraint(self, model, constraint):
+        ...
+
+    def remove_constraint(self, model, constraint):
+        ...
+
+    def _collate_sql(self, collation):
+        ...
+```
+
+
+==================================================
+
+Your Output:
+Ready generation: `True`
+==================================================
+
+Now, you need to generate patches to resolve the issue. Please ensure that your patch does not disrupt the original functionality of the code.
+You should generate *SEARCH/REPLACE* format patches to fix the issue.
+Every *SEARCH/REPLACE* edit must use this format:
+```pythony
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+
+A final json reply example:
+```json
+{
+  "search_replace_edits": [
+    "### A/B.py\n<<<<<<< SEARCH
+       def foo():\n=======\n    def bar():\n>>>>>>> REPLACE\n",
+    "### A/B.py\n<<<<<<< SEARCH
+       x = x + 1\n=======\n    x = x - 1\n>>>>>>> REPLACE\n",
+}
+```
+
+

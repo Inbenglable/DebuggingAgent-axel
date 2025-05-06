@@ -1,0 +1,302 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **sympy** project:
+## ISSUE
+<ISSUE>
+The difference of MatrixSymbols prints as a sum with (-1) coefficient
+Internally, differences like a-b are represented as the sum of a with `(-1)*b`, but they are supposed to print like a-b. This does not happen with MatrixSymbols. I tried three printers: str, pretty, and latex: 
+```
+from sympy import *
+A = MatrixSymbol('A', 2, 2)
+B = MatrixSymbol('B', 2, 2)
+print(A - A*B - B)
+pprint(A - A*B - B)
+latex(A - A*B - B)
+```
+Output:
+```
+(-1)*B + (-1)*A*B + A
+-B + -A⋅B + A
+'-1 B + -1 A B + A'
+```
+
+Based on a [Stack Overflow post](https://stackoverflow.com/q/48826611)
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+The API results show that there is a `MatrixSymbol` class but no specific printer methods for the `StrPrinter`, `PrettyPrinter`, or `LatexPrinter` in the expected files. Instead, there is a `TheanoPrinter` method `_print_MatrixSymbol`. It seems the relevant printer methods that affect the symbolic string conversion of matrix expressions might be located somewhere else or are indirectly handled, possibly missing some custom handling specifically for `MatrixSymbol`.
+
+To resolve the issue related to the difference of MatrixSymbols printing incorrectly as a sum with a coefficient of -1, I need to identify where the general string conversion behaviors, such as the subtraction behavior for `MatrixSymbol`, are defined. Specifically, I need to find the corresponding printer logic for SymPy that deals with subtraction/operator expression printing.
+
+I'll search for methods related to printing expressions like subtraction operations or `_print_Add` which might manage addition/subtraction logic, possibly capturing how `MatrixSymbol` expressions and their minus sign display are handled.
+
+```python
+search_method_in_codebase("_print_Add")
+search_method_in_codebase("Add._print_")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("_print_Add")
+RESULT:
+#### sympy/printing/fcode.py:FCodePrinter._print_Add
+```python
+    def _print_Add(self, expr):
+        # purpose: print complex numbers nicely in Fortran.
+        # collect the purely real and purely imaginary parts:
+        pure_real = []
+        pure_imaginary = []
+        mixed = []
+        for arg in expr.args:
+            if arg.is_number and arg.is_real:
+                pure_real.append(arg)
+            elif arg.is_number and arg.is_imaginary:
+                pure_imaginary.append(arg)
+            else:
+                mixed.append(arg)
+        if len(pure_imaginary) > 0:
+            if len(mixed) > 0:
+                PREC = precedence(expr)
+                term = Add(*mixed)
+                t = self._print(term)
+                if t.startswith('-'):
+                    sign = "-"
+                    t = t[1:]
+                else:
+                    sign = "+"
+                if precedence(term) < PREC:
+                    t = "(%s)" % t
+
+                return "cmplx(%s,%s) %s %s" % (
+                    self._print(Add(*pure_real)),
+                    self._print(-S.ImaginaryUnit*Add(*pure_imaginary)),
+                    sign, t,
+                )
+            else:
+                return "cmplx(%s,%s)" % (
+                    self._print(Add(*pure_real)),
+                    self._print(-S.ImaginaryUnit*Add(*pure_imaginary)),
+                )
+        else:
+            return CodePrinter._print_Add(self, expr)
+
+```
+
+#### sympy/printing/repr.py:ReprPrinter._print_Add
+```python
+    def _print_Add(self, expr, order=None):
+        args = self._as_ordered_terms(expr, order=order)
+        args = map(self._print, args)
+        return "Add(%s)" % ", ".join(args)
+
+```
+
+#### sympy/printing/latex.py:LatexPrinter._print_Add
+```python
+    def _print_Add(self, expr, order=None):
+        if self.order == 'none':
+            terms = list(expr.args)
+        else:
+            terms = self._as_ordered_terms(expr, order=order)
+
+        tex = ""
+        for i, term in enumerate(terms):
+            if i == 0:
+                pass
+            elif _coeff_isneg(term):
+                tex += " - "
+                term = -term
+            else:
+                tex += " + "
+            term_tex = self._print(term)
+            if self._needs_add_brackets(term):
+                term_tex = r"\left(%s\right)" % term_tex
+            tex += term_tex
+
+        return tex
+
+```
+
+#### sympy/printing/llvmjitcode.py:LLVMJitPrinter._print_Add
+```python
+    def _print_Add(self, expr):
+        nodes = [self._print(a) for a in expr.args]
+        e = nodes[0]
+        for node in nodes[1:]:
+            e = self.builder.fadd(e, node)
+        return e
+
+```
+
+#### sympy/printing/glsl.py:GLSLPrinter._print_Add
+```python
+    def _print_Add(self, expr, order=None):
+        if(self._settings['use_operators']):
+            return CodePrinter._print_Add(self,expr,order)
+
+        terms = expr.as_ordered_terms()
+
+        def partition(p,l):
+            return reduce(lambda x, y: (x[0]+[y], x[1]) if p(y) else (x[0], x[1]+[y]), l,  ([], []))
+        def add(a,b):
+            return self._print_Function_with_args('add',a,b)
+            # return self.known_functions['add']+'(%s, %s)' % (a,b)
+        neg, pos = partition(lambda arg: _coeff_isneg(arg), terms)
+        s = pos = reduce(lambda a,b: add(a,b), map(lambda t: self._print(t),pos))
+        if(len(neg) > 0):
+            # sum the absolute values of the negative terms
+            neg = reduce(lambda a,b: add(a,b), map(lambda n: self._print(-n),neg))
+            # then subtract them from the positive terms
+            s = self._print_Function_with_args('sub',pos,neg)
+            # s = self.known_functions['sub']+'(%s, %s)' % (pos,neg)
+        return s
+
+```
+
+#### sympy/printing/mathml.py:MathMLPresentationPrinter._print_Add
+```python
+    def _print_Add(self, expr, order=None):
+        mrow = self.dom.createElement('mrow')
+        args = self._as_ordered_terms(expr, order=order)
+        mrow.appendChild(self._print(args[0]))
+        for arg in args[1:]:
+            if _coeff_isneg(arg):
+                # use minus
+                x = self.dom.createElement('mo')
+                x.appendChild(self.dom.createTextNode('-'))
+                y = self._print(-arg)
+                # invert expression since this is now minused
+            else:
+                x = self.dom.createElement('mo')
+                x.appendChild(self.dom.createTextNode('+'))
+                y = self._print(arg)
+            mrow.appendChild(x)
+            mrow.appendChild(y)
+
+        return mrow
+
+```
+
+#### sympy/printing/str.py:StrPrinter._print_Add
+```python
+    def _print_Add(self, expr, order=None):
+        if self.order == 'none':
+            terms = list(expr.args)
+        else:
+            terms = self._as_ordered_terms(expr, order=order)
+
+        PREC = precedence(expr)
+        l = []
+        for term in terms:
+            t = self._print(term)
+            if t.startswith('-'):
+                sign = "-"
+                t = t[1:]
+            else:
+                sign = "+"
+            if precedence(term) < PREC:
+                l.extend([sign, "(%s)" % t])
+            else:
+                l.extend([sign, t])
+        sign = l.pop(0)
+        if sign == '+':
+            sign = ""
+        return sign + ' '.join(l)
+
+```
+
+#### sympy/printing/pretty/pretty.py:PrettyPrinter._print_Add
+```python
+    def _print_Add(self, expr, order=None):
+        if self.order == 'none':
+            terms = list(expr.args)
+        else:
+            terms = self._as_ordered_terms(expr, order=order)
+        pforms, indices = [], []
+
+        def pretty_negative(pform, index):
+            """Prepend a minus sign to a pretty form. """
+            #TODO: Move this code to prettyForm
+            if index == 0:
+                if pform.height() > 1:
+                    pform_neg = '- '
+                else:
+                    pform_neg = '-'
+            else:
+                pform_neg = ' - '
+
+            if (pform.binding > prettyForm.NEG
+                or pform.binding == prettyForm.ADD):
+                p = stringPict(*pform.parens())
+            else:
+                p = pform
+            p = stringPict.next(pform_neg, p)
+            # Lower the binding to NEG, even if it was higher. Otherwise, it
+            # will print as a + ( - (b)), instead of a - (b).
+            return prettyForm(binding=prettyForm.NEG, *p)
+
+        for i, term in enumerate(terms):
+            if term.is_Mul and _coeff_isneg(term):
+                coeff, other = term.as_coeff_mul(rational=False)
+                pform = self._print(Mul(-coeff, *other, evaluate=False))
+                pforms.append(pretty_negative(pform, i))
+            elif term.is_Rational and term.q > 1:
+                pforms.append(None)
+                indices.append(i)
+            elif term.is_Number and term < 0:
+                pform = self._print(-term)
+                pforms.append(pretty_negative(pform, i))
+            elif term.is_Relational:
+                pforms.append(prettyForm(*self._print(term).parens()))
+            else:
+                pforms.append(self._print(term))
+
+        if indices:
+            large = True
+
+            for pform in pforms:
+                if pform is not None and pform.height() > 1:
+                    break
+            else:
+                large = False
+
+            for i in indices:
+                term, negative = terms[i], False
+
+                if term < 0:
+                    term, negative = -term, True
+
+                if large:
+                    pform = prettyForm(str(term.p))/prettyForm(str(term.q))
+                else:
+                    pform = self._print(term)
+
+                if negative:
+                    pform = pretty_negative(pform, i)
+
+                pforms[i] = pform
+
+        return prettyForm.__add__(*pforms)
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

@@ -1,0 +1,199 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+The issue involves handling nullable `OneToOneField` migrations in SQLite, with a problem arising in the test script (`reproduce.py`). We have identified that the incorrect attribute and import was `migrations.OneToOneField` instead of `models.OneToOneField`. Additionally, there's a direct issue with how SQLite handles adding nullable unique columns through migrations.
+
+To generate the patch, we need to:
+1. Confirm and obtain the related migration setup code where `models.OneToOneField` is used.
+2. Review any significant changes or handling in the core Django migration code or the specific behavior of SQLite migrations affecting `OneToOneField`. Given that the error might extend into how `django` handles migrations specifically with SQLite, reviewing any `ALTER TABLE` behavior in migrations related to SQLite might also be necessary.
+
+Let's retrieve the relevant migration-related sources to make these adjustments properly:
+
+```python
+search_method_in_file("django/db/backends/sqlite3/base.py", "execute")
+search_method_in_codebase("AddField")
+search_method_in_codebase("OneToOneField")
+search_code_in_codebase("ALTER TABLE")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_code_in_codebase("ALTER TABLE")
+RESULT:
+#### tests/backends/oracle/test_operations.py:131-137
+```python
+        )
+        self.assertEqual(
+            statements[4],
+            'ALTER TABLE "BACKENDS_VERYLONGMODELNAME540F" ENABLE CONSTRAINT '
+            '"BACKENDS__PERSON_ID_1DD5E829_F";',
+        )
+        # Sequences.
+```
+
+#### tests/schema/tests.py:283-289
+```python
+        # a deferred ALTER TABLE.
+        self.assertFalse([
+            sql for sql in (str(statement) for statement in editor.deferred_sql)
+            if sql.startswith('ALTER TABLE') and 'ADD CONSTRAINT' in sql
+        ])
+
+    @skipUnlessDBFeature('can_create_inline_fk')
+```
+
+#### django/db/backends/base/schema.py:941-947
+```python
+        (e.g. SERIAL in PostgreSQL, PostGIS fields).
+
+        Return a two-tuple of: an SQL fragment of (sql, params) to insert into
+        an ALTER TABLE statement and a list of extra (sql, params) tuples to
+        run once the field is altered.
+        """
+        return (
+```
+
+#### django/db/backends/base/features.py:165-171
+```python
+    # Does it support operations requiring references rename in a transaction?
+    supports_atomic_references_rename = True
+
+    # Can we issue more than one ALTER COLUMN clause in an ALTER TABLE?
+    supports_combined_alters = False
+
+    # Does it support foreign keys?
+```
+
+#### django/db/backends/oracle/schema.py:190-196
+```python
+            return row[0] if row else False
+
+    def _drop_identity(self, table_name, column_name):
+        self.execute('ALTER TABLE %(table)s MODIFY %(column)s DROP IDENTITY' % {
+            'table': self.quote_name(table_name),
+            'column': self.quote_name(column_name),
+        })
+```
+
+#### django/db/backends/sqlite3/schema.py:353-359
+```python
+    def _alter_field(self, model, old_field, new_field, old_type, new_type,
+                     old_db_params, new_db_params, strict=False):
+        """Perform a "physical" (non-ManyToMany) field update."""
+        # Use "ALTER TABLE ... RENAME COLUMN" if only the column name
+        # changed and there aren't any constraints.
+        if (self.connection.features.can_alter_table_rename_column and
+            old_field.column != new_field.column and
+```
+
+#### django/db/backends/sqlite3/features.py:26-32
+```python
+    time_cast_precision = 3
+    can_release_savepoints = True
+    has_case_insensitive_like = True
+    # Is "ALTER TABLE ... RENAME COLUMN" supported?
+    can_alter_table_rename_column = Database.sqlite_version_info >= (3, 25, 0)
+    supports_parentheses_in_compound = False
+    # Deferred constraint checks can be emulated on SQLite < 3.20 but not in a
+```
+
+#### django/db/backends/postgresql/schema.py:31-37
+```python
+    )
+    # Setting the constraint to IMMEDIATE runs any deferred checks to allow
+    # dropping it in the same transaction.
+    sql_delete_fk = "SET CONSTRAINTS %(name)s IMMEDIATE; ALTER TABLE %(table)s DROP CONSTRAINT %(name)s"
+
+    sql_delete_procedure = 'DROP FUNCTION %(procedure)s(%(param_types)s)'
+
+```
+
+#### django/db/backends/mysql/schema.py:47-53
+```python
+                return super().sql_rename_column
+        elif self.connection.mysql_version >= (8, 0, 4):
+            return super().sql_rename_column
+        return 'ALTER TABLE %(table)s CHANGE %(old_column)s %(new_column)s %(type)s'
+
+    def quote_value(self, value):
+        self.connection.ensure_connection()
+```
+
+#### django/db/backends/mysql/operations.py:198-204
+```python
+        sql = ['SET FOREIGN_KEY_CHECKS = 0;']
+        if reset_sequences:
+            # It's faster to TRUNCATE tables that require a sequence reset
+            # since ALTER TABLE AUTO_INCREMENT is slower than TRUNCATE.
+            sql.extend(
+                '%s %s;' % (
+                    style.SQL_KEYWORD('TRUNCATE'),
+```
+
+#### django/contrib/postgres/operations.py:306-312
+```python
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        model = from_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, model):
+            schema_editor.execute('ALTER TABLE %s VALIDATE CONSTRAINT %s' % (
+                schema_editor.quote_name(model._meta.db_table),
+                schema_editor.quote_name(self.name),
+            ))
+```
+
+#### django/contrib/postgres/constraints.py:122-128
+```python
+    def create_sql(self, model, schema_editor):
+        self.check_supported(schema_editor)
+        return Statement(
+            'ALTER TABLE %(table)s ADD %(constraint)s',
+            table=Table(model._meta.db_table, schema_editor.quote_name),
+            constraint=self.constraint_sql(model, schema_editor),
+        )
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

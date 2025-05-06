@@ -1,0 +1,90 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Migration crashes deleting an index_together if there is a unique_together on the same fields
+Description
+	
+Happens with Django 1.11.10
+Steps to reproduce:
+1) Create models with 2 fields, add 2 same fields to unique_together and to index_together
+2) Delete index_together -> Fail
+It will fail at django/db/backends/base/schema.py, line 378, in _delete_composed_index(), ValueError: Found wrong number (2) of constraints for as this one will find two constraints, the _uniq and the _idx one. No way to get out of this...
+The worst in my case is that happened as I wanted to refactor my code to use the "new" (Dj 1.11) Options.indexes feature. I am actually not deleting the index, just the way it is declared in my code.
+I think there are 2 different points here:
+1) The deletion of index_together should be possible alone or made coherent (migrations side?) with unique_together
+2) Moving the declaration of an index should not result in an index re-creation
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+In order to resolve the issue, I need to understand the context of how the `_delete_composed_index` method is being invoked and used within the Django migration framework. Specifically, I need to determine where the method is called to identify any caller's behavior that might affect how the constraints are handled. This information would be valuable for designing an appropriate fix. Therefore, I need to search for occurrences of `_delete_composed_index` in the codebase to locate calls and inspect their context.
+
+```python
+search_method_in_codebase("_delete_composed_index")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("_delete_composed_index")
+RESULT:
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor._delete_composed_index
+```python
+    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):
+        meta_constraint_names = {constraint.name for constraint in model._meta.constraints}
+        meta_index_names = {constraint.name for constraint in model._meta.indexes}
+        columns = [model._meta.get_field(field).column for field in fields]
+        constraint_names = self._constraint_names(
+            model, columns, exclude=meta_constraint_names | meta_index_names,
+            **constraint_kwargs
+        )
+        if len(constraint_names) != 1:
+            raise ValueError("Found wrong number (%s) of constraints for %s(%s)" % (
+                len(constraint_names),
+                model._meta.db_table,
+                ", ".join(columns),
+            ))
+        self.execute(self._delete_constraint_sql(sql, model, constraint_names[0]))
+
+```
+
+#### django/db/backends/mysql/schema.py:DatabaseSchemaEditor._delete_composed_index
+```python
+    def _delete_composed_index(self, model, fields, *args):
+        """
+        MySQL can remove an implicit FK index on a field when that field is
+        covered by another index like a unique_together. "covered" here means
+        that the more complex index starts like the simpler one.
+        http://bugs.mysql.com/bug.php?id=37910 / Django ticket #24757
+        We check here before removing the [unique|index]_together if we have to
+        recreate a FK index.
+        """
+        first_field = model._meta.get_field(fields[0])
+        if first_field.get_internal_type() == 'ForeignKey':
+            constraint_names = self._constraint_names(model, [first_field.column], index=True)
+            if not constraint_names:
+                self.execute(self._create_index_sql(model, [first_field], suffix=""))
+        return super()._delete_composed_index(model, fields, *args)
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

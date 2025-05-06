@@ -1,0 +1,728 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Change uuid field to FK does not create dependency
+Description
+	 
+		(last modified by Simon Charette)
+	 
+Hi! I am new in django community, so please help me, because i really dont know is it really "bug".
+I have a django project named "testproject" and two apps: testapp1, testapp2.
+It will be simpler to understand, with this example:
+# TestApp1(models.py):
+class App1(models.Model):
+	id = models.UUIDField(primary_key=True, unique=True, default=uuid.uuid4, editable=False, verbose_name=_('identifier'))
+	text = models.CharField(max_length=100, verbose_name=_('text'))
+	another_app = models.UUIDField(null=True, blank=True, verbose_name=_('another app'))
+# TestApp2(models.py):
+class App2(models.Model):
+	id = models.UUIDField(primary_key=True, unique=True, default=uuid.uuid4, editable=False, verbose_name=_('identifier'))
+	text = models.CharField(max_length=100, verbose_name=_('text'))
+First model named "App1" has UUID field named "another_app":
+ another_app = models.UUIDField(null=True, blank=True, verbose_name=_('another app'))
+After some time i change field from UUID to FK, like this: 
+another_app = models.ForeignKey(App2, null=True, blank=True, on_delete=models.SET_NULL, verbose_name=_('another app'))
+And as result i create new migration, but Migration class was unexpected result, because it does not create any "dependencies" for App2, because of FK.
+I think the correct solution will be create dependency for App2.
+This project use django version 2.2 and postgresql. Attach archive with sources. Project contains small test, after running him, you will get exception like this: ValueError: Related model 'testapp2.App2' cannot be resolved.
+So is it problem in django or maybe i dont understand something ?
+Here is my post in django users:
+​https://groups.google.com/forum/#!searchin/django-users/Django$20bug$3A$20change$20uuid$20field$20to$20FK$20does$20not$20create$20dependency%7Csort:date/django-users/-h9LZxFomLU/yz-NLi1cDgAJ
+Regards, Viktor Lomakin
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+from django.core.management import call_command
+from django.db.migrations.state import ProjectState
+from django.db.migrations.autodetector import MigrationAutodetector
+from django.db.migrations.loader import MigrationLoader
+from django.apps import apps
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+def main():
+    # Set up Django environment
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'testproject.settings')
+    import django
+    django.setup()
+
+    # Load the current project state
+    loader = MigrationLoader(connection=apps.connection)
+    project_state = ProjectState.from_apps(apps)
+
+    # Simulate the change from UUIDField to ForeignKey
+    from testapp1.models import App1
+    from testapp2.models import App2
+
+    # Create a new state with the ForeignKey
+    new_state = project_state.clone()
+    new_state.models['testapp1', 'app1'].fields[2] = migrations.AlterField(
+        model_name='app1',
+        name='another_app',
+        field=migrations.fields.ForeignKey(
+            to='testapp2.App2',
+            on_delete=migrations.deletion.SET_NULL,
+            null=True,
+            blank=True,
+            verbose_name='another app'
+        )
+    )
+
+    # Detect changes
+    autodetector = MigrationAutodetector(
+        loader.project_state(),
+        new_state,
+        ignore_noop=True
+    )
+    changes = autodetector.changes(graph=loader.graph)
+
+    # Check if the migration has a dependency on testapp2
+    migration = changes['testapp1'][0]
+    dependencies = migration.dependencies
+
+    # Check if 'testapp2' is in the dependencies
+    assert any('testapp2' in dep for dep in dependencies), "Migration does not have a dependency on testapp2"
+
+    # If the assertion passes, print success message
+    print("Migration correctly has a dependency on testapp2. Issue is fixed.")
+    sys.exit(0)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except AssertionError as e:
+        print_stacktrace(e)
+        raise
+    except Exception as e:
+        print_stacktrace(e)
+        raise AssertionError("An unexpected error occurred while reproducing the issue.")
+
+
+This is the tracing and analysis history:
+
+==================================================
+The current issue seems to originate from the script's failure to locate the `testproject` Django settings module. This leads to a `ModuleNotFoundError` during the Django setup.
+
+Here are the key points observed from the log:
+
+1. **Error Location**: The error arises when attempting to perform the Django setup using `os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'testproject.settings')`.
+
+2. **Root Cause**: There may be a misconfiguration in the environment or project structure since it fails to find the specified settings module `testproject.settings`.
+
+3. **Testing Issues**: The test script is designed to simulate a migration change and verify dependency creation. However, due to the absence of the settings module, it fails to complete the setup phase required for migration testing.
+
+Given this, no specific method related to Django migrations is observed as problematic yet. The primary issue resides in the environment setup itself.
+
+To gather further information on this issue, the next method to observe would involve verifying how the settings module is configured and imported.
+
+Observed method: `django/__init__.py:setup`
+==================================================
+The runtime error we are encountering is a `ModuleNotFoundError`, indicating that the Django settings module `'testproject.settings'` cannot be found. This suggests a misconfiguration in the project's structure or environment setup rather than an issue with Django itself. The problem arises during the `django.setup()` call, specifically at line 19 in the observed `setup` method in `django/__init__.py`.
+
+Here's the analysis based on the current observations:
+1. **Setup Failure**: The error is triggered when trying to access the Django settings through `settings.LOGGING_CONFIG` inside the `setup` method because the settings module cannot be imported.
+2. **Potential Causes**: The settings module not being found could be due to several reasons:
+   - The `DJANGO_SETTINGS_MODULE` is set incorrectly or points to a non-existent path.
+   - The project directory does not include the `testproject/settings.py` file or the parent directory is not in the Python path.
+   - Errors in the project structure that lead to the module being unavailable.
+
+Given this, the primary issue seems to be related to project configuration rather than a code logic error within Django itself. However, to resolve Viktor Lomakin's migration issue, you need to ensure that the Django environment is properly configured.
+
+Before identifying the issue with the migration system, I need to ensure the Django settings are correctly loaded. So, the next step is to observe the settings configuration further.
+
+Observed scope: `django/conf/__init__.py:76-142`
+This scope contains the settings access and initialization, where `_setup` and `Settings` are involved in handling the settings module. We need to verify if the `settings.SETTINGS_MODULE` is correctly initialized and whether the file path issues begin here.
+==================================================
+The trace so far indicates that the settings module `'testproject.settings'` cannot be found, which leads to a failure during the Django setup. This is termed as a `ModuleNotFoundError`, suggesting a misconfiguration in the project's structure or environment setup. The current observation has highlighted the initialization and setup of Django settings within the `Settings` class.
+
+From the observed code snippet:
+
+- **Issue Context**: The settings configuration code is designed to import and initialize Django settings based on the `DJANGO_SETTINGS_MODULE` environment variable. The error `ModuleNotFoundError` occurs when the specified module `'testproject.settings'` cannot be located during the import attempt within the `Settings.__init__` method.
+
+Given this information, I suspect that the problem is related to improper project configuration, such as the incorrect directory structure or Python path setting, rather than a code logic error within Django itself.
+
+The next step is to dive deeper into the settings import process and observe the behavior during the settings module import attempt within `Settings.__init__`.
+
+Observed method: `django/conf/__init__.py:Settings.__init__`
+==================================================
+
+
+Now you choose downstream method Settings.__init__ to further observe, tracing the abnormal program behavior.
+This is the method code:
+   133	    def __init__(self, settings_module):
+   134	        # update this dict from global settings (but only for ALL_CAPS settings)
+   135	        for setting in dir(global_settings):
+   136	            if setting.isupper():
+   137	                setattr(self, setting, getattr(global_settings, setting))
+   138	
+   139	        # store the settings module in case someone later cares
+   140	        self.SETTINGS_MODULE = settings_module
+   141	
+   142	        mod = importlib.import_module(self.SETTINGS_MODULE)
+   143	
+   144	        tuple_settings = (
+   145	            "INSTALLED_APPS",
+   146	            "TEMPLATE_DIRS",
+   147	            "LOCALE_PATHS",
+   148	        )
+   149	        self._explicit_settings = set()
+   150	        for setting in dir(mod):
+   151	            if setting.isupper():
+   152	                setting_value = getattr(mod, setting)
+   153	
+   154	                if (setting in tuple_settings and
+   155	                        not isinstance(setting_value, (list, tuple))):
+   156	                    raise ImproperlyConfigured("The %s setting must be a list or a tuple. " % setting)
+   157	                setattr(self, setting, setting_value)
+   158	                self._explicit_settings.add(setting)
+   159	
+   160	        if not self.SECRET_KEY:
+   161	            raise ImproperlyConfigured("The SECRET_KEY setting must not be empty.")
+   162	
+   163	        if self.is_overridden('FILE_CHARSET'):
+   164	            warnings.warn(FILE_CHARSET_DEPRECATED_MSG, RemovedInDjango31Warning)
+   165	
+   166	        if hasattr(time, 'tzset') and self.TIME_ZONE:
+   167	            # When we can, attempt to validate the timezone. If we can't find
+   168	            # this file, no check happens and it's harmless.
+   169	            zoneinfo_root = Path('/usr/share/zoneinfo')
+   170	            zone_info_file = zoneinfo_root.joinpath(*self.TIME_ZONE.split('/'))
+   171	            if zoneinfo_root.exists() and not zone_info_file.exists():
+   172	                raise ValueError("Incorrect timezone setting: %s" % self.TIME_ZONE)
+   173	            # Move the time zone info into os.environ. See ticket #2315 for why
+   174	            # we don't do this unconditionally (breaks Windows).
+   175	            os.environ['TZ'] = self.TIME_ZONE
+   176	            time.tzset()
+
+
+This is the runtime information of Settings.__init__:
+
+Error occurred during script execution:An unexpected error occurred while reproducing the issue.
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-11740/django/conf/__init__.py
+New var:....... __module__ = 'django.conf'
+New var:....... __qualname__ = 'Settings'
+ line       133     def __init__(self, settings_module):
+Starting var:.. self = REPR FAILED
+Starting var:.. settings_module = 'testproject.settings'
+ call       133     def __init__(self, settings_module):
+ line       135         for setting in dir(global_settings):
+New var:....... setting = 'ABSOLUTE_URL_OVERRIDES'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'ADMINS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'ALLOWED_HOSTS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'APPEND_SLASH'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'AUTHENTICATION_BACKENDS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'AUTH_PASSWORD_VALIDATORS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'AUTH_USER_MODEL'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CACHES'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CACHE_MIDDLEWARE_ALIAS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CACHE_MIDDLEWARE_KEY_PREFIX'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CACHE_MIDDLEWARE_SECONDS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_COOKIE_AGE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_COOKIE_DOMAIN'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_COOKIE_HTTPONLY'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_COOKIE_NAME'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_COOKIE_PATH'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_COOKIE_SAMESITE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_COOKIE_SECURE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_FAILURE_VIEW'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_HEADER_NAME'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_TRUSTED_ORIGINS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'CSRF_USE_SESSIONS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DATABASES'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DATABASE_ROUTERS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DATA_UPLOAD_MAX_MEMORY_SIZE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DATA_UPLOAD_MAX_NUMBER_FIELDS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DATETIME_FORMAT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DATETIME_INPUT_FORMATS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DATE_FORMAT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DATE_INPUT_FORMATS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DEBUG'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DEBUG_PROPAGATE_EXCEPTIONS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DECIMAL_SEPARATOR'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DEFAULT_CHARSET'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DEFAULT_EXCEPTION_REPORTER_FILTER'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DEFAULT_FILE_STORAGE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DEFAULT_FROM_EMAIL'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DEFAULT_INDEX_TABLESPACE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DEFAULT_TABLESPACE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'DISALLOWED_USER_AGENTS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_BACKEND'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_HOST'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_HOST_PASSWORD'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_HOST_USER'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_PORT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_SSL_CERTFILE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_SSL_KEYFILE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_SUBJECT_PREFIX'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_TIMEOUT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_USE_LOCALTIME'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_USE_SSL'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'EMAIL_USE_TLS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FILE_CHARSET'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FILE_UPLOAD_DIRECTORY_PERMISSIONS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FILE_UPLOAD_HANDLERS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FILE_UPLOAD_MAX_MEMORY_SIZE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FILE_UPLOAD_PERMISSIONS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FILE_UPLOAD_TEMP_DIR'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FIRST_DAY_OF_WEEK'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FIXTURE_DIRS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FORCE_SCRIPT_NAME'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FORMAT_MODULE_PATH'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'FORM_RENDERER'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'IGNORABLE_404_URLS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'INSTALLED_APPS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'INTERNAL_IPS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGES'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGES_BIDI'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGE_CODE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGE_COOKIE_AGE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGE_COOKIE_DOMAIN'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGE_COOKIE_HTTPONLY'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGE_COOKIE_NAME'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGE_COOKIE_PATH'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGE_COOKIE_SAMESITE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LANGUAGE_COOKIE_SECURE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LOCALE_PATHS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LOGGING'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LOGGING_CONFIG'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LOGIN_REDIRECT_URL'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LOGIN_URL'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'LOGOUT_REDIRECT_URL'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'MANAGERS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'MEDIA_ROOT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'MEDIA_URL'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'MESSAGE_STORAGE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'MIDDLEWARE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'MIGRATION_MODULES'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'MONTH_DAY_FORMAT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'NUMBER_GROUPING'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'PASSWORD_HASHERS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'PASSWORD_RESET_TIMEOUT_DAYS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'PREPEND_WWW'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECRET_KEY'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_BROWSER_XSS_FILTER'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_CONTENT_TYPE_NOSNIFF'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_HSTS_INCLUDE_SUBDOMAINS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_HSTS_PRELOAD'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_HSTS_SECONDS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_PROXY_SSL_HEADER'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_REDIRECT_EXEMPT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_SSL_HOST'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SECURE_SSL_REDIRECT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SERVER_EMAIL'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_CACHE_ALIAS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_COOKIE_AGE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_COOKIE_DOMAIN'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_COOKIE_HTTPONLY'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_COOKIE_NAME'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_COOKIE_PATH'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_COOKIE_SAMESITE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_COOKIE_SECURE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_ENGINE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_EXPIRE_AT_BROWSER_CLOSE'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_FILE_PATH'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_SAVE_EVERY_REQUEST'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SESSION_SERIALIZER'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SHORT_DATETIME_FORMAT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SHORT_DATE_FORMAT'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SIGNING_BACKEND'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'SILENCED_SYSTEM_CHECKS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'STATICFILES_DIRS'
+ line       136             if setting.isupper():
+ line       137                 setattr(self, setting, getattr(global_settings, setting))
+ line       135         for setting in dir(global_settings):
+Modified var:.. setting = 'STATICFILES_FINDERS'
+ line       136             if setting.isupper():
+
+The debugging test execution result is too long to display here. Please re-select your `runtime_info` lists to narrow down the scope of your analysis.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

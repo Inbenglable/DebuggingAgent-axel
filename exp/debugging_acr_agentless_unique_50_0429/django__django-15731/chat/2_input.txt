@@ -1,0 +1,191 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+inspect.signature() returns incorrect signature on manager methods.
+Description
+	 
+		(last modified by Shiva Kumar)
+	 
+inspect.signature returns incorrect signature information when used on queryset methods
+import inspect
+from django.db import models
+class Person(models.Model):
+	name = models.CharField(max_length=100)
+print(inspect.signature(Person.objects.bulk_create))
+# actual: (*args, **kwargs)
+# expected: (objs, batch_size=None, ignore_conflicts=False)
+ipython and jupyter seem to internally use inspect.signature to show documentation when using the <obj>? command and they too show incorrect signature information:
+ 
+The issue is due to the code at ​https://github.com/django/django/blob/fe2e1478464846638082219c933a4302e5cf3037/django/db/models/manager.py#L84
+Although we are ensuring the decorated method has the right name and docstring on lines 87 and 88, complete metadata is not copied.
+The fix is to use functools.wraps instead of manually assigning name and docstring. wraps will take care of all the metadata and inspect.signature will return the expected output.
+If the bug is acknowledged please assign the ticket to me, I would like to raise a PR for this.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import django
+import inspect
+import traceback
+import sys
+from django.conf import settings
+from django.db import models
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+def setup_django():
+    # Set up Django environment
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'reproducer')
+    settings.configure(
+        INSTALLED_APPS=[
+            'django.contrib.contenttypes',  # Required for Django models
+        ],
+        DATABASES={
+            'default': {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': ':memory:',
+            }
+        },
+        SECRET_KEY='fake-key',
+        DEBUG=True,
+    )
+    django.setup()
+
+class Person(models.Model):
+    name = models.CharField(max_length=100)
+
+def main():
+    try:
+        sig = inspect.signature(Person.objects.bulk_create)
+        expected_signature = '(objs, batch_size=None, ignore_conflicts=False)'
+        actual_signature = str(sig)
+        assert actual_signature == expected_signature, f"Expected signature {expected_signature}, but got {actual_signature}"
+        print("The issue is fixed.")
+    except AssertionError as e:
+        print_stacktrace(e)
+        raise
+    except Exception as e:
+        print_stacktrace(e)
+        raise
+
+if __name__ == "__main__":
+    setup_django()
+    main()
+
+
+This is the tracing and analysis history:
+
+==================================================
+The error message indicates that the Django settings have not been properly configured before attempting to use models, leading to the `django.core.exceptions.ImproperlyConfigured` exception. The specific issue occurs when trying to create the `Person` model, and the Django settings have not been set up at this point.
+
+Here's a breakdown of the code execution leading to the error:
+
+1. The `setup_django()` function is defined, which is supposed to configure the Django settings including `INSTALLED_APPS` and `DATABASES`.
+
+2. The `main()` function attempts to inspect the signature of `Person.objects.bulk_create`, but this relies on the `Person` model being instantiated successfully.
+
+3. The error occurs because the settings have not been configured before the declaration of the `Person` model class, and the Django model system checks the app configuration during the creation of model classes.
+
+4. The stack trace shows that the error emerges when it tries to access settings through `self.check_apps_ready()`, indicating that the Django apps configuration hasn't been completed.
+
+To resolve this error within the test script, you need to ensure `setup_django()` is called before any Django model class is defined or instantiated. This way, Django settings will be configured properly before the model tries to access them.
+
+Before locating the buggy method related to the original issue in the Django manager code, we need to fix the test script setup first.
+
+Observed method: `reproduce.py:setup_django`
+==================================================
+
+
+Now you choose downstream method setup_django to further observe, tracing the abnormal program behavior.
+This is the method code:
+    19	def setup_django():
+    20	    # Set up Django environment
+    21	    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'reproducer')
+    22	    settings.configure(
+    23	        INSTALLED_APPS=[
+    24	            'django.contrib.contenttypes',  # Required for Django models
+    25	        ],
+    26	        DATABASES={
+    27	            'default': {
+    28	                'ENGINE': 'django.db.backends.sqlite3',
+    29	                'NAME': ':memory:',
+    30	            }
+    31	        },
+    32	        SECRET_KEY='fake-key',
+    33	        DEBUG=True,
+    34	    )
+    35	    django.setup()
+
+
+This is the runtime information of setup_django:
+
+Error occurred during script execution:Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-15731/reproduce.py
+New var:....... __name__ = '__main__'
+New var:....... __doc__ = None
+New var:....... __package__ = ''
+New var:....... __loader__ = None
+New var:....... __spec__ = None
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-15731/reproduce.py'
+New var:....... __cached__ = None
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__4.2/lib/python3.9/os.py'>
+New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-15731/django/__init__.py'>
+New var:....... inspect = <module 'inspect' from '/root/miniforge3/envs/django__django__4.2/lib/python3.9/inspect.py'>
+New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__4.2/lib/python3.9/traceback.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... settings = <LazySettings [Unevaluated]>
+New var:....... models = <module 'django.db.models' from '/data/swe-fl/TM...ango__django-15731/django/db/models/__init__.py'>
+New var:....... print_stacktrace = <function print_stacktrace at 0x7f4cf037c430>
+ line        19 def setup_django():
+Traceback (most recent call last):
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__4.2/lib/python3.9/runpy.py", line 288, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/root/miniforge3/envs/django__django__4.2/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/root/miniforge3/envs/django__django__4.2/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-15731/reproduce.py", line 37, in <module>
+    class Person(models.Model):
+  File "/data/swe-fl/TMP/testbed/django__django-15731/django/db/models/base.py", line 127, in __new__
+    app_config = apps.get_containing_app_config(module)
+  File "/data/swe-fl/TMP/testbed/django__django-15731/django/apps/registry.py", line 260, in get_containing_app_config
+    self.check_apps_ready()
+  File "/data/swe-fl/TMP/testbed/django__django-15731/django/apps/registry.py", line 137, in check_apps_ready
+    settings.INSTALLED_APPS
+  File "/data/swe-fl/TMP/testbed/django__django-15731/django/conf/__init__.py", line 92, in __getattr__
+    self._setup(name)
+  File "/data/swe-fl/TMP/testbed/django__django-15731/django/conf/__init__.py", line 72, in _setup
+    raise ImproperlyConfigured(
+django.core.exceptions.ImproperlyConfigured: Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

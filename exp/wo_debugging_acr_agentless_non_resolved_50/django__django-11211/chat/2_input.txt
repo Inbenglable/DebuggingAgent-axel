@@ -1,0 +1,553 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Prefetch related is not working when used GFK for model that uses UUID field as PK.
+Description
+	
+How to reproduce:
+create model with UUID as primary key
+class Foo(models.Model):
+	id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+	...
+create another model with GFK to model Foo
+class Bar(models.Model):
+	foo_content_type = models.ForeignKey(
+		ContentType, related_name='actor',
+		on_delete=models.CASCADE, db_index=True
+	)
+	foo_object_id = models.CharField(max_length=255, db_index=True)
+	foo = GenericForeignKey('foo_content_type', 'foo_object_id')
+	...
+and try to get queryset with prefetch related (django orm engine return None for attribute foo):
+Bar.objects.all().prefetch_related('foo')
+Thanks a lot for your attention! Also i wanna point out some related bug report from third party library in which previously i faced with that issue, maybe it would useful – ​https://github.com/justquick/django-activity-stream/issues/245
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To address the issue, it appears that the problem lies in how Django's ORM handles prefetching of GenericForeignKey relationships when the primary key is a UUID field. Specifically, the conversion between UUID objects and their string representations might be causing the problem.
+
+A typical approach to fix such a problem would be to ensure that the `foo_object_id` field stores the UUID in its canonical string format, and any retrieval operations correctly interpret this format as a UUID, especially when those operations interact with the ContentType framework.
+
+Before generating a patch, I need to:
+
+1. Explore Django's ORM prefetch-related and how it interacts with GenericForeignKey fields.
+2. Check any relevant utilities or methods in Django's source code that manage GenericForeignKeys, especially how they convert between UUID and string, which might not be directly evident without understanding the framework's internals.
+
+Therefore, I need to explore the Django source code related to GenericForeignKey and the prefetch_related functionality.
+
+```python
+search_class_in_codebase("GenericForeignKey")
+search_method_in_codebase("prefetch_related")
+search_code_in_codebase("UUIDField")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_code_in_codebase("UUIDField")
+RESULT:
+#### reproduce.py:20-26
+```python
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+class Foo(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+class Bar(models.Model):
+    foo_content_type = models.ForeignKey(
+```
+
+#### tests/admin_changelist/models.py:75-81
+```python
+
+
+class Swallow(models.Model):
+    uuid = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    origin = models.CharField(max_length=255)
+    load = models.FloatField()
+    speed = models.FloatField()
+```
+
+#### tests/gis_tests/layermap/models.py:80-86
+```python
+
+
+class DoesNotAllowNulls(models.Model):
+    uuid = models.UUIDField(primary_key=True, editable=False)
+    geom = models.PolygonField(srid=4326)
+    datetime = models.DateTimeField()
+    integer = models.IntegerField()
+```
+
+#### tests/prefetch_related/models.py:299-305
+```python
+
+
+class Flea(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    current_room = models.ForeignKey(Room, models.SET_NULL, related_name='fleas', null=True)
+    pets_visited = models.ManyToManyField(Pet, related_name='fleas_hosted')
+    people_visited = models.ManyToManyField(Person, related_name='fleas_hosted')
+```
+
+#### tests/bulk_create/models.py:91-94
+```python
+    slug_field = models.SlugField(null=True, default='slug')
+    text_field = models.TextField(null=True, default='text')
+    url_field = models.URLField(null=True, default='/')
+    uuid_field = models.UUIDField(null=True, default=uuid.uuid4)
+```
+
+#### tests/model_forms/models.py:427-433
+```python
+
+
+class UUIDPK(models.Model):
+    uuid = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=30)
+
+
+```
+
+#### tests/model_formsets/models.py:256-262
+```python
+
+
+class ParentWithUUIDAlternateKey(models.Model):
+    uuid = models.UUIDField(unique=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=50)
+
+
+```
+
+#### tests/migrations/test_writer.py:325-331
+```python
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.UUIDField(choices=["
+            "(uuid.UUID('5c859437-d061-4847-b3f7-e6b78852f8c8'), 'UUID A'), "
+            "(uuid.UUID('c7853ec1-2ea3-4359-b02d-b54e8f1bcee2'), 'UUID B')], "
+            "default=uuid.UUID('5c859437-d061-4847-b3f7-e6b78852f8c8'))"
+```
+
+#### tests/expressions_case/tests.py:956-962
+```python
+                )),
+                When(integer=2, then=Value(
+                    UUID('22222222222222222222222222222222'),
+                    output_field=models.UUIDField(),
+                )),
+            ),
+        )
+```
+
+#### tests/expressions_case/models.py:34-40
+```python
+    text = models.TextField(default='')
+    time = models.TimeField(null=True, db_column='time_field')
+    url = models.URLField(default='')
+    uuid = models.UUIDField(null=True)
+    fk = models.ForeignKey('self', models.CASCADE, null=True)
+
+    def __str__(self):
+```
+
+#### tests/admin_views/models.py:967-973
+```python
+
+
+class ParentWithUUIDPK(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=100)
+
+    def __str__(self):
+```
+
+#### tests/inspectdb/tests.py:81-87
+```python
+        if connection.features.can_introspect_time_field:
+            assertFieldType('time_field', "models.TimeField()")
+        if connection.features.has_native_uuid_field:
+            assertFieldType('uuid_field', "models.UUIDField()")
+        elif not connection.features.interprets_empty_strings_as_nulls:
+            assertFieldType('uuid_field', "models.CharField(max_length=32)")
+
+```
+
+#### tests/inspectdb/models.py:64-70
+```python
+    text_field = models.TextField()
+    time_field = models.TimeField()
+    url_field = models.URLField()
+    uuid_field = models.UUIDField()
+
+
+class UniqueTogether(models.Model):
+```
+
+#### tests/schema/tests.py:642-648
+```python
+            editor.create_model(Author)
+        # Change UUIDField to primary key.
+        old_field = Author._meta.get_field('uuid')
+        new_field = UUIDField(primary_key=True)
+        new_field.set_attributes_from_name('uuid')
+        new_field.model = Author
+        with connection.schema_editor() as editor:
+```
+
+#### tests/schema/models.py:12-18
+```python
+    name = models.CharField(max_length=255)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    weight = models.IntegerField(null=True, blank=True)
+    uuid = models.UUIDField(null=True)
+
+    class Meta:
+        apps = new_apps
+```
+
+#### tests/expressions/tests.py:1409-1415
+```python
+
+    def test_update_UUIDField_using_Value(self):
+        UUID.objects.create()
+        UUID.objects.update(uuid=Value(uuid.UUID('12345678901234567890123456789012'), output_field=UUIDField()))
+        self.assertEqual(UUID.objects.get().uuid, uuid.UUID('12345678901234567890123456789012'))
+
+    def test_deconstruct(self):
+```
+
+#### tests/expressions/models.py:92-98
+```python
+
+
+class UUID(models.Model):
+    uuid = models.UUIDField(null=True)
+    uuid_fk = models.ForeignKey(UUIDPK, models.CASCADE, null=True)
+
+    def __str__(self):
+```
+
+#### tests/serializers/models/data.py:250-256
+```python
+
+
+class UUIDData(models.Model):
+    data = models.UUIDField(primary_key=True)
+
+
+class FKToUUID(models.Model):
+```
+
+#### tests/serializers/models/natural.py:42-48
+```python
+
+
+class NaturalPKWithDefault(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=100, unique=True)
+
+    class Manager(models.Manager):
+```
+
+#### tests/introspection/models.py:61-67
+```python
+
+
+class Comment(models.Model):
+    ref = models.UUIDField(unique=True)
+    article = models.ForeignKey(Article, models.CASCADE, db_index=True)
+    email = models.EmailField()
+    pub_date = models.DateTimeField()
+```
+
+#### tests/postgres_tests/models.py:180-183
+```python
+
+
+class UUIDTestModel(models.Model):
+    uuid = models.UUIDField(default=None, null=True)
+```
+
+#### tests/postgres_tests/migrations/0002_create_test_models.py:200-206
+```python
+            name='UUIDTestModel',
+            fields=[
+                ('id', models.AutoField(verbose_name='ID', serialize=False, auto_created=True, primary_key=True)),
+                ('uuid', models.UUIDField(default=None, null=True)),
+            ]
+        ),
+        migrations.CreateModel(
+```
+
+#### tests/forms_tests/field_tests/test_uuidfield.py:27-32
+```python
+            field.clean('550e8400')
+
+    def test_uuidfield_4(self):
+        field = UUIDField()
+        value = field.prepare_value(uuid.UUID('550e8400e29b41d4a716446655440000'))
+        self.assertEqual(value, '550e8400-e29b-41d4-a716-446655440000')
+```
+
+#### tests/admin_widgets/tests.py:413-419
+```python
+        w = widgets.AdminUUIDInputWidget()
+        self.assertHTMLEqual(
+            w.render('test', '550e8400-e29b-41d4-a716-446655440000'),
+            '<input value="550e8400-e29b-41d4-a716-446655440000" type="text" class="vUUIDField" name="test">',
+        )
+        w = widgets.AdminUUIDInputWidget(attrs={'class': 'myUUIDInput'})
+        self.assertHTMLEqual(
+```
+
+#### tests/admin_widgets/models.py:94-100
+```python
+
+
+class Honeycomb(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.CharField(max_length=20)
+
+
+```
+
+#### tests/auth_tests/models/uuid_pk.py:8-11
+```python
+with RemoveGroupsAndPermissions():
+    class UUIDUser(AbstractUser):
+        """A user with a UUID as primary key"""
+        id = models.UUIDField(default=uuid.uuid4, primary_key=True)
+```
+
+#### tests/model_fields/test_uuid.py:136-142
+```python
+        self.assertEqual(cm.exception.message % cm.exception.params, "'550e8400' is not a valid UUID.")
+
+    def test_uuid_instance_ok(self):
+        field = models.UUIDField()
+        field.clean(uuid.uuid4(), None)  # no error
+
+
+```
+
+#### tests/model_fields/models.py:380-386
+```python
+
+
+class PrimaryKeyUUIDModel(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+
+
+class RelatedToUUIDModel(models.Model):
+```
+
+#### tests/fixtures/models.py:115-121
+```python
+
+
+class PrimaryKeyUUIDModel(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+
+
+class NaturalKeyThing(models.Model):
+```
+
+#### django/db/backends/oracle/base.py:126-132
+```python
+        'TextField': 'NCLOB',
+        'TimeField': 'TIMESTAMP',
+        'URLField': 'VARCHAR2(%(max_length)s)',
+        'UUIDField': 'VARCHAR2(32)',
+    }
+    data_type_check_constraints = {
+        'BooleanField': '%(qn_column)s IN (0,1)',
+```
+
+#### django/db/backends/oracle/operations.py:170-176
+```python
+            converters.append(self.convert_datefield_value)
+        elif internal_type == 'TimeField':
+            converters.append(self.convert_timefield_value)
+        elif internal_type == 'UUIDField':
+            converters.append(self.convert_uuidfield_value)
+        # Oracle stores empty strings as null. If the field accepts the empty
+        # string, undo this to adhere to the Django convention of using
+```
+
+#### django/db/backends/sqlite3/base.py:106-112
+```python
+        'SmallIntegerField': 'smallint',
+        'TextField': 'text',
+        'TimeField': 'time',
+        'UUIDField': 'char(32)',
+    }
+    data_type_check_constraints = {
+        'PositiveIntegerField': '"%(column)s" >= 0',
+```
+
+#### django/db/backends/sqlite3/operations.py:249-255
+```python
+            converters.append(self.convert_timefield_value)
+        elif internal_type == 'DecimalField':
+            converters.append(self.get_decimalfield_converter(expression))
+        elif internal_type == 'UUIDField':
+            converters.append(self.convert_uuidfield_value)
+        elif internal_type in ('NullBooleanField', 'BooleanField'):
+            converters.append(self.convert_booleanfield_value)
+```
+
+#### django/db/backends/postgresql/base.py:90-96
+```python
+        'SmallIntegerField': 'smallint',
+        'TextField': 'text',
+        'TimeField': 'time',
+        'UUIDField': 'uuid',
+    }
+    data_type_check_constraints = {
+        'PositiveIntegerField': '"%(column)s" >= 0',
+```
+
+#### django/db/backends/postgresql/operations.py:15-21
+```python
+
+    def unification_cast_sql(self, output_field):
+        internal_type = output_field.get_internal_type()
+        if internal_type in ("GenericIPAddressField", "IPAddressField", "TimeField", "UUIDField"):
+            # PostgreSQL will resolve a union as type 'text' if input types are
+            # 'unknown'.
+            # https://www.postgresql.org/docs/current/typeconv-union-case.html
+```
+
+#### django/db/backends/postgresql/introspection.py:25-31
+```python
+        1186: 'DurationField',
+        1266: 'TimeField',
+        1700: 'DecimalField',
+        2950: 'UUIDField',
+    }
+
+    ignored_tables = []
+```
+
+#### django/db/backends/mysql/base.py:125-131
+```python
+        'SmallIntegerField': 'smallint',
+        'TextField': 'longtext',
+        'TimeField': 'time(6)',
+        'UUIDField': 'char(32)',
+    }
+
+    # For these columns, MySQL doesn't:
+```
+
+#### django/db/backends/mysql/operations.py:240-246
+```python
+        elif internal_type == 'DateTimeField':
+            if settings.USE_TZ:
+                converters.append(self.convert_datetimefield_value)
+        elif internal_type == 'UUIDField':
+            converters.append(self.convert_uuidfield_value)
+        return converters
+
+```
+
+#### django/db/models/base.py:680-686
+```python
+                obj = getattr(self, field.name, None)
+                # A pk may have been assigned manually to a model instance not
+                # saved to the database (or auto-generated in a case like
+                # UUIDField), but we allow the save to proceed and rely on the
+                # database to raise an IntegrityError if applicable. If
+                # constraints aren't supported by the database, there's the
+                # unavoidable risk of data corruption.
+```
+
+#### django/db/models/fields/__init__.py:2350-2355
+```python
+
+    def formfield(self, **kwargs):
+        return super().formfield(**{
+            'form_class': forms.UUIDField,
+            **kwargs,
+        })
+```
+
+#### django/forms/fields.py:1180-1186
+```python
+        super().__init__(**kwargs)
+
+
+class UUIDField(CharField):
+    default_error_messages = {
+        'invalid': _('Enter a valid UUID.'),
+    }
+```
+
+#### django/contrib/gis/utils/layermapping.py:73-79
+```python
+        models.SlugField: OFTString,
+        models.TextField: OFTString,
+        models.URLField: OFTString,
+        models.UUIDField: OFTString,
+        models.BigIntegerField: (OFTInteger, OFTReal, OFTString),
+        models.SmallIntegerField: (OFTInteger, OFTReal, OFTString),
+        models.PositiveIntegerField: (OFTInteger, OFTReal, OFTString),
+```
+
+#### django/contrib/admin/options.py:90-96
+```python
+    models.ImageField: {'widget': widgets.AdminFileWidget},
+    models.FileField: {'widget': widgets.AdminFileWidget},
+    models.EmailField: {'widget': widgets.AdminEmailInputWidget},
+    models.UUIDField: {'widget': widgets.AdminUUIDInputWidget},
+}
+
+csrf_protect_m = method_decorator(csrf_protect)
+```
+
+#### django/contrib/admin/widgets.py:354-360
+```python
+
+class AdminUUIDInputWidget(forms.TextInput):
+    def __init__(self, attrs=None):
+        super().__init__(attrs={'class': 'vUUIDField', **(attrs or {})})
+
+
+# Mapping of lowercase language codes [returned by Django's get_language()] to
+```
+
+#### django/contrib/postgres/functions.py:3-9
+```python
+
+class RandomUUID(Func):
+    template = 'GEN_RANDOM_UUID()'
+    output_field = UUIDField()
+
+
+class TransactionNow(Func):
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

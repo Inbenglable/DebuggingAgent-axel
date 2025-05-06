@@ -1,0 +1,227 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+TemplateView.get_context_data()'s kwargs returns SimpleLazyObjects that causes a crash when filtering.
+Description
+	
+Example Code that works in 3.0, but not in 3.1:
+class OfferView(TemplateView):
+	template_name = "offers/offer.html"
+	def get_context_data(self, **kwargs):
+		offer_slug = kwargs.get("offer_slug", "")
+		offer = get_object_or_404(Account, slug=offer_slug)
+		return {"offer": offer, "offer_slug": offer_slug}
+In order to make this work in 3.1, you have to explicitly convert the result of kwargs.get() to a string to get the SimpleLazyObject to resolve:
+class OfferView(TemplateView):
+	template_name = "offers/offer.html"
+	def get_context_data(self, **kwargs):
+		offer_slug = kwargs.get("offer_slug", "")
+		offer = get_object_or_404(Account, slug=str(offer_slug))
+		return {"offer": offer, "offer_slug": offer_slug}
+The error generated if you don't is:
+Error binding parameter 0 - probably unsupported type
+from django/db/backends/sqlite3/operations.py, line 144, in _quote_params_for_last_executed_query
+In both cases, the urls.py looks like:
+path(
+		"/offers/<slug:offer_slug>/",
+		OfferView.as_view(),
+		name="offer_view",
+	),
+When debugging, I found that offer_slug (coming in from kwargs.get) was of type 'SimpleLazyObject' in Django 3.1, and when I explicitly converted it to a string, get_object_or_404 behaved as expected.
+This is using Python 3.7.8 with SQLite.
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To resolve the issue, I need to review the implementation details of `TemplateView.get_context_data` and understand how `SimpleLazyObject` is returned in Django 3.1. This might involve checking how `SimpleLazyObject` is used or if any changes occurred around it during the transition from Django 3.0 to 3.1.
+
+I will start by searching for the `get_context_data` method in the Django codebase to understand how it operates in the `TemplateView`.
+
+```python
+search_method_in_codebase("TemplateView.get_context_data")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("TemplateView.get_context_data")
+RESULT:
+#### reproduce.py:OfferView.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        offer_slug = kwargs.get("offer_slug", "")
+        # Uncomment the following line to fix the issue
+        # offer_slug = str(offer_slug)
+        offer = get_object_or_404(Account, slug=offer_slug)
+        return {"offer": offer, "offer_slug": offer_slug}
+
+```
+
+#### tests/syndication_tests/feeds.py:TemplateContextFeed.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['foo'] = 'bar'
+        return context
+
+```
+
+#### tests/generic_views/views.py:CustomContextView.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        context = {'custom_key': 'custom_value'}
+        context.update(kwargs)
+        return super().get_context_data(**context)
+
+```
+
+#### django/views/i18n.py:JavaScriptCatalog.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        return {
+            'catalog': self.get_catalog(),
+            'formats': get_formats(),
+            'plural': self.get_plural(),
+        }
+
+```
+
+#### django/views/generic/base.py:ContextMixin.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        kwargs.setdefault('view', self)
+        if self.extra_context is not None:
+            kwargs.update(self.extra_context)
+        return kwargs
+
+```
+
+#### django/views/generic/list.py:MultipleObjectMixin.get_context_data
+```python
+    def get_context_data(self, *, object_list=None, **kwargs):
+        """Get the context for this view."""
+        queryset = object_list if object_list is not None else self.object_list
+        page_size = self.get_paginate_by(queryset)
+        context_object_name = self.get_context_object_name(queryset)
+        if page_size:
+            paginator, page, queryset, is_paginated = self.paginate_queryset(queryset, page_size)
+            context = {
+                'paginator': paginator,
+                'page_obj': page,
+                'is_paginated': is_paginated,
+                'object_list': queryset
+            }
+        else:
+            context = {
+                'paginator': None,
+                'page_obj': None,
+                'is_paginated': False,
+                'object_list': queryset
+            }
+        if context_object_name is not None:
+            context[context_object_name] = queryset
+        context.update(kwargs)
+        return super().get_context_data(**context)
+
+```
+
+#### django/views/generic/detail.py:SingleObjectMixin.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        """Insert the single object into the context dict."""
+        context = {}
+        if self.object:
+            context['object'] = self.object
+            context_object_name = self.get_context_object_name(self.object)
+            if context_object_name:
+                context[context_object_name] = self.object
+        context.update(kwargs)
+        return super().get_context_data(**context)
+
+```
+
+#### django/views/generic/edit.py:FormMixin.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        """Insert the form into the context dict."""
+        if 'form' not in kwargs:
+            kwargs['form'] = self.get_form()
+        return super().get_context_data(**kwargs)
+
+```
+
+#### django/contrib/syndication/views.py:Feed.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        """
+        Return a dictionary to use as extra context if either
+        ``self.description_template`` or ``self.item_template`` are used.
+
+        Default implementation preserves the old behavior
+        of using {'obj': item, 'site': current_site} as the context.
+        """
+        return {'obj': kwargs.get('item'), 'site': kwargs.get('site')}
+
+```
+
+#### django/contrib/admindocs/views.py:TemplateDetailView.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        template = self.kwargs['template']
+        templates = []
+        try:
+            default_engine = Engine.get_default()
+        except ImproperlyConfigured:
+            # Non-trivial TEMPLATES settings aren't supported (#24125).
+            pass
+        else:
+            # This doesn't account for template loaders (#24128).
+            for index, directory in enumerate(default_engine.dirs):
+                template_file = Path(directory) / template
+                if template_file.exists():
+                    template_contents = template_file.read_text()
+                else:
+                    template_contents = ''
+                templates.append({
+                    'file': template_file,
+                    'exists': template_file.exists(),
+                    'contents': template_contents,
+                    'order': index,
+                })
+        return super().get_context_data(**{
+            **kwargs,
+            'name': template,
+            'templates': templates,
+        })
+
+```
+
+#### django/contrib/auth/views.py:PasswordResetCompleteView.get_context_data
+```python
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['login_url'] = resolve_url(settings.LOGIN_URL)
+        return context
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

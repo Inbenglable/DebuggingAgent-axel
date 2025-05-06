@@ -1,0 +1,381 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+import django
+from django.conf import settings
+from django.db import migrations
+from django.db.utils import OperationalError
+from django.core.management import call_command
+from subprocess import check_call, CalledProcessError
+
+# Function to print stack trace
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Ensure django-oauth-toolkit is installed
+try:
+    import oauth2_provider
+except ImportError:
+    print("django-oauth-toolkit is not installed. Installing now...")
+    try:
+        check_call([sys.executable, "-m", "pip", "install", "django-oauth-toolkit"])
+    except CalledProcessError as e:
+        print_stacktrace(e)
+        raise AssertionError("Failed to install django-oauth-toolkit")
+
+# Define a minimal Django settings module
+settings.configure(
+    DEBUG=True,
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': 'test_db.sqlite3',
+        }
+    },
+    INSTALLED_APPS=[
+        'django.contrib.contenttypes',
+        'django.contrib.auth',
+        'oauth2_provider',
+    ],
+    MIDDLEWARE=[],
+    ROOT_URLCONF='test_app.urls',
+    SECRET_KEY='notasecret',
+)
+
+# Initialize Django
+django.setup()
+
+# Define a migration class to add a OneToOneField
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('oauth2_provider', '0001_initial'),
+    ]
+
+    operations = [
+        migrations.AddField(
+            model_name='accesstoken',
+            name='source_refresh_token',
+            field=migrations.OneToOneField(blank=True, null=True, on_delete=migrations.SET_NULL, to='oauth2_provider.refreshtoken', related_name="refreshed_access_token"),
+        ),
+    ]
+
+# Write the migration file
+os.makedirs('test_app/migrations', exist_ok=True)
+with open('test_app/migrations/0001_initial.py', 'w') as f:
+    f.write('from django.db import migrations\n\n')
+    f.write('class Migration(migrations.Migration):\n')
+    f.write('    dependencies = [\n')
+    f.write("        ('oauth2_provider', '0001_initial'),\n")
+    f.write('    ]\n\n')
+    f.write('    operations = [\n')
+    f.write('        migrations.AddField(\n')
+    f.write("            model_name='accesstoken',\n")
+    f.write("            name='source_refresh_token',\n")
+    f.write("            field=migrations.OneToOneField(blank=True, null=True, on_delete=migrations.SET_NULL, to='oauth2_provider.refreshtoken', related_name='refreshed_access_token'),\n")
+    f.write('        ),\n')
+    f.write('    ]\n')
+
+# Create the test app directory and files
+os.makedirs('test_app', exist_ok=True)
+with open('test_app/__init__.py', 'w') as f:
+    f.write('')
+with open('test_app/apps.py', 'w') as f:
+    f.write('from django.apps import AppConfig\n\nclass TestAppConfig(AppConfig):\n    name = "test_app"\n')
+with open('test_app/models.py', 'w') as f:
+    f.write('from django.db import models\n\n')
+    f.write('class TestApp(models.Model):\n    name = models.CharField(max_length=100)\n')
+with open('test_app/urls.py', 'w') as f:
+    f.write('from django.urls import path\n\n')
+    f.write('urlpatterns = []\n')
+
+# Add the test app to INSTALLED_APPS
+settings.INSTALLED_APPS.append('test_app')
+
+# Main function to set up and run the test
+def main():
+    # Apply migrations
+    try:
+        call_command('migrate', verbosity=0)
+    except OperationalError as e:
+        print_stacktrace(e)
+        raise AssertionError("The issue is present: Cannot add a UNIQUE column")
+
+    print("The issue is fixed.")
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
+
+This is the corresponding output and runtime information:
+Error occurred during script execution:module 'django.db.migrations' has no attribute 'OneToOneField'
+
+    Source path:... /data/swe-fl/TMP/testbed/django__django-15278/reproduce.py
+    Starting var:.. __name__ = '__main__'
+    Starting var:.. __doc__ = None
+    Starting var:.. __package__ = ''
+    Starting var:.. __loader__ = None
+    Starting var:.. __spec__ = None
+    Starting var:.. __file__ = '/data/swe-fl/TMP/testbed/django__django-15278/reproduce.py'
+    Starting var:.. __cached__ = None
+    Starting var:.. __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+     call         1 import os
+     line         1 import os
+    New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__4.1/lib/python3.9/os.py'>
+     line         2 import sys
+    New var:....... sys = <module 'sys' (built-in)>
+     line         3 import traceback
+    New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__4.1/lib/python3.9/traceback.py'>
+     line         4 import django
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f3189867060>
+        Return value:.. <module 'django' from '/data/swe-fl/TMP/testbed/django__django-15278/django/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-15278/reproduce.py
+    New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-15278/django/__init__.py'>
+     line         5 from django.conf import settings
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.conf'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f3189867060>
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-15278/django/conf/__init__.py'>
+        Starting var:.. module = <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-15278/django/conf/__init__.py'>
+        Starting var:.. fromlist = ('settings',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'settings'
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-15278/django/conf/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-15278/reproduce.py
+    New var:....... settings = <LazySettings [Unevaluated]>
+     line         6 from django.db import migrations
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.db'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f3189867060>
+        Return value:.. <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-15278/django/db/__init__.py'>
+        Starting var:.. module = <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-15278/django/db/__init__.py'>
+        Starting var:.. fromlist = ('migrations',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'migrations'
+        New var:....... from_name = 'django.db.migrations'
+        Return value:.. <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-15278/django/db/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-15278/reproduce.py
+    New var:....... migrations = <module 'django.db.migrations' from '/data/swe-f...__django-15278/django/db/migrations/__init__.py'>
+     line         7 from django.db.utils import OperationalError
+    New var:....... OperationalError = <class 'django.db.utils.OperationalError'>
+     line         8 from django.core.management import call_command
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.core.management'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f3189867060>
+        Return value:.. <module 'django.core.management' from '/data/swe...django-15278/django/core/management/__init__.py'>
+        Starting var:.. module = <module 'django.core.management' from '/data/swe...django-15278/django/core/management/__init__.py'>
+        Starting var:.. fromlist = ('call_command',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'call_command'
+        Return value:.. <module 'django.core.management' from '/data/swe...django-15278/django/core/management/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-15278/reproduce.py
+    New var:....... call_command = <function call_command at 0x7f3188256940>
+     line         9 from subprocess import check_call, CalledProcessError
+    New var:....... check_call = <function check_call at 0x7f31892f3a60>
+    New var:....... CalledProcessError = <class 'subprocess.CalledProcessError'>
+     line        12 def print_stacktrace(e: Exception):
+    New var:....... print_stacktrace = <function print_stacktrace at 0x7f31892fc3a0>
+     line        23 try:
+     line        24     import oauth2_provider
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'oauth2_provider'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f3189867060>
+        Return value:.. <module 'oauth2_provider' from '/root/miniforge3...on3.9/site-packages/oauth2_provider/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-15278/reproduce.py
+    New var:....... oauth2_provider = <module 'oauth2_provider' from '/root/miniforge3...on3.9/site-packages/oauth2_provider/__init__.py'>
+     line        34 settings.configure(
+     line        35     DEBUG=True,
+     line        37         'default': {
+     line        38             'ENGINE': 'django.db.backends.sqlite3',
+     line        39             'NAME': 'test_db.sqlite3',
+     line        37         'default': {
+     line        36     DATABASES={
+     line        42     INSTALLED_APPS=[
+     line        47     MIDDLEWARE=[],
+     line        48     ROOT_URLCONF='test_app.urls',
+     line        49     SECRET_KEY='notasecret',
+     line        34 settings.configure(
+        Source path:... /data/swe-fl/TMP/testbed/django__django-15278/django/conf/__init__.py
+        Starting var:.. self = <LazySettings [Unevaluated]>
+        Starting var:.. default_settings = <module 'django.conf.global_settings' from '/dat...go__django-15278/django/conf/global_settings.py'>
+        Starting var:.. options = {'DEBUG': True, 'DATABASES': {'default': {'ENGIN...NF': 'test_app.urls', 'SECRET_KEY': 'notasecret'}
+         call       118     def configure(self, default_settings=global_settings, **options):
+         line       124         if self._wrapped is not empty:
+         line       126         holder = UserSettingsHolder(default_settings)
+        New var:....... holder = <UserSettingsHolder>
+         line       127         for name, value in options.items():
+        New var:....... name = 'DEBUG'
+        New var:....... value = True
+         line       128             if not name.isupper():
+         line       130             setattr(holder, name, value)
+         line       127         for name, value in options.items():
+        Modified var:.. name = 'DATABASES'
+        Modified var:.. value = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': 'test_db.sqlite3'}}
+         line       128             if not name.isupper():
+         line       130             setattr(holder, name, value)
+         line       127         for name, value in options.items():
+        Modified var:.. name = 'INSTALLED_APPS'
+        Modified var:.. value = ['django.contrib.contenttypes', 'django.contrib.auth', 'oauth2_provider']
+         line       128             if not name.isupper():
+         line       130             setattr(holder, name, value)
+         line       127         for name, value in options.items():
+        Modified var:.. name = 'MIDDLEWARE'
+        Modified var:.. value = []
+         line       128             if not name.isupper():
+         line       130             setattr(holder, name, value)
+         line       127         for name, value in options.items():
+        Modified var:.. name = 'ROOT_URLCONF'
+        Modified var:.. value = 'test_app.urls'
+         line       128             if not name.isupper():
+         line       130             setattr(holder, name, value)
+         line       127         for name, value in options.items():
+        Modified var:.. name = 'SECRET_KEY'
+        Modified var:.. value = 'notasecret'
+         line       128             if not name.isupper():
+         line       130             setattr(holder, name, value)
+         line       127         for name, value in options.items():
+         line       131         self._wrapped = holder
+        Modified var:.. self = <LazySettings "None">
+         return     131         self._wrapped = holder
+        Return value:.. None
+    Source path:... /data/swe-fl/TMP/testbed/django__django-15278/reproduce.py
+    Modified var:.. settings = <LazySettings "None">
+     line        53 django.setup()
+        Source path:... /data/swe-fl/TMP/testbed/django__django-15278/django/__init__.py
+        Starting var:.. set_prefix = True
+         call         8 def setup(set_prefix=True):
+         line        14     from django.apps import apps
+        New var:....... apps = <django.apps.registry.Apps object at 0x7f3188953520>
+         line        15     from django.conf import settings
+        New var:....... settings = <LazySettings "None">
+         line        16     from django.urls import set_script_prefix
+        New var:....... set_script_prefix = <function set_script_prefix at 0x7f318809fb80>
+         line        17     from django.utils.log import configure_logging
+        New var:....... configure_logging = <function configure_logging at 0x7f3188083310>
+         line        19     configure_logging(settings.LOGGING_CONFIG, settings.LOGGING)
+         line        20     if set_prefix:
+         line        21         set_script_prefix(
+         line        22             '/' if settings.FORCE_SCRIPT_NAME is None else settings.FORCE_SCRIPT_NAME
+         line        21         set_script_prefix(
+         line        24     apps.populate(settings.INSTALLED_APPS)
+         return      24     apps.populate(settings.INSTALLED_APPS)
+        Return value:.. None
+    Source path:... /data/swe-fl/TMP/testbed/django__django-15278/reproduce.py
+     line        56 class Migration(migrations.Migration):
+         call        56 class Migration(migrations.Migration):
+         line        56 class Migration(migrations.Migration):
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'Migration'
+         line        59         ('oauth2_provider', '0001_initial'),
+         line        58     dependencies = [
+        New var:....... dependencies = [('oauth2_provider', '0001_initial')]
+         line        63         migrations.AddField(
+         line        64             model_name='accesstoken',
+         line        65             name='source_refresh_token',
+         line        66             field=migrations.OneToOneField(blank=True, null=True, on_delete=migrations.SET_NULL, to='oauth2_provider.refreshtoken', related_name="refreshed_access_token"),
+         exception   66             field=migrations.OneToOneField(blank=True, null=True, on_delete=migrations.SET_NULL, to='oauth2_provider.refreshtoken', related_name="refreshed_access_token"),
+        Exception:..... AttributeError: module 'django.db.migrations' has no attribute 'OneToOneField'
+        New var:....... __module__ = '__main__'
+    New var:....... __qualname__ = 'Migration'
+    New var:....... dependencies = [('oauth2_provider', '0001_initial')]
+    Call ended by exception
+ exception   56 class Migration(migrations.Migration):
+Exception:..... AttributeError: module 'django.db.migrations' has no attribute 'OneToOneField'
+New var:....... __name__ = '__main__'
+New var:....... __doc__ = None
+New var:....... __package__ = ''
+New var:....... __loader__ = None
+New var:....... __spec__ = None
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-15278/reproduce.py'
+New var:....... __cached__ = None
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__4.1/lib/python3.9/os.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__4.1/lib/python3.9/traceback.py'>
+New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-15278/django/__init__.py'>
+New var:....... settings = <LazySettings "None">
+New var:....... migrations = <module 'django.db.migrations' from '/data/swe-f...__django-15278/django/db/migrations/__init__.py'>
+New var:....... OperationalError = <class 'django.db.utils.OperationalError'>
+New var:....... call_command = <function call_command at 0x7f3188256940>
+New var:....... check_call = <function check_call at 0x7f31892f3a60>
+New var:....... CalledProcessError = <class 'subprocess.CalledProcessError'>
+New var:....... print_stacktrace = <function print_stacktrace at 0x7f31892fc3a0>
+New var:....... oauth2_provider = <module 'oauth2_provider' from '/root/miniforge3...on3.9/site-packages/oauth2_provider/__init__.py'>
+Call ended by exception
+Traceback (most recent call last):
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__4.1/lib/python3.9/runpy.py", line 288, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/root/miniforge3/envs/django__django__4.1/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/root/miniforge3/envs/django__django__4.1/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-15278/reproduce.py", line 56, in <module>
+    class Migration(migrations.Migration):
+  File "/data/swe-fl/TMP/testbed/django__django-15278/reproduce.py", line 66, in Migration
+    field=migrations.OneToOneField(blank=True, null=True, on_delete=migrations.SET_NULL, to='oauth2_provider.refreshtoken', related_name="refreshed_access_token"),
+AttributeError: module 'django.db.migrations' has no attribute 'OneToOneField'
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

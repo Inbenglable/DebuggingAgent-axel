@@ -1,0 +1,686 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+QuerySet.none() on combined queries returns all results.
+Description
+	
+I came across this issue on Stack Overflow. I'm not 100% sure it's a bug, but it does seem strange. With this code (excuse the bizarre example filtering):
+class Publication(models.Model):
+	pass
+class Article(models.Model):
+	publications = models.ManyToManyField(to=Publication, blank=True, null=True)
+class ArticleForm(forms.ModelForm):
+	publications = forms.ModelMultipleChoiceField(
+		Publication.objects.filter(id__lt=2) | Publication.objects.filter(id__gt=5),
+		required=False,
+	)
+	class Meta:
+		model = Article
+		fields = ["publications"]
+class ArticleAdmin(admin.ModelAdmin):
+	form = ArticleForm
+This works well. However, changing the ModelMultipleChoiceField queryset to use union() breaks things.
+publications = forms.ModelMultipleChoiceField(
+	Publication.objects.filter(id__lt=2).union(
+		Publication.objects.filter(id__gt=5)
+	),
+	required=False,
+)
+The form correctly shows only the matching objects. However, if you submit this form while empty (i.e. you didn't select any publications), ALL objects matching the queryset will be added. Using the OR query, NO objects are added, as I'd expect.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+from django.conf import settings
+from django.core.management import call_command
+from django.db import models
+from django import forms
+from django.contrib import admin
+from django.test import TestCase
+from django.test.client import RequestFactory
+
+# Configure Django settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': 'test_db.sqlite3',
+        }
+    },
+    INSTALLED_APPS=[
+        'django.contrib.contenttypes',
+        'django.contrib.auth',
+        'django.contrib.admin',
+        'django.contrib.sessions',
+        '__main__',  # This app is the current script
+    ],
+    ROOT_URLCONF='__main__',
+    MIDDLEWARE=[
+        'django.middleware.security.SecurityMiddleware',
+        'django.contrib.sessions.middleware.SessionMiddleware',
+        'django.middleware.common.CommonMiddleware',
+        'django.middleware.csrf.CsrfViewMiddleware',
+        'django.contrib.auth.middleware.AuthenticationMiddleware',
+        'django.contrib.messages.middleware.MessageMiddleware',
+        'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    ],
+    TEMPLATES=[
+        {
+            'BACKEND': 'django.template.backends.django.DjangoTemplates',
+            'DIRS': [],
+            'APP_DIRS': True,
+            'OPTIONS': {
+                'context_processors': [
+                    'django.template.context_processors.debug',
+                    'django.template.context_processors.request',
+                    'django.contrib.auth.context_processors.auth',
+                    'django.contrib.messages.context_processors.messages',
+                ],
+            },
+        },
+    ],
+    SECRET_KEY='secret_key_for_testing',
+)
+
+# Initialize Django
+import django
+django.setup()
+
+# Define models
+class Publication(models.Model):
+    pass
+
+class Article(models.Model):
+    publications = models.ManyToManyField(to=Publication, blank=True, null=True)
+
+# Define form
+class ArticleForm(forms.ModelForm):
+    publications = forms.ModelMultipleChoiceField(
+        Publication.objects.filter(id__lt=2).union(
+            Publication.objects.filter(id__gt=5)
+        ),
+        required=False,
+    )
+
+    class Meta:
+        model = Article
+        fields = ["publications"]
+
+# Define admin
+class ArticleAdmin(admin.ModelAdmin):
+    form = ArticleForm
+
+# Function to print stack trace
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Test case to reproduce the issue
+class TestArticleForm(TestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.publications = [
+            Publication.objects.create(),
+            Publication.objects.create(),
+            Publication.objects.create(),
+            Publication.objects.create(),
+            Publication.objects.create(),
+            Publication.objects.create(),
+            Publication.objects.create(),
+        ]
+
+    def test_form_submission(self):
+        data = {'publications': []}  # Simulate form submission with no selections
+        form = ArticleForm(data)
+        if form.is_valid():
+            article = form.save(commit=False)
+            article.save()
+            form.save_m2m()
+            # Check if no publications are added
+            self.assertEqual(article.publications.count(), 0, "Publications should not be added when none are selected.")
+        else:
+            self.fail("Form is not valid")
+
+# Run the test case
+if __name__ == '__main__':
+    # Run migrations
+    call_command('migrate', verbosity=0)
+    # Run the test case
+    try:
+        test_case = TestArticleForm()
+        test_case.setUp()
+        test_case.test_form_submission()
+        print("Issue is fixed.")
+        sys.exit(0)
+    except AssertionError as e:
+        print_stacktrace(e)
+        raise
+
+This is the corresponding output and runtime information:
+Error occurred during script execution:no such table: __main___publication
+
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    Starting var:.. __name__ = '__main__'
+    Starting var:.. __doc__ = None
+    Starting var:.. __package__ = ''
+    Starting var:.. __loader__ = None
+    Starting var:.. __spec__ = None
+    Starting var:.. __file__ = '/data/swe-fl/TMP/testbed/django__django-13158/reproduce.py'
+    Starting var:.. __cached__ = None
+    Starting var:.. __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+     call         1 import os
+     line         1 import os
+    New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/os.py'>
+     line         2 import sys
+    New var:....... sys = <module 'sys' (built-in)>
+     line         3 import traceback
+    New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py'>
+     line         4 from django.conf import settings
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.conf'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f8863d54030>
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-13158/django/conf/__init__.py'>
+        Starting var:.. module = <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-13158/django/conf/__init__.py'>
+        Starting var:.. fromlist = ('settings',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'settings'
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-13158/django/conf/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    New var:....... settings = <LazySettings [Unevaluated]>
+     line         5 from django.core.management import call_command
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.core.management'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f8863d54030>
+        Return value:.. <module 'django.core.management' from '/data/swe...django-13158/django/core/management/__init__.py'>
+        Starting var:.. module = <module 'django.core.management' from '/data/swe...django-13158/django/core/management/__init__.py'>
+        Starting var:.. fromlist = ('call_command',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'call_command'
+        Return value:.. <module 'django.core.management' from '/data/swe...django-13158/django/core/management/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    New var:....... call_command = <function call_command at 0x7f8862ea1510>
+     line         6 from django.db import models
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-13158/django/db/__init__.py'>
+        Starting var:.. fromlist = ('models',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'models'
+        New var:....... from_name = 'django.db.models'
+        Return value:.. <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-13158/django/db/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    New var:....... models = <module 'django.db.models' from '/data/swe-fl/TM...ango__django-13158/django/db/models/__init__.py'>
+     line         7 from django import forms
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13158/django/__init__.py'>
+        Starting var:.. fromlist = ('forms',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'forms'
+        Return value:.. <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13158/django/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    New var:....... forms = <module 'django.forms' from '/data/swe-fl/TMP/te...d/django__django-13158/django/forms/__init__.py'>
+     line         8 from django.contrib import admin
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.contrib'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f8863d54030>
+        Return value:.. <module 'django.contrib' from '/data/swe-fl/TMP/...django__django-13158/django/contrib/__init__.py'>
+        Starting var:.. module = <module 'django.contrib' from '/data/swe-fl/TMP/...django__django-13158/django/contrib/__init__.py'>
+        Starting var:.. fromlist = ('admin',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'admin'
+        New var:....... from_name = 'django.contrib.admin'
+        Return value:.. <module 'django.contrib' from '/data/swe-fl/TMP/...django__django-13158/django/contrib/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    New var:....... admin = <module 'django.contrib.admin' from '/data/swe-f...__django-13158/django/contrib/admin/__init__.py'>
+     line         9 from django.test import TestCase
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.test'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f8863d54030>
+        Return value:.. <module 'django.test' from '/data/swe-fl/TMP/testbed/django__django-13158/django/test/__init__.py'>
+        Starting var:.. module = <module 'django.test' from '/data/swe-fl/TMP/testbed/django__django-13158/django/test/__init__.py'>
+        Starting var:.. fromlist = ('TestCase',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'TestCase'
+        Return value:.. <module 'django.test' from '/data/swe-fl/TMP/testbed/django__django-13158/django/test/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    New var:....... TestCase = <class 'django.test.testcases.TestCase'>
+     line        10 from django.test.client import RequestFactory
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django.test.client' from '/data/swe-fl/...tbed/django__django-13158/django/test/client.py'>
+        Starting var:.. fromlist = ('RequestFactory',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        Return value:.. <module 'django.test.client' from '/data/swe-fl/...tbed/django__django-13158/django/test/client.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    New var:....... RequestFactory = <class 'django.test.client.RequestFactory'>
+     line        13 settings.configure(
+     line        14     DEBUG=True,
+     line        16         'default': {
+     line        17             'ENGINE': 'django.db.backends.sqlite3',
+     line        18             'NAME': 'test_db.sqlite3',
+     line        22         'django.contrib.contenttypes',
+     line        23         'django.contrib.auth',
+     line        24         'django.contrib.admin',
+     line        25         'django.contrib.sessions',
+     line        26         '__main__',  # This app is the current script
+     line        28     ROOT_URLCONF='__main__',
+     line        30         'django.middleware.security.SecurityMiddleware',
+     line        31         'django.contrib.sessions.middleware.SessionMiddleware',
+     line        32         'django.middleware.common.CommonMiddleware',
+     line        33         'django.middleware.csrf.CsrfViewMiddleware',
+     line        34         'django.contrib.auth.middleware.AuthenticationMiddleware',
+     line        35         'django.contrib.messages.middleware.MessageMiddleware',
+     line        36         'django.middleware.clickjacking.XFrameOptionsMiddleware',
+     line        40             'BACKEND': 'django.template.backends.django.DjangoTemplates',
+     line        41             'DIRS': [],
+     line        42             'APP_DIRS': True,
+     line        44                 'context_processors': [
+     line        45                     'django.template.context_processors.debug',
+     line        46                     'django.template.context_processors.request',
+     line        47                     'django.contrib.auth.context_processors.auth',
+     line        48                     'django.contrib.messages.context_processors.messages',
+     line        53     SECRET_KEY='secret_key_for_testing',
+        Source path:... /data/swe-fl/TMP/testbed/django__django-13158/django/conf/__init__.py
+        Starting var:.. self = <LazySettings [Unevaluated]>
+        Starting var:.. default_settings = <module 'django.conf.global_settings' from '/dat...go__django-13158/django/conf/global_settings.py'>
+        Starting var:.. options = {'DEBUG': True, 'DATABASES': {'default': {'ENGIN...ges']}}], 'SECRET_KEY': 'secret_key_for_testing'}
+         call        98     def configure(self, default_settings=global_settings, **options):
+         line       104         if self._wrapped is not empty:
+         line       106         holder = UserSettingsHolder(default_settings)
+        New var:....... holder = <UserSettingsHolder>
+         line       107         for name, value in options.items():
+        New var:....... name = 'DEBUG'
+        New var:....... value = True
+         line       108             if not name.isupper():
+         line       110             setattr(holder, name, value)
+         line       107         for name, value in options.items():
+        Modified var:.. name = 'DATABASES'
+        Modified var:.. value = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': 'test_db.sqlite3'}}
+         line       108             if not name.isupper():
+         line       110             setattr(holder, name, value)
+         line       107         for name, value in options.items():
+        Modified var:.. name = 'INSTALLED_APPS'
+        Modified var:.. value = ['django.contrib.contenttypes', 'django.contrib....ib.admin', 'django.contrib.sessions', '__main__']
+         line       108             if not name.isupper():
+         line       110             setattr(holder, name, value)
+         line       107         for name, value in options.items():
+        Modified var:.. name = 'ROOT_URLCONF'
+        Modified var:.. value = '__main__'
+         line       108             if not name.isupper():
+         line       110             setattr(holder, name, value)
+         line       107         for name, value in options.items():
+        Modified var:.. name = 'MIDDLEWARE'
+        Modified var:.. value = ['django.middleware.security.SecurityMiddleware'...middleware.clickjacking.XFrameOptionsMiddleware']
+         line       108             if not name.isupper():
+         line       110             setattr(holder, name, value)
+         line       107         for name, value in options.items():
+        Modified var:.. name = 'TEMPLATES'
+        Modified var:.. value = [{'BACKEND': 'django.template.backends.django.Dj...contrib.messages.context_processors.messages']}}]
+         line       108             if not name.isupper():
+         line       110             setattr(holder, name, value)
+         line       107         for name, value in options.items():
+        Modified var:.. name = 'SECRET_KEY'
+        Modified var:.. value = 'secret_key_for_testing'
+         line       108             if not name.isupper():
+         line       110             setattr(holder, name, value)
+         line       107         for name, value in options.items():
+         line       111         self._wrapped = holder
+        Modified var:.. self = <LazySettings "None">
+         return     111         self._wrapped = holder
+        Return value:.. None
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    Modified var:.. settings = <LazySettings "None">
+     line        57 import django
+    New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13158/django/__init__.py'>
+     line        58 django.setup()
+        Source path:... /data/swe-fl/TMP/testbed/django__django-13158/django/__init__.py
+        Starting var:.. set_prefix = True
+         call         8 def setup(set_prefix=True):
+         line        14     from django.apps import apps
+        New var:....... apps = <django.apps.registry.Apps object at 0x7f886306e7b8>
+         line        15     from django.conf import settings
+        New var:....... settings = <LazySettings "None">
+         line        16     from django.urls import set_script_prefix
+        New var:....... set_script_prefix = <function set_script_prefix at 0x7f886256a158>
+         line        17     from django.utils.log import configure_logging
+        New var:....... configure_logging = <function configure_logging at 0x7f8862368840>
+         line        19     configure_logging(settings.LOGGING_CONFIG, settings.LOGGING)
+         line        20     if set_prefix:
+         line        21         set_script_prefix(
+         line        22             '/' if settings.FORCE_SCRIPT_NAME is None else settings.FORCE_SCRIPT_NAME
+         line        24     apps.populate(settings.INSTALLED_APPS)
+         return      24     apps.populate(settings.INSTALLED_APPS)
+        Return value:.. None
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+     line        61 class Publication(models.Model):
+         call        61 class Publication(models.Model):
+         line        61 class Publication(models.Model):
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'Publication'
+         line        62     pass
+         return      62     pass
+        Return value:.. None
+            Source path:... /data/swe-fl/TMP/testbed/django__django-13158/django/db/models/base.py
+        Starting var:.. cls = <class 'django.db.models.base.ModelBase'>
+        Starting var:.. name = 'Publication'
+        Starting var:.. bases = (<class 'django.db.models.base.Model'>,)
+        Starting var:.. attrs = {'__module__': '__main__', '__qualname__': 'Publication'}
+        Starting var:.. kwargs = {}
+        Starting var:.. __class__ = <class 'django.db.models.base.ModelBase'>
+         call        74     def __new__(cls, name, bases, attrs, **kwargs):
+         line        75         super_new = super().__new__
+        New var:....... super_new = <built-in method __new__ of type object at 0x5630ced64880>
+         line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+        New var:....... parents = [<class 'django.db.models.base.Model'>]
+         line        80         if not parents:
+         line        84         module = attrs.pop('__module__')
+        Modified var:.. attrs = {'__qualname__': 'Publication'}
+        New var:....... module = '__main__'
+         line        85         new_attrs = {'__module__': module}
+        New var:....... new_attrs = {'__module__': '__main__'}
+         line        86         classcell = attrs.pop('__classcell__', None)
+        New var:....... classcell = None
+         line        87         if classcell is not None:
+         line        89         attr_meta = attrs.pop('Meta', None)
+        New var:....... attr_meta = None
+         line        93         contributable_attrs = {}
+        New var:....... contributable_attrs = {}
+         line        94         for obj_name, obj in attrs.items():
+        New var:....... obj_name = '__qualname__'
+        New var:....... obj = 'Publication'
+         line        95             if _has_contribute_to_class(obj):
+         line        98                 new_attrs[obj_name] = obj
+        Modified var:.. new_attrs = {'__module__': '__main__', '__qualname__': 'Publication'}
+         line        94         for obj_name, obj in attrs.items():
+         line        99         new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+        New var:....... new_class = <class '__main__.Publication'>
+         line       101         abstract = getattr(attr_meta, 'abstract', False)
+        New var:....... abstract = False
+         line       102         meta = attr_meta or getattr(new_class, 'Meta', None)
+        New var:....... meta = None
+         line       103         base_meta = getattr(new_class, '_meta', None)
+        New var:....... base_meta = None
+         line       105         app_label = None
+        New var:....... app_label = None
+         line       108         app_config = apps.get_containing_app_config(module)
+        New var:....... app_config = <AppConfig: __main__>
+         line       110         if getattr(meta, 'app_label', None) is None:
+         line       111             if app_config is None:
+         line       120                 app_label = app_config.label
+        Modified var:.. app_label = '__main__'
+         line       122         new_class.add_to_class('_meta', Options(meta, app_label))
+         line       123         if not abstract:
+         line       124             new_class.add_to_class(
+         line       125                 'DoesNotExist',
+         line       126                 subclass_exception(
+         line       127                     'DoesNotExist',
+         line       128                     tuple(
+         line       129                         x.DoesNotExist for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+         line       130                     ) or (ObjectDoesNotExist,),
+         line       131                     module,
+         line       132                     attached_to=new_class))
+         line       133             new_class.add_to_class(
+         line       134                 'MultipleObjectsReturned',
+         line       135                 subclass_exception(
+         line       136                     'MultipleObjectsReturned',
+         line       137                     tuple(
+         line       138                         x.MultipleObjectsReturned for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+         line       139                     ) or (MultipleObjectsReturned,),
+         line       140                     module,
+         line       141                     attached_to=new_class))
+         line       142             if base_meta and not base_meta.abstract:
+         line       151         is_proxy = new_class._meta.proxy
+        New var:....... is_proxy = False
+         line       155         if is_proxy and base_meta and base_meta.swapped:
+         line       160         for obj_name, obj in contributable_attrs.items():
+         line       164         new_fields = chain(
+         line       165             new_class._meta.local_fields,
+         line       166             new_class._meta.local_many_to_many,
+         line       167             new_class._meta.private_fields
+        New var:....... new_fields = <itertools.chain object at 0x7f8861bf4b70>
+         line       169         field_names = {f.name for f in new_fields}
+        New var:....... field_names = set()
+         line       172         if is_proxy:
+         line       192             new_class._meta.concrete_model = new_class
+         line       195         parent_links = {}
+        New var:....... parent_links = {}
+         line       196         for base in reversed([new_class] + parents):
+        New var:....... base = <class 'django.db.models.base.Model'>
+         line       198             if not hasattr(base, '_meta'):
+         line       199                 continue
+         line       196         for base in reversed([new_class] + parents):
+        Modified var:.. base = <class '__main__.Publication'>
+         line       198             if not hasattr(base, '_meta'):
+         line       201             if base != new_class and not base._meta.abstract:
+         line       204             for field in base._meta.local_fields:
+         line       196         for base in reversed([new_class] + parents):
+         line       210         inherited_attributes = set()
+        New var:....... inherited_attributes = set()
+         line       212         for base in new_class.mro():
+         line       213             if base not in parents or not hasattr(base, '_meta'):
+         line       216                 inherited_attributes.update(base.__dict__)
+        Modified var:.. inherited_attributes = {'__module__', '__doc__', '_meta', 'MultipleObjectsReturned', 'DoesNotExist'}
+         line       217                 continue
+         line       212         for base in new_class.mro():
+        Modified var:.. base = <class 'django.db.models.base.Model'>
+         line       213             if base not in parents or not hasattr(base, '_meta'):
+         line       216                 inherited_attributes.update(base.__dict__)
+        Modified var:.. inherited_attributes = {'check', '_get_expr_references', 'pk', '__hash_..._message', '_check_local_fields', 'clean_fields'}
+         line       217                 continue
+         line       212         for base in new_class.mro():
+        Modified var:.. base = <class 'object'>
+         line       213             if base not in parents or not hasattr(base, '_meta'):
+         line       216                 inherited_attributes.update(base.__dict__)
+        Modified var:.. inherited_attributes = {'check', '_get_expr_references', '__new__', '__..._class__', '_check_local_fields', 'clean_fields'}
+         line       217                 continue
+         line       212         for base in new_class.mro():
+         line       310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+         line       312         if abstract:
+         line       320         new_class._prepare()
+         line       321         new_class._meta.apps.register_model(new_class._meta.app_label, new_class)
+         line       322         return new_class
+         return     322         return new_class
+        Return value:.. <class '__main__.Publication'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+    New var:....... Publication = <class '__main__.Publication'>
+     line        64 class Article(models.Model):
+         call        64 class Article(models.Model):
+         line        64 class Article(models.Model):
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'Article'
+         line        65     publications = models.ManyToManyField(to=Publication, blank=True, null=True)
+            Source path:... /data/swe-fl/TMP/testbed/django__django-13158/django/db/models/fields/related.py
+            Starting var:.. self = <django.db.models.fields.related.ManyToManyField>
+            Starting var:.. to = <class '__main__.Publication'>
+            Starting var:.. related_name = None
+            Starting var:.. related_query_name = None
+            Starting var:.. limit_choices_to = None
+            Starting var:.. symmetrical = None
+            Starting var:.. through = None
+            Starting var:.. through_fields = None
+            Starting var:.. db_constraint = True
+            Starting var:.. db_table = None
+            Starting var:.. swappable = True
+            Starting var:.. kwargs = {'blank': True, 'null': True}
+            Starting var:.. __class__ = <class 'django.db.models.fields.related.ManyToManyField'>
+             call      1144     def __init__(self, to, related_name=None, related_query_name=None,
+             line      1148         try:
+             line      1149             to._meta
+             line      1157         if symmetrical is None:
+             line      1158             symmetrical = (to == RECURSIVE_RELATIONSHIP_CONSTANT)
+            Modified var:.. symmetrical = False
+             line      1160         if through is not None:
+             line      1165         kwargs['rel'] = self.rel_class(
+             line      1166             self, to,
+             line      1167             related_name=related_name,
+             line      1168             related_query_name=related_query_name,
+             line      1169             limit_choices_to=limit_choices_to,
+             line      1170             symmetrical=symmetrical,
+             line      1171             through=through,
+             line      1172             through_fields=through_fields,
+             line      1173             db_constraint=db_constraint,
+            Modified var:.. kwargs = REPR FAILED
+             line      1175         self.has_null_arg = 'null' in kwargs
+             line      1177         super().__init__(**kwargs)
+             line      1179         self.db_table = db_table
+             line      1180         self.swappable = swappable
+             return    1180         self.swappable = swappable
+            Return value:.. None
+        Source path:... /data/swe-fl/TMP/testbed/django__django-13158/reproduce.py
+        New var:....... publications = <django.db.models.fields.related.ManyToManyField>
+         return      65     publications = models.ManyToManyField(to=Publication, blank=True, null=True)
+        Return value:.. None
+            Source path:... /data/swe-fl/TMP/testbed/django__django-13158/django/db/models/base.py
+        Starting var:.. cls = <class 'django.db.models.base.ModelBase'>
+        Starting var:.. name = 'Article'
+        Starting var:.. bases = (<class 'django.db.models.base.Model'>,)
+        Starting var:.. attrs = {'__module__': '__main__', '__qualname__': 'Arti...django.db.models.fields.related.ManyToManyField>}
+        Starting var:.. kwargs = {}
+        Starting var:.. __class__ = <class 'django.db.models.base.ModelBase'>
+         call        74     def __new__(cls, name, bases, attrs, **kwargs):
+         line        75         super_new = super().__new__
+        New var:....... super_new = <built-in method __new__ of type object at 0x5630ced64880>
+         line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+        New var:....... parents = [<class 'django.db.models.base.Model'>]
+         line        80         if not parents:
+         line        84         module = attrs.pop('__module__')
+        Modified var:.. attrs = {'__qualname__': 'Article', 'publications': <django.db.models.fields.related.ManyToManyField>}
+        New var:....... module = '__main__'
+         line        85         new_attrs = {'__module__': module}
+        New var:....... new_attrs = {'__module__': '__main__'}
+         line        86         classcell = attrs.pop('__classcell__', None)
+        New var:....... classcell = None
+         line        87         if classcell is not None:
+         line        89         attr_meta = attrs.pop('Meta', None)
+        New var:....... attr_meta = None
+         line        93         contributable_attrs = {}
+        New var:....... contributable_attrs = {}
+         line        94         for obj_name, obj in attrs.items():
+        New var:....... obj_name = '__qualname__'
+        New var:....... obj = 'Article'
+         line        95             if _has_contribute_to_class(obj):
+         line        98                 new_attrs[obj_name] = obj
+        Modified var:.. new_attrs = {'__module__': '__main__', '__qualname__': 'Article'}
+         line        94         for obj_name, obj in attrs.items():
+        Modified var:.. obj_name = 'publications'
+        Modified var:.. obj = <django.db.models.fields.related.ManyToManyField>
+         line        95             if _has_contribute_to_class(obj):
+         line        96                 contributable_attrs[obj_name] = obj
+        Modified var:.. contributable_attrs = {'publications': <django.db.models.fields.related.ManyToManyField>}
+         line        94         for obj_name, obj in attrs.items():
+         line        99         new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+        New var:....... new_class = <class '__main__.Article'>
+         line       101         abstract = getattr(attr_meta, 'abstract', False)
+        New var:....... abstract = False
+         line       102         meta = attr_meta or getattr(new_class, 'Meta', None)
+        New var:....... meta = None
+         line       103         base_meta = getattr(new_class, '_meta', None)
+        New var:....... base_meta = None
+         line       105         app_label = None
+        New var:....... app_label = None
+         line       108         app_config = apps.get_containing_app_config(module)
+        New var:....... app_config = <AppConfig: __main__>
+         line       110         if getattr(meta, 'app_label', None) is None:
+         line       111             if app_config is None:
+         line       120                 app_label = app_config.label
+        Modified var:.. app_label = '__main__'
+         line       122         new_class.add_to_class('_meta', Options(meta, app_label))
+         line       123         if not abstract:
+         line       124             new_class.add_to_class(
+         line       125                 'DoesNotExist',
+         line       126                 subclass_exception(
+         line       127                     'DoesNotExist',
+         line       128                     tuple(
+         line       129                         x.DoesNotExist for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+         line       130                     ) or (ObjectDoesNotExist,),
+         line       131                     module,
+         line       132                     attached_to=new_class))
+         line       133             new_class.add_to_class(
+         line       134                 'MultipleObjectsReturned',
+         line       135                 subclass_exception(
+         line       136                     'MultipleObjectsReturned',
+         line       137                     tuple(
+         line       138                         x.MultipleObjectsReturned for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+         line       139                     ) or (MultipleObjectsReturned,),
+         line       140                     module,
+         line       141                     attached_to=new_class))
+         line       142             if base_meta and not base_meta.abstract:
+         line       151         is_proxy = new_class._meta.proxy
+        New var:....... is_proxy = False
+         line       155         if is_proxy and base_meta and base_meta.swapped:
+         line       160         for obj_name, obj in contributable_attrs.items():
+         line       161             new_class.add_to_class(obj_name, obj)
+        Modified var:.. attrs = {'__qualname__': 'Article', 'publications': <dja...ls.fields.related.ManyToManyField: publications>}
+        Modified var:.. contributable_attrs = {'publications': <django.db.models.fields.related.ManyToManyField: publications>}
+        Modified var:.. obj = <django.db.models.fields.related.ManyToManyField: publications>
+         line       160         for obj_name, obj in contributable_attrs.items():
+         line       164         new_fields = chain(
+         line       165             new_class._meta.local_fields,
+         line       166             new_class._meta.local_many_to_many,
+         line       167             new_class._meta.private_fields
+        New var:....... new_fields = <itertools.chain object at 0x7f8861bf4be0>
+         line       169         field_names = {f.name for f in new_fields}
+        New var:....... field_names = {'publications'}
+         line       172         if is_proxy:
+         line       192             new_class._meta.concrete_model = new_class
+         line       195         parent_links = {}
+        New var:....... parent_links = {}
+         line       196         for base in reversed([new_class] + parents):
+        New var:....... base = <class 'django.db.models.base.Model'>
+         line       198             if not hasattr(base, '_meta'):
+         line       199                 continue
+         line       196         for base in reversed([new_class] + parents):
+        Modified var:.. base = <class '__main__.Article'>
+         line       198             if not hasattr(base, '_meta'):
+         line       201             if base != new_class and not base._meta.abstract:
+         line       204             for field in base._meta.local_fields:
+         line       196         for base in reversed([new_class] + parents):
+         line       210         inherited_attributes = set()
+        New var:....... inherited_attributes = set()
+         line       212         for base in new_class.mro():
+         line       213             if base not in parents or not hasattr(base, '_meta'):
+         line       216                 inherited_attributes.update(base.__dict__)
+        Modified var:.. inherited_attributes = {'__module__', '__doc__', 'publications', '_meta', 'MultipleObjectsReturned', 'DoesNotExist'}
+         line       217                 continue
+         line       212         for base in new_class.mro():
+        Modified var:.. base = <class 'django.db.models.base.Model'>
+         line       213             if base not in parents or not hasattr(base, '_meta'):
+         line       216                 inherited_attributes.update(base.__dict__)
+        Modified var:.. inherited_attributes = {'check', '_get_expr_references', 'pk', '__hash_..._message', '_check_local_fields', 'clean_fields'}
+         line       217                 continue
+
+The debugging test execution result is too long to display here. Please re-select your `runtime_info` lists to narrow down the scope of your analysis.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

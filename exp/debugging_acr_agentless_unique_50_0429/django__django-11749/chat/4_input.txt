@@ -1,0 +1,491 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+call_command fails when argument of required mutually exclusive group is passed in kwargs.
+Description
+	
+This error 
+django.core.management.base.CommandError: Error: one of the arguments --shop-id --shop is required
+is raised when I run 
+call_command('my_command', shop_id=1)
+the argument 'shop_id' is part of a required mutually exclusive group:
+shop = parser.add_mutually_exclusive_group(required=True)
+shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
+shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
+However, everything is fine when I call this command in this way:
+call_command('my_command, '--shop-id=1')
+In django sources I found that only those keyword arguments of call_command are passed to the parser that are defined as required:
+# Any required arguments which are passed in via '**options' must be passed
+# to parse_args().
+parse_args += [
+	'{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+	for opt in parser._actions if opt.required and opt.dest in options
+]
+but in this special case both of them individually are not required, they are actually part of a group that is required. And the code of call_command does nothing with groups defined in the parser.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+from django.core.management import call_command
+from django.core.management.base import BaseCommand, CommandError
+from django.conf import settings
+from django.core.management import ManagementUtility
+
+# Define a minimal Django settings module
+settings.configure(
+    DEBUG=True,
+    INSTALLED_APPS=[
+        'django.contrib.auth',
+        'django.contrib.contenttypes',
+        'django.contrib.sessions',
+        'django.contrib.messages',
+        'django.contrib.staticfiles',
+    ],
+    ROOT_URLCONF=__name__,
+    SECRET_KEY='fake-key',
+)
+
+# Define a custom management command
+class Command(BaseCommand):
+    help = 'Test mutually exclusive group'
+
+    def add_arguments(self, parser):
+        shop = parser.add_mutually_exclusive_group(required=True)
+        shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
+        shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
+
+    def handle(self, *args, **options):
+        if options['shop_id'] is not None:
+            self.stdout.write(f"Shop ID: {options['shop_id']}")
+        elif options['shop_name'] is not None:
+            self.stdout.write(f"Shop Name: {options['shop_name']}")
+
+# Function to print stack trace
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Main function to reproduce the issue
+def main():
+    # Add the current directory to the system path
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+    # Initialize Django
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', __name__)
+    ManagementUtility(['']).execute()
+
+    try:
+        # Call the command with kwargs
+        call_command('command', shop_id=1)
+    except CommandError as e:
+        print_stacktrace(e)
+        raise AssertionError("call_command fails when argument of required mutually exclusive group is passed in kwargs.")
+
+if __name__ == '__main__':
+    main()
+
+
+This is the tracing and analysis history:
+
+==================================================
+The issue seems to occur when executing a Django management command using the `call_command` function in a way that does not validate mutually exclusive group arguments correctly.
+
+### Analysis of the exception traceback:
+
+1. The test script defines a custom Django management command `Command` with mutually exclusive arguments `shop_id` and `shop_name`. 
+   
+2. The test attempts to call this custom command using `call_command('command', shop_id=1)`, which fails with the error: `CommandError: Unknown command: 'command'`.
+
+3. Examining the traceback:
+   - The error occurs because the custom command `Command` defined in the script is not recognized as a registered Django command. This is because it's not being loaded properly in the context where `call_command` is being executed.
+   - The `get_commands()` call in `call_command` tries to retrieve available commands and raises a `KeyError` when it doesn't find `command`.
+
+### Observations:
+- `call_command` is expecting a registered command, which usually resides within a Django app and is discoverable via the app's configuration.
+- The testing setup does not appear to properly register the custom command as a valid Django command.
+
+Since the custom command isn't being recognized, the problem doesn't directly lie within the handling of mutually exclusive groups yet.
+
+We should focus on understanding how commands are registered and discovered to solve this registration issue first. The observed method involved in this discovery and raising the KeyError is `get_commands()` in the following context:
+
+Observed method: `django/core/management/__init__.py:get_commands`
+==================================================
+### Analysis
+
+The issue arises from using the `call_command` function to invoke a Django management command without properly registering it as part of the Django command system. In the provided test setup, the custom command `Command` is defined locally but isn't exposed to `get_commands()` in a way that Django can discover and execute it.
+
+### Observations
+
+- The test code attempts to call a command named `'command'`, which is expected to be part of the registered Django commands. However, `get_commands()` currently retrieves only built-in or configured commands located in installed apps.
+
+- The function `get_commands()` scans registered Django applications for a `management.commands` package. Custom commands must reside in a Django app's `management.commands` directory to be detected by this mechanism.
+
+### Root Cause
+
+The failure stems from trying to call a command that isn't registered. The setup doesn't provide any mechanism for it to be registered or located correctly because it's defined locally within the test script, not as part of a formal Django application structure.
+
+### Next Steps
+
+The focus should first be on correcting the setup to ensure the custom command gets properly registered or loaded before narrowing down the issue related to handling mutually exclusive group arguments.
+
+Thus, I will trace further but with significant focus on resolving the registration issue. Let's specifically examine how the command location and discovery logic might be fixed or circumvented within the context of the test setup.
+
+To achieve this, I will deep dive into how `get_commands()` pulls application configurations and determines their command structure for proper registration. 
+
+### Observed Scope
+Given the missing registration, I'll need further insight into the command discovery mechanism, particularly around how app commands are identified. 
+
+Observed scope: `django/core/management/__init__.py:69-71`
+
+This scope involves iterating through app configurations to update the `commands` dictionary, important for identifying where custom/new commands would be added. The idea is to monitor how the discovered path is dynamically handled and updated on `commands`. Thus ensuring we deduce what's missed in our testing approach and ensure proper context.
+==================================================
+
+
+Now you choose get_commands's code snippet 
+    69	    for app_config in reversed(list(apps.get_app_configs())):
+    70	        path = os.path.join(app_config.path, 'management')
+    71	        commands.update({name: app_config.name for name in find_commands(path)})
+
+for further observation, tracing the abnormal program behavior.
+
+This is the runtime information of the code snippet you choose to observed in get_commands:
+
+
+Type ' help <subcommand>' for help on a specific subcommand.
+
+Available subcommands:
+
+[auth]
+    changepassword
+    createsuperuser
+
+[contenttypes]
+    remove_stale_contenttypes
+
+[django]
+    check
+    compilemessages
+    createcachetable
+    dbshell
+    diffsettings
+    dumpdata
+    flush
+    inspectdb
+    loaddata
+    makemessages
+    makemigrations
+    migrate
+    sendtestemail
+    shell
+    showmigrations
+    sqlflush
+    sqlmigrate
+    sqlsequencereset
+    squashmigrations
+    startapp
+    startproject
+    test
+    testserver
+
+[sessions]
+    clearsessions
+
+[staticfiles]
+    collectstatic
+    findstatic
+    runserver
+Error occurred during script execution:call_command fails when argument of required mutually exclusive group is passed in kwargs.
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py
+New var:....... commands = {'check': 'django.core', 'compilemessages': 'dja...est': 'django.core', 'testserver': 'django.core'}
+ line        69     for app_config in reversed(list(apps.get_app_configs())):
+    Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/apps/registry.py
+    Starting var:.. self = <django.apps.registry.Apps object at 0x7fb22c36a0b8>
+     call       142     def get_app_configs(self):
+     line       144         self.check_apps_ready()
+     line       145         return self.app_configs.values()
+     return     145         return self.app_configs.values()
+    Return value:.. dict_values([<AuthConfig: auth>, <ContentTypesCo...ig: messages>, <StaticFilesConfig: staticfiles>])
+Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py
+New var:....... app_config = <StaticFilesConfig: staticfiles>
+ line        70         path = os.path.join(app_config.path, 'management')
+    Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/posixpath.py
+    Starting var:.. a = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/staticfiles'
+    Starting var:.. p = ('management',)
+     call        75 def join(a, *p):
+     line        80     a = os.fspath(a)
+     line        81     sep = _get_sep(a)
+    New var:....... sep = '/'
+     line        82     path = a
+    New var:....... path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/staticfiles'
+     line        83     try:
+     line        84         if not p:
+     line        86         for b in map(os.fspath, p):
+    New var:....... b = 'management'
+     line        87             if b.startswith(sep):
+     line        89             elif not path or path.endswith(sep):
+     line        92                 path += sep + b
+    Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/staticfiles/management'
+     line        86         for b in map(os.fspath, p):
+     line        96     return path
+     return      96     return path
+    Return value:.. '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/staticfiles/management'
+Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py
+New var:....... path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/staticfiles/management'
+ line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    Starting var:.. management_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/staticfiles/management'
+     call        21 def find_commands(management_dir):
+     line        26     command_dir = os.path.join(management_dir, 'commands')
+    New var:....... command_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/staticfiles/management/commands'
+     line        27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+     return      27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+    Return value:.. ['collectstatic', 'findstatic', 'runserver']
+    Starting var:.. .0 = <list_iterator object at 0x7fb22bd7a630>
+    Starting var:.. app_config = <StaticFilesConfig: staticfiles>
+     call        71         commands.update({name: app_config.name for name in find_commands(path)})
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    New var:....... name = 'collectstatic'
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    Modified var:.. name = 'findstatic'
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    Modified var:.. name = 'runserver'
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+     return      71         commands.update({name: app_config.name for name in find_commands(path)})
+    Return value:.. {'collectstatic': 'django.contrib.staticfiles', ...iles', 'runserver': 'django.contrib.staticfiles'}
+Modified var:.. commands = {'check': 'django.core', 'compilemessages': 'dja...les', 'findstatic': 'django.contrib.staticfiles'}
+ line        69     for app_config in reversed(list(apps.get_app_configs())):
+Modified var:.. app_config = <MessagesConfig: messages>
+ line        70         path = os.path.join(app_config.path, 'management')
+    Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/posixpath.py
+    Starting var:.. a = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/messages'
+    Starting var:.. p = ('management',)
+     call        75 def join(a, *p):
+     line        80     a = os.fspath(a)
+     line        81     sep = _get_sep(a)
+    New var:....... sep = '/'
+     line        82     path = a
+    New var:....... path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/messages'
+     line        83     try:
+     line        84         if not p:
+     line        86         for b in map(os.fspath, p):
+    New var:....... b = 'management'
+     line        87             if b.startswith(sep):
+     line        89             elif not path or path.endswith(sep):
+     line        92                 path += sep + b
+    Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/messages/management'
+     line        86         for b in map(os.fspath, p):
+     line        96     return path
+     return      96     return path
+    Return value:.. '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/messages/management'
+Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py
+Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/messages/management'
+ line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    Starting var:.. management_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/messages/management'
+     call        21 def find_commands(management_dir):
+     line        26     command_dir = os.path.join(management_dir, 'commands')
+    New var:....... command_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/messages/management/commands'
+     line        27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+     return      27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+    Return value:.. []
+    Starting var:.. .0 = <list_iterator object at 0x7fb22bd7a630>
+    Starting var:.. app_config = <MessagesConfig: messages>
+     call        71         commands.update({name: app_config.name for name in find_commands(path)})
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+     return      71         commands.update({name: app_config.name for name in find_commands(path)})
+    Return value:.. {}
+ line        69     for app_config in reversed(list(apps.get_app_configs())):
+Modified var:.. app_config = <SessionsConfig: sessions>
+ line        70         path = os.path.join(app_config.path, 'management')
+    Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/posixpath.py
+    Starting var:.. a = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/sessions'
+    Starting var:.. p = ('management',)
+     call        75 def join(a, *p):
+     line        80     a = os.fspath(a)
+     line        81     sep = _get_sep(a)
+    New var:....... sep = '/'
+     line        82     path = a
+    New var:....... path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/sessions'
+     line        83     try:
+     line        84         if not p:
+     line        86         for b in map(os.fspath, p):
+    New var:....... b = 'management'
+     line        87             if b.startswith(sep):
+     line        89             elif not path or path.endswith(sep):
+     line        92                 path += sep + b
+    Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/sessions/management'
+     line        86         for b in map(os.fspath, p):
+     line        96     return path
+     return      96     return path
+    Return value:.. '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/sessions/management'
+Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py
+Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/sessions/management'
+ line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    Starting var:.. management_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/sessions/management'
+     call        21 def find_commands(management_dir):
+     line        26     command_dir = os.path.join(management_dir, 'commands')
+    New var:....... command_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/sessions/management/commands'
+     line        27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+     return      27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+    Return value:.. ['clearsessions']
+    Starting var:.. .0 = <list_iterator object at 0x7fb22bd7a5f8>
+    Starting var:.. app_config = <SessionsConfig: sessions>
+     call        71         commands.update({name: app_config.name for name in find_commands(path)})
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    New var:....... name = 'clearsessions'
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+     return      71         commands.update({name: app_config.name for name in find_commands(path)})
+    Return value:.. {'clearsessions': 'django.contrib.sessions'}
+Modified var:.. commands = {'check': 'django.core', 'compilemessages': 'dja...les', 'clearsessions': 'django.contrib.sessions'}
+ line        69     for app_config in reversed(list(apps.get_app_configs())):
+Modified var:.. app_config = <ContentTypesConfig: contenttypes>
+ line        70         path = os.path.join(app_config.path, 'management')
+    Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/posixpath.py
+    Starting var:.. a = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/contenttypes'
+    Starting var:.. p = ('management',)
+     call        75 def join(a, *p):
+     line        80     a = os.fspath(a)
+     line        81     sep = _get_sep(a)
+    New var:....... sep = '/'
+     line        82     path = a
+    New var:....... path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/contenttypes'
+     line        83     try:
+     line        84         if not p:
+     line        86         for b in map(os.fspath, p):
+    New var:....... b = 'management'
+     line        87             if b.startswith(sep):
+     line        89             elif not path or path.endswith(sep):
+     line        92                 path += sep + b
+    Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/contenttypes/management'
+     line        86         for b in map(os.fspath, p):
+     line        96     return path
+     return      96     return path
+    Return value:.. '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/contenttypes/management'
+Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py
+Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/contenttypes/management'
+ line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    Starting var:.. management_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/contenttypes/management'
+     call        21 def find_commands(management_dir):
+     line        26     command_dir = os.path.join(management_dir, 'commands')
+    New var:....... command_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/contenttypes/management/commands'
+     line        27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+     return      27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+    Return value:.. ['remove_stale_contenttypes']
+    Starting var:.. .0 = <list_iterator object at 0x7fb22bd7a630>
+    Starting var:.. app_config = <ContentTypesConfig: contenttypes>
+     call        71         commands.update({name: app_config.name for name in find_commands(path)})
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    New var:....... name = 'remove_stale_contenttypes'
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+     return      71         commands.update({name: app_config.name for name in find_commands(path)})
+    Return value:.. {'remove_stale_contenttypes': 'django.contrib.contenttypes'}
+Modified var:.. commands = {'check': 'django.core', 'compilemessages': 'dja...ale_contenttypes': 'django.contrib.contenttypes'}
+ line        69     for app_config in reversed(list(apps.get_app_configs())):
+Modified var:.. app_config = <AuthConfig: auth>
+ line        70         path = os.path.join(app_config.path, 'management')
+    Source path:... /root/miniforge3/envs/django__django__3.0/lib/python3.6/posixpath.py
+    Starting var:.. a = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/auth'
+    Starting var:.. p = ('management',)
+     call        75 def join(a, *p):
+     line        80     a = os.fspath(a)
+     line        81     sep = _get_sep(a)
+    New var:....... sep = '/'
+     line        82     path = a
+    New var:....... path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/auth'
+     line        83     try:
+     line        84         if not p:
+     line        86         for b in map(os.fspath, p):
+    New var:....... b = 'management'
+     line        87             if b.startswith(sep):
+     line        89             elif not path or path.endswith(sep):
+     line        92                 path += sep + b
+    Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/auth/management'
+     line        86         for b in map(os.fspath, p):
+     line        96     return path
+     return      96     return path
+    Return value:.. '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/auth/management'
+Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py
+Modified var:.. path = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/auth/management'
+ line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    Starting var:.. management_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/auth/management'
+     call        21 def find_commands(management_dir):
+     line        26     command_dir = os.path.join(management_dir, 'commands')
+    New var:....... command_dir = '/data/swe-fl/TMP/testbed/django__django-11749/django/contrib/auth/management/commands'
+     line        27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+     return      27     return [name for _, name, is_pkg in pkgutil.iter_modules([command_dir])
+    Return value:.. ['changepassword', 'createsuperuser']
+    Starting var:.. .0 = <list_iterator object at 0x7fb22bd7a5c0>
+    Starting var:.. app_config = <AuthConfig: auth>
+     call        71         commands.update({name: app_config.name for name in find_commands(path)})
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    New var:....... name = 'changepassword'
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+    Modified var:.. name = 'createsuperuser'
+     line        71         commands.update({name: app_config.name for name in find_commands(path)})
+     return      71         commands.update({name: app_config.name for name in find_commands(path)})
+    Return value:.. {'changepassword': 'django.contrib.auth', 'createsuperuser': 'django.contrib.auth'}
+Modified var:.. commands = {'check': 'django.core', 'compilemessages': 'dja....auth', 'createsuperuser': 'django.contrib.auth'}
+ line        69     for app_config in reversed(list(apps.get_app_configs())):
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-11749/reproduce.py"
+    60: call_command('command', shop_id=1)
+  File "/data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py"
+    105: raise CommandError("Unknown command: %r" % command_name)
+CommandError: Unknown command: 'command'
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py", line 103, in call_command
+    app_name = get_commands()[command_name]
+KeyError: 'command'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-11749/reproduce.py", line 60, in main
+    call_command('command', shop_id=1)
+  File "/data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py", line 105, in call_command
+    raise CommandError("Unknown command: %r" % command_name)
+django.core.management.base.CommandError: Unknown command: 'command'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-11749/reproduce.py", line 66, in <module>
+    main()
+  File "/data/swe-fl/TMP/testbed/django__django-11749/reproduce.py", line 63, in main
+    raise AssertionError("call_command fails when argument of required mutually exclusive group is passed in kwargs.")
+AssertionError: call_command fails when argument of required mutually exclusive group is passed in kwargs.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

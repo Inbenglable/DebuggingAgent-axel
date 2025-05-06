@@ -1,0 +1,314 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+QuerySet.bulk_create() crashes on mixed case columns in unique_fields/update_fields.
+Description
+	
+Not sure exactly how to phrase this, but when I I'm calling bulk_update on the manager for a class with db_column set on fields the SQL is invalid. Ellipses indicate other fields excluded for clarity.
+class ActivityBlackListed(models.Model):
+	"""
+	Originally sourced from Activity_BlackListed in /home/josh/PNDS_Interim_MIS-Data.accdb (13 records)
+	"""
+	class Meta:
+		db_table = "Activity_BlackListed"
+	blacklistid = models.IntegerField(primary_key=True, db_column="BlacklistID")
+	sectorid = models.IntegerField(null=True, blank=True, db_column="SectorID")
+	...
+qs.bulk_create(instances, update_conflicts=True, update_fields=["sectorid", ...], unique_fields=["blacklistid"])
+The "INSERT" code does take into account the db_columns
+INSERT INTO "Activity_BlackListed" ("BlacklistID",...) VALUES (%s, ...),
+The code which is generated for "ON CONFLICT" uses the field name and not the db_column which leads to a syntax error
+'ON CONFLICT("blacklistid") DO UPDATE SET "sectorid" = EXCLUDED."sectorid", ...
+PostgreSQL returns ERROR: column "blacklistid" does not exist at character 1508
+What should be generated is I think:
+'ON CONFLICT("BlacklistID") DO UPDATE SET "SectorID" = EXCLUDED."SectorID", ...
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+from django.conf import settings
+from django.db import models, connection
+from django.test.utils import override_settings
+
+settings.configure(
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': ':memory:',
+        }
+    },
+    INSTALLED_APPS=['django.contrib.contenttypes'],
+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
+)
+
+import django
+django.setup()
+
+class ActivityBlackListed(models.Model):
+    class Meta:
+        app_label = 'test'
+        db_table = "Activity_BlackListed"
+    blacklistid = models.IntegerField(primary_key=True, db_column="BlacklistID")
+    sectorid = models.IntegerField(null=True, blank=True, db_column="SectorID")
+
+# Create the table
+with connection.schema_editor() as schema_editor:
+    schema_editor.create_model(ActivityBlackListed)
+
+# Try to bulk_create with update_conflicts
+instances = [
+    ActivityBlackListed(blacklistid=1, sectorid=100),
+    ActivityBlackListed(blacklistid=2, sectorid=200),
+]
+
+qs = ActivityBlackListed.objects.bulk_create(
+    instances,
+    update_conflicts=True,
+    update_fields=["sectorid"],
+    unique_fields=["blacklistid"]
+)
+
+
+This is the tracing and analysis history:
+
+==================================================
+To resolve the reported bug, we need to trace the abnormal behavior observed during the execution of `qs.bulk_create(instances, update_conflicts=True, update_fields=["sectorid"], unique_fields=["blacklistid"])`. The issue arises with SQL generated when using column names specified in `db_column` attributes in models, potentially leading to syntax errors as reported.
+
+Let's examine the observed issue: when constructing the SQL statement for `ON CONFLICT`, Django uses the field names set in the model definition rather than the `db_column` values, leading to a mismatch with PostgreSQL expected column names.
+
+Considering the provided runtime information, the next logical step is to analyze how Django constructs such SQL statements, specifically focusing on methods relevant to database operations during bulk updates with conflicts.
+
+Therefore, the next observed method for further analysis should involve SQL generation within the bulk_create operations.
+
+Observed method: `django/db/models/query.py:QuerySet.bulk_create`
+==================================================
+
+
+Now you choose downstream method QuerySet.bulk_create to further observe, tracing the abnormal program behavior.
+This is the method code:
+   746	    def bulk_create(
+   747	        self,
+   748	        objs,
+   749	        batch_size=None,
+   750	        ignore_conflicts=False,
+   751	        update_conflicts=False,
+   752	        update_fields=None,
+   753	        unique_fields=None,
+   754	    ):
+   755	        """
+   756	        Insert each of the instances into the database. Do *not* call
+   757	        save() on each of the instances, do not send any pre/post_save
+   758	        signals, and do not set the primary key attribute if it is an
+   759	        autoincrement field (except if features.can_return_rows_from_bulk_insert=True).
+   760	        Multi-table models are not supported.
+   761	        """
+   762	        # When you bulk insert you don't get the primary keys back (if it's an
+   763	        # autoincrement, except if can_return_rows_from_bulk_insert=True), so
+   764	        # you can't insert into the child tables which references this. There
+   765	        # are two workarounds:
+   766	        # 1) This could be implemented if you didn't have an autoincrement pk
+   767	        # 2) You could do it by doing O(n) normal inserts into the parent
+   768	        #    tables to get the primary keys back and then doing a single bulk
+   769	        #    insert into the childmost table.
+   770	        # We currently set the primary keys on the objects when using
+   771	        # PostgreSQL via the RETURNING ID clause. It should be possible for
+   772	        # Oracle as well, but the semantics for extracting the primary keys is
+   773	        # trickier so it's not done yet.
+   774	        if batch_size is not None and batch_size <= 0:
+   775	            raise ValueError("Batch size must be a positive integer.")
+   776	        # Check that the parents share the same concrete model with the our
+   777	        # model to detect the inheritance pattern ConcreteGrandParent ->
+   778	        # MultiTableParent -> ProxyChild. Simply checking self.model._meta.proxy
+   779	        # would not identify that case as involving multiple tables.
+   780	        for parent in self.model._meta.get_parent_list():
+   781	            if parent._meta.concrete_model is not self.model._meta.concrete_model:
+   782	                raise ValueError("Can't bulk create a multi-table inherited model")
+   783	        if not objs:
+   784	            return objs
+   785	        opts = self.model._meta
+   786	        if unique_fields:
+   787	            # Primary key is allowed in unique_fields.
+   788	            unique_fields = [
+   789	                opts.pk.name if name == "pk" else name for name in unique_fields
+   790	            ]
+   791	        on_conflict = self._check_bulk_create_options(
+   792	            ignore_conflicts,
+   793	            update_conflicts,
+   794	            update_fields,
+   795	            unique_fields,
+   796	        )
+   797	        self._for_write = True
+   798	        fields = opts.concrete_fields
+   799	        objs = list(objs)
+   800	        self._prepare_for_bulk_create(objs)
+   801	        with transaction.atomic(using=self.db, savepoint=False):
+   802	            objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
+   803	            if objs_with_pk:
+   804	                returned_columns = self._batched_insert(
+   805	                    objs_with_pk,
+   806	                    fields,
+   807	                    batch_size,
+   808	                    on_conflict=on_conflict,
+   809	                    update_fields=update_fields,
+   810	                    unique_fields=unique_fields,
+   811	                )
+   812	                for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+   813	                    for result, field in zip(results, opts.db_returning_fields):
+   814	                        if field != opts.pk:
+   815	                            setattr(obj_with_pk, field.attname, result)
+   816	                for obj_with_pk in objs_with_pk:
+   817	                    obj_with_pk._state.adding = False
+   818	                    obj_with_pk._state.db = self.db
+   819	            if objs_without_pk:
+   820	                fields = [f for f in fields if not isinstance(f, AutoField)]
+   821	                returned_columns = self._batched_insert(
+   822	                    objs_without_pk,
+   823	                    fields,
+   824	                    batch_size,
+   825	                    on_conflict=on_conflict,
+   826	                    update_fields=update_fields,
+   827	                    unique_fields=unique_fields,
+   828	                )
+   829	                connection = connections[self.db]
+   830	                if (
+   831	                    connection.features.can_return_rows_from_bulk_insert
+   832	                    and on_conflict is None
+   833	                ):
+   834	                    assert len(returned_columns) == len(objs_without_pk)
+   835	                for obj_without_pk, results in zip(objs_without_pk, returned_columns):
+   836	                    for result, field in zip(results, opts.db_returning_fields):
+   837	                        setattr(obj_without_pk, field.attname, result)
+   838	                    obj_without_pk._state.adding = False
+   839	                    obj_without_pk._state.db = self.db
+   840	
+   841	        return objs
+
+
+This is the runtime information of QuerySet.bulk_create:
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/models/query.py
+New var:....... __module__ = 'django.db.models.query'
+New var:....... __qualname__ = 'QuerySet'
+New var:....... __doc__ = 'Represent a lazy database lookup for a set of objects.'
+New var:....... __init__ = <function QuerySet.__init__ at 0x7efce46df5e0>
+New var:....... query = <property object at 0x7efce46dad60>
+New var:....... as_manager = <classmethod object at 0x7efce46db730>
+New var:....... __deepcopy__ = <function QuerySet.__deepcopy__ at 0x7efce46df820>
+New var:....... __getstate__ = <function QuerySet.__getstate__ at 0x7efce46df8b0>
+New var:....... __setstate__ = <function QuerySet.__setstate__ at 0x7efce46df940>
+New var:....... __repr__ = <function QuerySet.__repr__ at 0x7efce46df9d0>
+New var:....... __len__ = <function QuerySet.__len__ at 0x7efce46dfa60>
+New var:....... __iter__ = <function QuerySet.__iter__ at 0x7efce46dfaf0>
+New var:....... __aiter__ = <function QuerySet.__aiter__ at 0x7efce46dfb80>
+New var:....... __bool__ = <function QuerySet.__bool__ at 0x7efce46dfc10>
+New var:....... __getitem__ = <function QuerySet.__getitem__ at 0x7efce46dfca0>
+New var:....... __class_getitem__ = <function QuerySet.__class_getitem__ at 0x7efce46dfd30>
+New var:....... __and__ = <function QuerySet.__and__ at 0x7efce46dfdc0>
+New var:....... __or__ = <function QuerySet.__or__ at 0x7efce46dfe50>
+New var:....... __xor__ = <function QuerySet.__xor__ at 0x7efce46dfee0>
+New var:....... _iterator = <function QuerySet._iterator at 0x7efce46dff70>
+New var:....... iterator = <function QuerySet.iterator at 0x7efce46e1040>
+New var:....... aiterator = <function QuerySet.aiterator at 0x7efce46e10d0>
+New var:....... aggregate = <function QuerySet.aggregate at 0x7efce46e1160>
+New var:....... aaggregate = <function QuerySet.aaggregate at 0x7efce46e11f0>
+New var:....... count = <function QuerySet.count at 0x7efce46e1280>
+New var:....... acount = <function QuerySet.acount at 0x7efce46e1310>
+New var:....... get = <function QuerySet.get at 0x7efce46e13a0>
+New var:....... aget = <function QuerySet.aget at 0x7efce46e1430>
+New var:....... create = <function QuerySet.create at 0x7efce46e14c0>
+New var:....... acreate = <function QuerySet.acreate at 0x7efce46e1550>
+New var:....... _prepare_for_bulk_create = <function QuerySet._prepare_for_bulk_create at 0x7efce46e15e0>
+New var:....... _check_bulk_create_options = <function QuerySet._check_bulk_create_options at 0x7efce46e1670>
+ line       746     def bulk_create(
+Starting var:.. self = <QuerySet []>
+Starting var:.. objs = [<ActivityBlackListed: ActivityBlackListed objec...vityBlackListed: ActivityBlackListed object (2)>]
+Starting var:.. batch_size = None
+Starting var:.. ignore_conflicts = False
+Starting var:.. update_conflicts = True
+Starting var:.. update_fields = ['sectorid']
+Starting var:.. unique_fields = ['blacklistid']
+ call       746     def bulk_create(
+ line       774         if batch_size is not None and batch_size <= 0:
+ line       780         for parent in self.model._meta.get_parent_list():
+ line       783         if not objs:
+ line       785         opts = self.model._meta
+New var:....... opts = <Options for ActivityBlackListed>
+ line       786         if unique_fields:
+ line       788             unique_fields = [
+ line       789                 opts.pk.name if name == "pk" else name for name in unique_fields
+ line       788             unique_fields = [
+    Starting var:.. .0 = <list_iterator object at 0x7efce3d1ccd0>
+    Starting var:.. opts = <Options for ActivityBlackListed>
+     call       788             unique_fields = [
+     line       788             unique_fields = [
+     line       789                 opts.pk.name if name == "pk" else name for name in unique_fields
+    New var:....... name = 'blacklistid'
+     line       788             unique_fields = [
+     return     788             unique_fields = [
+    Return value:.. ['blacklistid']
+ line       791         on_conflict = self._check_bulk_create_options(
+ line       792             ignore_conflicts,
+ line       793             update_conflicts,
+ line       794             update_fields,
+ line       795             unique_fields,
+ line       791         on_conflict = self._check_bulk_create_options(
+New var:....... on_conflict = <OnConflict.UPDATE: 'update'>
+ line       797         self._for_write = True
+ line       798         fields = opts.concrete_fields
+New var:....... fields = (<django.db.models.fields.IntegerField: blacklis...<django.db.models.fields.IntegerField: sectorid>)
+ line       799         objs = list(objs)
+ line       800         self._prepare_for_bulk_create(objs)
+ line       801         with transaction.atomic(using=self.db, savepoint=False):
+ line       802             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
+    Starting var:.. o = <ActivityBlackListed: ActivityBlackListed object (1)>
+     call       802             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
+     line       802             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
+     return     802             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
+    Return value:.. False
+    Starting var:.. o = <ActivityBlackListed: ActivityBlackListed object (2)>
+     call       802             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
+     line       802             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
+     return     802             objs_with_pk, objs_without_pk = partition(lambda o: o.pk is None, objs)
+    Return value:.. False
+New var:....... objs_with_pk = [<ActivityBlackListed: ActivityBlackListed objec...vityBlackListed: ActivityBlackListed object (2)>]
+New var:....... objs_without_pk = []
+ line       803             if objs_with_pk:
+ line       804                 returned_columns = self._batched_insert(
+ line       805                     objs_with_pk,
+ line       806                     fields,
+ line       807                     batch_size,
+ line       808                     on_conflict=on_conflict,
+ line       809                     update_fields=update_fields,
+ line       810                     unique_fields=unique_fields,
+ line       804                 returned_columns = self._batched_insert(
+Modified var:.. self = <QuerySet [<ActivityBlackListed: ActivityBlackLi...ityBlackListed: ActivityBlackListed object (2)>]>
+New var:....... returned_columns = []
+ line       812                 for obj_with_pk, results in zip(objs_with_pk, returned_columns):
+ line       816                 for obj_with_pk in objs_with_pk:
+New var:....... obj_with_pk = <ActivityBlackListed: ActivityBlackListed object (1)>
+ line       817                     obj_with_pk._state.adding = False
+ line       818                     obj_with_pk._state.db = self.db
+ line       816                 for obj_with_pk in objs_with_pk:
+Modified var:.. obj_with_pk = <ActivityBlackListed: ActivityBlackListed object (2)>
+ line       817                     obj_with_pk._state.adding = False
+ line       818                     obj_with_pk._state.db = self.db
+ line       816                 for obj_with_pk in objs_with_pk:
+ line       819             if objs_without_pk:
+ line       841         return objs
+ return     841         return objs
+Return value:.. [<ActivityBlackListed: ActivityBlackListed objec...vityBlackListed: ActivityBlackListed object (2)>]
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

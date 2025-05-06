@@ -1,0 +1,463 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **astropy** project:
+## ISSUE
+<ISSUE>
+In v5.3, NDDataRef mask propagation fails when one of the operand does not have a mask
+### Description
+
+This applies to v5.3. 
+
+It looks like when one of the operand does not have a mask, the mask propagation when doing arithmetic, in particular with `handle_mask=np.bitwise_or` fails.  This is not a problem in v5.2.
+
+I don't know enough about how all that works, but it seems from the error that the operand without a mask is set as a mask of None's and then the bitwise_or tries to operate on an integer and a None and fails.
+
+### Expected behavior
+
+When one of the operand does not have mask, the mask that exists should just be copied over to the output.  Or whatever was done in that situation in v5.2 where there's no problem.
+
+### How to Reproduce
+
+This is with v5.3.   With v5.2, there are no errors.
+
+```
+>>> import numpy as np
+>>> from astropy.nddata import NDDataRef
+
+>>> array = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
+>>> mask = np.array([[0, 1, 64], [8, 0, 1], [2, 1, 0]])
+
+>>> nref_nomask = NDDataRef(array)
+>>> nref_mask = NDDataRef(array, mask=mask)
+
+# multiply no mask by constant (no mask * no mask)
+>>> nref_nomask.multiply(1., handle_mask=np.bitwise_or).mask   # returns nothing, no mask,  OK
+
+# multiply no mask by itself (no mask * no mask)
+>>> nref_nomask.multiply(nref_nomask, handle_mask=np.bitwise_or).mask # return nothing, no mask, OK
+
+# multiply mask by constant (mask * no mask)
+>>> nref_mask.multiply(1., handle_mask=np.bitwise_or).mask
+...
+TypeError: unsupported operand type(s) for |: 'int' and 'NoneType'
+
+# multiply mask by itself (mask * mask)
+>>> nref_mask.multiply(nref_mask, handle_mask=np.bitwise_or).mask
+array([[ 0,  1, 64],
+       [ 8,  0,  1],
+       [ 2,  1,  0]])
+
+# multiply mask by no mask (mask * no mask)
+>>> nref_mask.multiply(nref_nomask, handle_mask=np.bitwise_or).mask
+...
+TypeError: unsupported operand type(s) for |: 'int' and 'NoneType'
+```
+
+
+### Versions
+
+>>> import sys; print("Python", sys.version)
+Python 3.10.11 | packaged by conda-forge | (main, May 10 2023, 19:07:22) [Clang 14.0.6 ]
+>>> import astropy; print("astropy", astropy.__version__)
+astropy 5.3
+>>> import numpy; print("Numpy", numpy.__version__)
+Numpy 1.24.3
+>>> import erfa; print("pyerfa", erfa.__version__)
+pyerfa 2.0.0.3
+>>> import scipy; print("Scipy", scipy.__version__)
+Scipy 1.10.1
+>>> import matplotlib; print("Matplotlib", matplotlib.__version__)
+Matplotlib 3.7.1
+
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import numpy as np
+from astropy.nddata import NDDataRef
+import traceback
+import sys
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+def main():
+    array = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
+    mask = np.array([[0, 1, 64], [8, 0, 1], [2, 1, 0]])
+
+    nref_nomask = NDDataRef(array)
+    nref_mask = NDDataRef(array, mask=mask)
+
+    # Test cases that should not raise an error
+    try:
+        assert nref_nomask.multiply(1., handle_mask=np.bitwise_or).mask is None
+        assert nref_nomask.multiply(nref_nomask, handle_mask=np.bitwise_or).mask is None
+        assert np.array_equal(nref_mask.multiply(nref_mask, handle_mask=np.bitwise_or).mask, mask)
+    except AssertionError as e:
+        print_stacktrace(e)
+        raise
+
+    # Test cases that should raise an error
+    try:
+        nref_mask.multiply(1., handle_mask=np.bitwise_or).mask
+    except TypeError as e:
+        print_stacktrace(e)
+        raise AssertionError("Test case 'multiply mask by constant (mask * no mask)' failed with TypeError") from e
+
+    try:
+        nref_mask.multiply(nref_nomask, handle_mask=np.bitwise_or).mask
+    except TypeError as e:
+        print_stacktrace(e)
+        raise AssertionError("Test case 'multiply mask by no mask (mask * no mask)' failed with TypeError") from e
+
+if __name__ == "__main__":
+    main()
+
+
+This is the tracing and analysis history:
+
+==================================================
+The error trace indicates that the issue lies in how masks are being handled when one operand lacks a mask. The problematic operation involves a `TypeError: unsupported operand type(s) for |: 'int' and 'NoneType'` which suggests an attempt to bitwise OR a mask containing `None` (no mask) with an integer.
+
+The relevant portion of the traceback is:
+- `File ".../astropy/nddata/mixins/ndarithmetic.py", line 527, in _arithmetic_mask`
+  - `return handle_mask(self.mask, operand.mask, **kwds)`
+
+This suggests that `self.mask` or `operand.mask` is `None`, and `np.bitwise_or`, which is used as the `handle_mask` function, cannot handle `None` as an input.
+
+In order to address this, let's focus on the `_arithmetic_mask` method, where the operation involving `handle_mask` is conducted. We need to verify how masks are being prepared when one operand lacks a mask, particularly in version 5.3.
+
+Observed method: `astropy/nddata/mixins/ndarithmetic.py:_arithmetic_mask`
+==================================================
+Based on the issue analysis and the trace of the method `NDArithmeticMixin._arithmetic_mask`, it appears that there is a misunderstanding or mishandling of the mask when one of the operands does not have a mask. The objective is to replicate a functional behavior similar to v5.2, where the problem does not occur.
+
+The relevant code section seems to be around line 527 where `handle_mask(self.mask, operand.mask, **kwds)` is executed. This line performs a masking operation utilizing the handle_mask parameter. The error occurs because there is an attempt to bitwise OR `None` with an integer, indicating that the mask of an operand might be `None`, but the method does not properly address this when `handle_mask` is executed.
+
+### Potential Issue
+- **Lines 515-527**: This block checks the presence of masks and determines what to return. The logic fails to correctly process when one mask is missing (`None`). Instead of ensuring handle_mask does not process a `None` type, it passes it to an operation which results in the TypeError.
+
+Given this is the area where the mishandling is likely happening, let's focus on where masks are checked and returned, especially in conditions that lead to line 527 being executed.
+
+### Candidate Method for Fix
+The candidate for a possible error is within this method. Let’s investigate the following section to understand the handling more deeply.
+
+### Observed Code Scope
+To further trace and determine the precise buggy code, I'll concentrate on the lines handling mask existence and propagation:
+
+```plaintext
+Observed scope: `astropy/nddata/mixins/ndarithmetic.py:515-527`
+```
+
+In this scope, I’ll examine the precise paths that are taken given inputs with and without masks to identify where the logic fails to properly handle `None`.
+==================================================
+Based on the analysis of the observed code snippet from the `NDArithmeticMixin._arithmetic_mask` method, the TypeError arises due to the mishandling of `None` masks during arithmetic operations. The relevant code lines deal with the decision-making process depending on whether the operands have masks or not:
+
+1. Lines 516-518: If neither operand has a mask, or `handle_mask` is `None`, return `None`.
+2. Line 520-522: If `self` lacks a mask but the operand has one, return a deep copy of the operand's mask.
+3. Line 523: If the operand is `None`, return a deep copy of `self.mask`.
+4. Line 526-527: When both operands have masks, apply `handle_mask`.
+
+The issue occurs in the condition handling around lines 520-524. The check for `handle_mask` happens in line 518. The operation fails because it doesn't properly manage when one mask is `None` and attempts a `bitwise_or`, leading to a `TypeError`.
+
+- `line 519` returns `None` for the maskless condition.
+- Handling starts failing from `line 522` might incorrectly lead to `line 527` execution.
+
+### Immediate Suspect Area:
+Given that failure occurs when `handle_mask` is set to `np.bitwise_or`, attention should be directed toward lines 520-524 and their conditions. Specifically, how the method doesn't correctly exclude `None` during the mask application on `line 527`.
+
+### Conclusion:
+The logic, which is trying to handle cases for different combinations of masks (either operand, neither, or both), isn't catering to all possible scenarios and combinations (especially switching from v5.2 logic to v5.3). 
+
+I need to explore the adjustment logic introduced in `v5.3` concerning how it previously handled `None` and `bitwise_or`.
+
+Given this context, I need to look beyond `_arithmetic_mask` in handling scenarios or the effect that might have been overlooked in `v5.3`.
+
+Observed method: `astropy/nddata/mixins/ndarithmetic.py:NDArithmeticMixin.multiply`
+==================================================
+### Analysis of Current Observed Code and Abnormal Program Behavior
+
+The observed method `NDArithmeticMixin.multiply` at lines 617-620 is a simple wrapper that calls another method `_prepare_then_do_arithmetic` with the `np.multiply` operation along with operands and any additional arguments (`kwargs`).
+
+Given the traceback and the error presented, the `multiply` method itself is not directly responsible for handling masks. Instead, it abstracts over the `_prepare_then_do_arithmetic` method, which should handle the intricacies of arithmetic operations including mask management.
+
+### Recent Observation:
+- The `multiply` method itself is straightforward, doing nothing more than delegating the multiplication task.
+- The error occurrence and failure to handle scenarios where one operand might lack a mask isn't within the `multiply` method context, meaning we need to observe further how the `_prepare_then_do_arithmetic` manages input data and operations, particularly focusing on mask handling.
+
+### Conclusion:
+The problem likely resides where the actual operation and handling logic occur, deeper within `_prepare_then_do_arithmetic`.
+
+### Next Steps:
+To locate the root cause of the issue concerning mask handling during arithmetic operations, it would be pertinent to trace operations in `_prepare_then_do_arithmetic`. This method will likely include the logic for invoking `_arithmetic_mask`, which is the last place we identified the mishandling of `None` masks.
+
+### Observed Scope:
+To effectively trace the abnormal behavior in mask handling, let's delve deeper into the implementation details, particularly looking into:
+- **Relevant Preparatory or Execution Operations**: `_prepare_then_do_arithmetic` must handle or prepare operands to execute arithmetic logic safely.
+
+To verify how we transition from preparation to mask handling:
+```plaintext
+Observed scope: `astropy/nddata/mixins/ndarithmetic.py:_prepare_then_do_arithmetic`
+```
+
+This will allow us to uncover how data is being managed before reaching the problematic point identified earlier in `_arithmetic_mask`.
+==================================================
+### Analysis of Current Observed Code and Abnormal Program Behavior
+
+In the method `_prepare_then_do_arithmetic`, the logic primarily involves setting up the operands for arithmetic operations based on whether the function is called on an instance or as a class method. The code in this method sets `operand` and `operand2` appropriately, ensuring they are instances of the class before passing them to the `_arithmetic` function for the actual computation.
+
+#### Observations:
+
+1. **Handling of Operands**: 
+   - Lines 690-719: Assigns correct references to `cls`, `operand`, and `operand2`, based on whether the method is called on an instance or class. This ensures the operands are correctly prepared for arithmetic operations.
+
+2. **Entry to Arithmetic Logic**:
+   - Lines 720-740: This section checks if `operand2` is a subclass of `NDArithmeticMixin`. This distinction affects which `_arithmetic` method will be invoked.
+
+3. **Invoke Arithmetic Operation**:
+   - Lines 730-747: Calls `_arithmetic` method using processed `operand` and `operand2`. This is where the mask operations eventually propagate through.
+
+#### Potential Issue:
+   - The observed method itself does not directly manipulate masks but directs flow towards `_arithmetic`, suggesting that any improper handling of masks or misaligned flow of logic could surface there.
+
+Given that the error occurs when `_arithmetic` involves a `bitwise_or` operation on masks that contains `None`, it's likely the actual bug resides deeper in how masks are handled inside `_arithmetic`.
+
+### Conclusion:
+
+The setup and call to arithmetic operations in `_prepare_then_do_arithmetic` should be revisited where conditions surrounding invocation pathways might pass a `None` mask into situations that `bitwise_or` cannot handle. However, the critical mask handling and combining logic are inside `_arithmetic`.
+
+### Next Steps:
+
+Let's delve deeper into the logic specifically handling arithmetic operations, focusing primarily on how masks are managed during these operations. The next logical step is to trace the `_arithmetic` function and see how it handles mask propagation.
+
+### Observed Scope:
+
+```plaintext
+Observed scope: `astropy/nddata/mixins/ndarithmetic.py:_arithmetic`
+```
+
+This line scope will likely contain the flow involving masks and calling functions such as `np.bitwise_or` where the TypeError is occurring. We need to inspect its logic further to identify potential mishandling of operands with missing masks.
+==================================================
+
+
+Now you choose downstream method NDArithmeticMixin._arithmetic to further observe, tracing the abnormal program behavior.
+This is the method code:
+   166	    def _arithmetic(
+   167	        self,
+   168	        operation,
+   169	        operand,
+   170	        propagate_uncertainties=True,
+   171	        handle_mask=np.logical_or,
+   172	        handle_meta=None,
+   173	        uncertainty_correlation=0,
+   174	        compare_wcs="first_found",
+   175	        operation_ignores_mask=False,
+   176	        axis=None,
+   177	        **kwds,
+   178	    ):
+   179	        """
+   180	        Base method which calculates the result of the arithmetic operation.
+   181	
+   182	        This method determines the result of the arithmetic operation on the
+   183	        ``data`` including their units and then forwards to other methods
+   184	        to calculate the other properties for the result (like uncertainty).
+   185	
+   186	        Parameters
+   187	        ----------
+   188	        operation : callable
+   189	            The operation that is performed on the `NDData`. Supported are
+   190	            `numpy.add`, `numpy.subtract`, `numpy.multiply` and
+   191	            `numpy.true_divide`.
+   192	
+   193	        operand : same type (class) as self
+   194	            see :meth:`NDArithmeticMixin.add`
+   195	
+   196	        propagate_uncertainties : `bool` or ``None``, optional
+   197	            see :meth:`NDArithmeticMixin.add`
+   198	
+   199	        handle_mask : callable, ``'first_found'`` or ``None``, optional
+   200	            see :meth:`NDArithmeticMixin.add`
+   201	
+   202	        handle_meta : callable, ``'first_found'`` or ``None``, optional
+   203	            see :meth:`NDArithmeticMixin.add`
+   204	
+   205	        compare_wcs : callable, ``'first_found'`` or ``None``, optional
+   206	            see :meth:`NDArithmeticMixin.add`
+   207	
+   208	        uncertainty_correlation : ``Number`` or `~numpy.ndarray`, optional
+   209	            see :meth:`NDArithmeticMixin.add`
+   210	
+   211	        operation_ignores_mask : bool, optional
+   212	            When True, masked values will be excluded from operations;
+   213	            otherwise the operation will be performed on all values,
+   214	            including masked ones.
+   215	
+   216	        axis : int or tuple of ints, optional
+   217	            axis or axes over which to perform collapse operations like min, max, sum or mean.
+   218	
+   219	        kwargs :
+   220	            Any other parameter that should be passed to the
+   221	            different :meth:`NDArithmeticMixin._arithmetic_mask` (or wcs, ...)
+   222	            methods.
+   223	
+   224	        Returns
+   225	        -------
+   226	        result : ndarray or `~astropy.units.Quantity`
+   227	            The resulting data as array (in case both operands were without
+   228	            unit) or as quantity if at least one had a unit.
+   229	
+   230	        kwargs : `dict`
+   231	            The kwargs should contain all the other attributes (besides data
+   232	            and unit) needed to create a new instance for the result. Creating
+   233	            the new instance is up to the calling method, for example
+   234	            :meth:`NDArithmeticMixin.add`.
+   235	
+   236	        """
+   237	        # Find the appropriate keywords for the appropriate method (not sure
+   238	        # if data and uncertainty are ever used ...)
+   239	        kwds2 = {"mask": {}, "meta": {}, "wcs": {}, "data": {}, "uncertainty": {}}
+   240	        for i in kwds:
+   241	            splitted = i.split("_", 1)
+   242	            try:
+   243	                kwds2[splitted[0]][splitted[1]] = kwds[i]
+   244	            except KeyError:
+   245	                raise KeyError(f"Unknown prefix {splitted[0]} for parameter {i}")
+   246	
+   247	        kwargs = {}
+   248	
+   249	        # First check that the WCS allows the arithmetic operation
+   250	        if compare_wcs is None:
+   251	            kwargs["wcs"] = None
+   252	        elif compare_wcs in ["ff", "first_found"]:
+   253	            if self.wcs is None and hasattr(operand, "wcs"):
+   254	                kwargs["wcs"] = deepcopy(operand.wcs)
+   255	            else:
+   256	                kwargs["wcs"] = deepcopy(self.wcs)
+   257	        else:
+   258	            kwargs["wcs"] = self._arithmetic_wcs(
+   259	                operation, operand, compare_wcs, **kwds2["wcs"]
+   260	            )
+   261	
+   262	        # collapse operations on masked quantities/arrays which are supported by
+   263	        # the astropy.utils.masked or np.ma modules should use those modules to
+   264	        # do the arithmetic on the data and propagate masks.
+   265	        use_masked_arith = operand is None and self.mask is not None
+   266	        if use_masked_arith:
+   267	            # if we're *including* masked values in the operation,
+   268	            # use the astropy Masked module:
+   269	            if not operation_ignores_mask:
+   270	                # call the numpy operation on a Masked NDDataArray
+   271	                # representation of the nddata, with units when available:
+   272	                if self.unit is not None and not hasattr(self.data, "unit"):
+   273	                    masked_input = Masked(self.data << self.unit, mask=self.mask)
+   274	                else:
+   275	                    masked_input = Masked(self.data, mask=self.mask)
+   276	            # if we're *excluding* masked values in the operation,
+   277	            # we use the numpy.ma module:
+   278	            else:
+   279	                masked_input = np.ma.masked_array(self.data, self.mask)
+   280	            result = operation(masked_input, axis=axis)
+   281	            # since result may be e.g. a float if operation is a sum over all axes,
+   282	            # let's ensure that result is a masked array, since we'll assume this later:
+   283	            if not hasattr(result, "mask"):
+   284	                result = np.ma.masked_array(
+   285	                    result, mask=np.zeros_like(result, dtype=bool)
+   286	                )
+   287	        else:
+   288	            # Then calculate the resulting data (which can but needs not be a
+   289	            # quantity)
+   290	            result = self._arithmetic_data(
+   291	                operation, operand, axis=axis, **kwds2["data"]
+   292	            )
+   293	
+   294	        # preserve original units
+   295	        if not hasattr(result, "unit") and hasattr(self, "unit"):
+   296	            kwargs["unit"] = self.unit
+   297	
+   298	        # Determine the other properties
+   299	        if propagate_uncertainties is None:
+   300	            kwargs["uncertainty"] = None
+   301	        elif not propagate_uncertainties:
+   302	            if self.uncertainty is None:
+   303	                kwargs["uncertainty"] = deepcopy(operand.uncertainty)
+   304	            else:
+   305	                kwargs["uncertainty"] = deepcopy(self.uncertainty)
+   306	        else:
+   307	            kwargs["uncertainty"] = self._arithmetic_uncertainty(
+   308	                operation,
+   309	                operand,
+   310	                result,
+   311	                uncertainty_correlation,
+   312	                axis=axis,
+   313	                **kwds2["uncertainty"],
+   314	            )
+   315	
+   316	        # If both are None, there is nothing to do.
+   317	        if self.psf is not None or (operand is not None and operand.psf is not None):
+   318	            warnings.warn(
+   319	                f"Not setting psf attribute during {operation.__name__}.",
+   320	                AstropyUserWarning,
+   321	            )
+   322	
+   323	        if handle_mask is None:
+   324	            pass
+   325	        elif hasattr(result, "mask"):
+   326	            # if numpy.ma or astropy.utils.masked is being used, the constructor
+   327	            # will pick up the mask from the masked object:
+   328	            kwargs["mask"] = None
+   329	        elif handle_mask in ["ff", "first_found"]:
+   330	            if self.mask is None:
+   331	                kwargs["mask"] = deepcopy(operand.mask)
+   332	            else:
+   333	                kwargs["mask"] = deepcopy(self.mask)
+   334	        else:
+   335	            kwargs["mask"] = self._arithmetic_mask(
+   336	                operation, operand, handle_mask, axis=axis, **kwds2["mask"]
+   337	            )
+   338	
+   339	        if handle_meta is None:
+   340	            kwargs["meta"] = None
+   341	        elif handle_meta in ["ff", "first_found"]:
+   342	            if not self.meta:
+   343	                kwargs["meta"] = deepcopy(operand.meta)
+   344	            else:
+   345	                kwargs["meta"] = deepcopy(self.meta)
+   346	        else:
+   347	            kwargs["meta"] = self._arithmetic_meta(
+   348	                operation, operand, handle_meta, **kwds2["meta"]
+   349	            )
+   350	
+   351	        # Wrap the individual results into a new instance of the same class.
+   352	        return result, kwargs
+
+
+This is the runtime information of NDArithmeticMixin._arithmetic:
+
+Traceback (most recent call last):
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 38, in <module>
+    debugging_test_execution_wrapper(args.test_path, file_scope_dict, args.depth, args.loop)
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 13, in debugging_test_execution_wrapper
+    @dbgsnooper.snoop(file_scope_dict=file_scope_dict, depth=depth, loop=loop)
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 249, in __init__
+    assert os.path.exists(file_path)
+AssertionError
+
+ERROR conda.cli.main_run:execute(125): `conda run python run_debugging_test.py --test-path /data/swe-fl/TMP/testbed/astropy__astropy-14995/reproduce.py --file-scope-dict {"/data/swe-fl/SRC/DebuggingAgent/src/astropy/nddata/mixins/ndarithmetic.py": [166, 352]} --depth 1` failed. (See above for error)
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

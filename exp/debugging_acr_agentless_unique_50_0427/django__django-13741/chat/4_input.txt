@@ -1,0 +1,147 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Set disabled prop on ReadOnlyPasswordHashField
+Description
+	
+Currently the django.contrib.auth.forms.UserChangeForm defines a clean_password method that returns the initial password value to prevent (accidental) changes to the password value. It is also documented that custom forms for the User model need to define this method: ​https://docs.djangoproject.com/en/3.1/topics/auth/customizing/#a-full-example
+A while ago the forms.Field base class gained the ​disabled argument to:
+[disable] a form field using the disabled HTML attribute so that it won’t be editable by users. Even if a user tampers with the field’s value submitted to the server, it will be ignored in favor of the value from the form’s initial data.
+It seems to me that this property could be set to True be default on the ReadOnlyPasswordHashField used to display the password hash. This way the clean_password is no longer necessary and the potential pitfall when using the ReadOnlyPasswordHashField without implementing clean_password is removed.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'test_settings')
+
+import django
+django.setup()
+
+from django.contrib.auth.forms import UserChangeForm, ReadOnlyPasswordHashField
+from django.test import TestCase
+from django.contrib.auth.models import User
+
+class TestReadOnlyPasswordHashField(TestCase):
+    def test_disabled_by_default(self):
+        # Test that the field is disabled by default
+        field = ReadOnlyPasswordHashField()
+        self.assertTrue(field.disabled)
+
+    def test_disabled_can_be_overridden(self):
+        # Test that disabled can be overridden if needed
+        field = ReadOnlyPasswordHashField(disabled=False)
+        self.assertFalse(field.disabled)
+
+    def test_field_in_user_change_form(self):
+        # Create a test user
+        user = User.objects.create_user(username='testuser', password='testpass')
+        
+        # Create the form with the user instance
+        form = UserChangeForm(instance=user)
+        
+        # Check that the password field is disabled
+        self.assertTrue(form.fields['password'].disabled)
+        
+        # Check that the field is a ReadOnlyPasswordHashField
+        self.assertIsInstance(form.fields['password'], ReadOnlyPasswordHashField)
+        
+        # Test submitting a new password value (should be ignored)
+        data = {
+            'username': 'testuser',
+            'password': 'newpassword',  # This should be ignored
+            'date_joined': user.date_joined.strftime('%Y-%m-%d %H:%M:%S'),
+            'last_login': user.last_login.strftime('%Y-%m-%d %H:%M:%S') if user.last_login else '',
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'is_active': user.is_active,
+            'is_staff': user.is_staff,
+            'is_superuser': user.is_superuser,
+        }
+        form = UserChangeForm(data, instance=user)
+        if not form.is_valid():
+            print("Form errors:", form.errors)
+        self.assertTrue(form.is_valid())
+        
+        # Save the form and verify the password hasn't changed
+        form.save()
+        user.refresh_from_db()
+        self.assertTrue(user.check_password('testpass'))  # Original password still works
+
+if __name__ == '__main__':
+    import django
+    django.setup()
+    from django.test.runner import DiscoverRunner
+    test_runner = DiscoverRunner(verbosity=2)
+    failures = test_runner.run_tests(['__main__'])
+    if failures:
+        print("Tests failed!")
+    else:
+        print("All tests passed!")
+
+
+This is the tracing and analysis history:
+
+==================================================
+The current observed code snippet imports the `django` module and attempts to run `django.setup()`. This requires Django settings to be properly configured. The error message indicates that the script tries to set the `DJANGO_SETTINGS_MODULE` environment variable to `'test_settings'`, but there is no module named `'test_settings'`, resulting in a `ModuleNotFoundError`.
+
+This is causing the initial setup of Django to fail because it cannot find a settings module, which is necessary for configuring Django before using its components, such as models and forms.
+
+Considering the error and where it originates from in the traceback:
+
+- The error occurs during the `django.setup()` call, which is part of the script to configure Django.
+- The missing `'test_settings'` module is the root cause of the error, preventing Django from initializing properly.
+
+Before moving directly to the buggy method to implement the fix regarding the disabled property, we must first resolve the testing environment issue using appropriate settings.
+
+Observed method: `django/conf/__init__.py:LazySettings._setup`
+==================================================
+
+
+Now you choose downstream method LazySettings._setup to further observe, tracing the abnormal program behavior.
+This is the method code:
+    55	    def _setup(self, name=None):
+    56	        """
+    57	        Load the settings module pointed to by the environment variable. This
+    58	        is used the first time settings are needed, if the user hasn't
+    59	        configured settings manually.
+    60	        """
+    61	        settings_module = os.environ.get(ENVIRONMENT_VARIABLE)
+    62	        if not settings_module:
+    63	            desc = ("setting %s" % name) if name else "settings"
+    64	            raise ImproperlyConfigured(
+    65	                "Requested %s, but settings are not configured. "
+    66	                "You must either define the environment variable %s "
+    67	                "or call settings.configure() before accessing settings."
+    68	                % (desc, ENVIRONMENT_VARIABLE))
+    69	
+    70	        self._wrapped = Settings(settings_module)
+
+
+This is the runtime information of LazySettings._setup:
+
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 38, in <module>
+    debugging_test_execution_wrapper(args.test_path, file_scope_dict, args.depth, args.loop)
+  File "run_debugging_test.py", line 13, in debugging_test_execution_wrapper
+    @dbgsnooper.snoop(file_scope_dict=file_scope_dict, depth=depth, loop=loop)
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 249, in __init__
+    assert os.path.exists(file_path)
+AssertionError
+
+ERROR conda.cli.main_run:execute(125): `conda run python run_debugging_test.py --test-path /data/swe-fl/TMP/testbed/django__django-13741/reproduce.py --file-scope-dict {"/data/swe-fl/SRC/DebuggingAgent/src/django/conf/__init__.py": [55, 70]} --depth 1` failed. (See above for error)
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

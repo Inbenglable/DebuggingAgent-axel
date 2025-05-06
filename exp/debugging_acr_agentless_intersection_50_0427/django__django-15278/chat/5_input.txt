@@ -1,0 +1,711 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is its debugging history:
+
+==================================================
+The current issue is related to the erroneous usage of an attribute in the test script used to reproduce the problem where adding a nullable `OneToOneField` causes an error in SQLite. Specifically, the following abnormalities are observed:
+
+1. **ImportError**: The script tries to use `migrations.OneToOneField`, which results in an `AttributeError` because there is no such attribute in `django.db.migrations`. Instead, it should be using `models.OneToOneField` to define fields in a migration.
+
+The error in the migration class definition indicates a misunderstanding or typo in using Django's ORM APIs.
+
+Given these observations, the likely location for this error is not within the Django source code itself but within the test script provided (`reproduce.py`). We'll need to correct the import and usage to properly test for the original SQLite issue.
+
+Buggy method: `reproduce.py:Migration`
+==================================================
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+The issue involves handling nullable `OneToOneField` migrations in SQLite, with a problem arising in the test script (`reproduce.py`). We have identified that the incorrect attribute and import was `migrations.OneToOneField` instead of `models.OneToOneField`. Additionally, there's a direct issue with how SQLite handles adding nullable unique columns through migrations.
+
+To generate the patch, we need to:
+1. Confirm and obtain the related migration setup code where `models.OneToOneField` is used.
+2. Review any significant changes or handling in the core Django migration code or the specific behavior of SQLite migrations affecting `OneToOneField`. Given that the error might extend into how `django` handles migrations specifically with SQLite, reviewing any `ALTER TABLE` behavior in migrations related to SQLite might also be necessary.
+
+Let's retrieve the relevant migration-related sources to make these adjustments properly:
+
+```python
+search_method_in_file("django/db/backends/sqlite3/base.py", "execute")
+search_method_in_codebase("AddField")
+search_method_in_codebase("OneToOneField")
+search_code_in_codebase("ALTER TABLE")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("django/db/backends/sqlite3/base.py", "execute")
+RESULT:
+#### django/db/backends/sqlite3/base.py:SQLiteCursorWrapper.execute
+```python
+    def execute(self, query, params=None):
+        if params is None:
+            return Database.Cursor.execute(self, query)
+        query = self.convert_query(query)
+        return Database.Cursor.execute(self, query, params)
+
+```
+
+
+### API INVOKE: search_method_in_codebase("AddField")
+RESULT:
+#### django/db/migrations/operations/fields.py:AddField
+```python
+class AddField(FieldOperation):
+    """Add a field to a model."""
+
+    def __init__(self, model_name, name, field, preserve_default=True):
+        self.preserve_default = preserve_default
+        super().__init__(model_name, name, field)
+
+    def deconstruct(self):
+        kwargs = {
+            'model_name': self.model_name,
+            'name': self.name,
+            'field': self.field,
+        }
+        if self.preserve_default is not True:
+            kwargs['preserve_default'] = self.preserve_default
+        return (
+            self.__class__.__name__,
+            [],
+            kwargs
+        )
+
+    def state_forwards(self, app_label, state):
+        state.add_field(
+            app_label,
+            self.model_name_lower,
+            self.name,
+            self.field,
+            self.preserve_default,
+        )
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        to_model = to_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
+            from_model = from_state.apps.get_model(app_label, self.model_name)
+            field = to_model._meta.get_field(self.name)
+            if not self.preserve_default:
+                field.default = self.field.default
+            schema_editor.add_field(
+                from_model,
+                field,
+            )
+            if not self.preserve_default:
+                field.default = NOT_PROVIDED
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        from_model = from_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, from_model):
+            schema_editor.remove_field(from_model, from_model._meta.get_field(self.name))
+
+    def describe(self):
+        return "Add field %s to %s" % (self.name, self.model_name)
+
+    @property
+    def migration_name_fragment(self):
+        return '%s_%s' % (self.model_name_lower, self.name_lower)
+
+    def reduce(self, operation, app_label):
+        if isinstance(operation, FieldOperation) and self.is_same_field_operation(operation):
+            if isinstance(operation, AlterField):
+                return [
+                    AddField(
+                        model_name=self.model_name,
+                        name=operation.name,
+                        field=operation.field,
+                    ),
+                ]
+            elif isinstance(operation, RemoveField):
+                return []
+            elif isinstance(operation, RenameField):
+                return [
+                    AddField(
+                        model_name=self.model_name,
+                        name=operation.new_name,
+                        field=self.field,
+                    ),
+                ]
+        return super().reduce(operation, app_label)
+
+```
+
+
+### API INVOKE: search_method_in_codebase("OneToOneField")
+RESULT:
+#### django/db/models/fields/related.py:OneToOneField
+```python
+class OneToOneField(ForeignKey):
+    """
+    A OneToOneField is essentially the same as a ForeignKey, with the exception
+    that it always carries a "unique" constraint with it and the reverse
+    relation always returns the object pointed to (since there will only ever
+    be one), rather than returning a list.
+    """
+
+    # Field flags
+    many_to_many = False
+    many_to_one = False
+    one_to_many = False
+    one_to_one = True
+
+    related_accessor_class = ReverseOneToOneDescriptor
+    forward_related_accessor_class = ForwardOneToOneDescriptor
+    rel_class = OneToOneRel
+
+    description = _("One-to-one relationship")
+
+    def __init__(self, to, on_delete, to_field=None, **kwargs):
+        kwargs['unique'] = True
+        super().__init__(to, on_delete, to_field=to_field, **kwargs)
+
+    def deconstruct(self):
+        name, path, args, kwargs = super().deconstruct()
+        if "unique" in kwargs:
+            del kwargs['unique']
+        return name, path, args, kwargs
+
+    def formfield(self, **kwargs):
+        if self.remote_field.parent_link:
+            return None
+        return super().formfield(**kwargs)
+
+    def save_form_data(self, instance, data):
+        if isinstance(data, self.remote_field.model):
+            setattr(instance, self.name, data)
+        else:
+            setattr(instance, self.attname, data)
+            # Remote field object must be cleared otherwise Model.save()
+            # will reassign attname using the related object pk.
+            if data is None:
+                setattr(instance, self.name, data)
+
+    def _check_unique(self, **kwargs):
+        # Override ForeignKey since check isn't applicable here.
+        return []
+
+```
+
+
+==================================================
+
+Your Output:
+To address the issue, we need to understand how `SchemaEditor` handles adding fields to tables specifically in SQLite, as we encountered an `OperationalError` when attempting to add a `OneToOneField`. It appears that a direct `ALTER TABLE` statement fails when introducing a nullable unique constraint, which might need some internal handling or a workaround, like creating a new table with the desired schema and migrating data.
+
+Given this, I need to examine the `add_field` method in the `BaseDatabaseSchemaEditor` class or its SQLite-specific subclass, as this is typically where managing such operations occurs. This involves reviewing how field addition is executed within a migration with SQLite, and possibly handling or emulating an existing workaround for adding UNIQUE fields safely.
+
+I will proceed to retrieve the source code for `add_field` in the suspected relevant files:
+
+```python
+search_method_in_file("django/db/backends/sqlite3/schema.py", "add_field")
+search_class_in_codebase("BaseDatabaseSchemaEditor")
+search_class_in_file("django/db/backends/sqlite3/schema.py", "DatabaseSchemaEditor")
+```
+
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("django/db/backends/sqlite3/schema.py", "add_field")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """Create a field on a model."""
+        # Fields with default values cannot by handled by ALTER TABLE ADD
+        # COLUMN statement because DROP DEFAULT is not supported in
+        # ALTER TABLE.
+        if not field.null or self.effective_default(field) is not None:
+            self._remake_table(model, create_field=field)
+        else:
+            super().add_field(model, field)
+
+```
+
+
+### API INVOKE: search_class_in_codebase("BaseDatabaseSchemaEditor")
+RESULT:
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor
+```python
+class BaseDatabaseSchemaEditor:
+    """
+    This class and its subclasses are responsible for emitting schema-changing
+    statements to the databases - model creation/removal/alteration, field
+    renaming, index fiddling, and so on.
+    """
+
+    # Overrideable SQL templates
+    sql_create_table = "CREATE TABLE %(table)s (%(definition)s)"
+    sql_rename_table = "ALTER TABLE %(old_table)s RENAME TO %(new_table)s"
+    sql_retablespace_table = "ALTER TABLE %(table)s SET TABLESPACE %(new_tablespace)s"
+    sql_delete_table = "DROP TABLE %(table)s CASCADE"
+
+    sql_create_column = "ALTER TABLE %(table)s ADD COLUMN %(column)s %(definition)s"
+    sql_alter_column = "ALTER TABLE %(table)s %(changes)s"
+    sql_alter_column_type = "ALTER COLUMN %(column)s TYPE %(type)s"
+    sql_alter_column_null = "ALTER COLUMN %(column)s DROP NOT NULL"
+    sql_alter_column_not_null = "ALTER COLUMN %(column)s SET NOT NULL"
+    sql_alter_column_default = "ALTER COLUMN %(column)s SET DEFAULT %(default)s"
+    sql_alter_column_no_default = "ALTER COLUMN %(column)s DROP DEFAULT"
+    sql_alter_column_no_default_null = sql_alter_column_no_default
+    sql_alter_column_collate = "ALTER COLUMN %(column)s TYPE %(type)s%(collation)s"
+    sql_delete_column = "ALTER TABLE %(table)s DROP COLUMN %(column)s CASCADE"
+    sql_rename_column = "ALTER TABLE %(table)s RENAME COLUMN %(old_column)s TO %(new_column)s"
+    sql_update_with_default = "UPDATE %(table)s SET %(column)s = %(default)s WHERE %(column)s IS NULL"
+
+    sql_unique_constraint = "UNIQUE (%(columns)s)%(deferrable)s"
+    sql_check_constraint = "CHECK (%(check)s)"
+    sql_delete_constraint = "ALTER TABLE %(table)s DROP CONSTRAINT %(name)s"
+    sql_constraint = "CONSTRAINT %(name)s %(constraint)s"
+
+    sql_create_check = "ALTER TABLE %(table)s ADD CONSTRAINT %(name)s CHECK (%(check)s)"
+    sql_delete_check = sql_delete_constraint
+
+    sql_create_unique = "ALTER TABLE %(table)s ADD CONSTRAINT %(name)s UNIQUE (%(columns)s)%(deferrable)s"
+    sql_delete_unique = sql_delete_constraint
+
+    sql_create_fk = (
+        "ALTER TABLE %(table)s ADD CONSTRAINT %(name)s FOREIGN KEY (%(column)s) "
+        "REFERENCES %(to_table)s (%(to_column)s)%(deferrable)s"
+    )
+    sql_create_inline_fk = None
+    sql_create_column_inline_fk = None
+    sql_delete_fk = sql_delete_constraint
+
+    sql_create_index = "CREATE INDEX %(name)s ON %(table)s (%(columns)s)%(include)s%(extra)s%(condition)s"
+    sql_create_unique_index = "CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)%(include)s%(condition)s"
+    sql_delete_index = "DROP INDEX %(name)s"
+
+    sql_create_pk = "ALTER TABLE %(table)s ADD CONSTRAINT %(name)s PRIMARY KEY (%(columns)s)"
+    sql_delete_pk = sql_delete_constraint
+
+    sql_delete_procedure = 'DROP PROCEDURE %(procedure)s'
+
+    def __init__(self, connection, collect_sql=False, atomic=True):
+        ...
+
+    # State-managing methods
+
+    def __enter__(self):
+        ...
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        ...
+
+    # Core utility functions
+
+    def execute(self, sql, params=()):
+        ...
+
+    def quote_name(self, name):
+        ...
+
+    def table_sql(self, model):
+        ...
+
+    # Field <-> database mapping functions
+
+    def _iter_column_sql(self, column_db_type, params, model, field, include_default):
+        ...
+
+    def column_sql(self, model, field, include_default=False):
+        ...
+
+    def skip_default(self, field):
+        ...
+
+    def skip_default_on_alter(self, field):
+        ...
+
+    def prepare_default(self, value):
+        ...
+
+    def _column_default_sql(self, field):
+        ...
+
+    @staticmethod
+    def _effective_default(field):
+        ...
+
+    def effective_default(self, field):
+        ...
+
+    def quote_value(self, value):
+        ...
+
+    # Actions
+
+    def create_model(self, model):
+        ...
+
+    def delete_model(self, model):
+        ...
+
+    def add_index(self, model, index):
+        ...
+
+    def remove_index(self, model, index):
+        ...
+
+    def add_constraint(self, model, constraint):
+        ...
+
+    def remove_constraint(self, model, constraint):
+        ...
+
+    def alter_unique_together(self, model, old_unique_together, new_unique_together):
+        ...
+
+    def alter_index_together(self, model, old_index_together, new_index_together):
+        ...
+
+    def _delete_composed_index(self, model, fields, constraint_kwargs, sql):
+        ...
+
+    def alter_db_table(self, model, old_db_table, new_db_table):
+        ...
+
+    def alter_db_tablespace(self, model, old_db_tablespace, new_db_tablespace):
+        ...
+
+    def add_field(self, model, field):
+        ...
+
+    def remove_field(self, model, field):
+        ...
+
+    def alter_field(self, model, old_field, new_field, strict=False):
+        ...
+
+    def _alter_field(self, model, old_field, new_field, old_type, new_type,
+        ...
+
+    def _alter_column_null_sql(self, model, old_field, new_field):
+        ...
+
+    def _alter_column_default_sql(self, model, old_field, new_field, drop=False):
+        ...
+
+    def _alter_column_type_sql(self, model, old_field, new_field, new_type):
+        ...
+
+    def _alter_column_collation_sql(self, model, new_field, new_type, new_collation):
+        ...
+
+    def _alter_many_to_many(self, model, old_field, new_field, strict):
+        ...
+
+    def _create_index_name(self, table_name, column_names, suffix=""):
+        ...
+
+    def _get_index_tablespace_sql(self, model, fields, db_tablespace=None):
+        ...
+
+    def _index_condition_sql(self, condition):
+        ...
+
+    def _index_include_sql(self, model, columns):
+        ...
+
+    def _create_index_sql(self, model, *, fields=None, name=None, suffix='', using='',
+        ...
+
+    def _delete_index_sql(self, model, name, sql=None):
+        ...
+
+    def _index_columns(self, table, columns, col_suffixes, opclasses):
+        ...
+
+    def _model_indexes_sql(self, model):
+        ...
+
+    def _field_indexes_sql(self, model, field):
+        ...
+
+    def _field_should_be_altered(self, old_field, new_field):
+        ...
+
+    def _field_should_be_indexed(self, model, field):
+        ...
+
+    def _field_became_primary_key(self, old_field, new_field):
+        ...
+
+    def _unique_should_be_added(self, old_field, new_field):
+        ...
+
+    def _rename_field_sql(self, table, old_field, new_field, new_type):
+        ...
+
+    def _create_fk_sql(self, model, field, suffix):
+        ...
+
+    def _fk_constraint_name(self, model, field, suffix):
+        ...
+
+    def _delete_fk_sql(self, model, name):
+        ...
+
+    def _deferrable_constraint_sql(self, deferrable):
+        ...
+
+    def _unique_sql(
+        ...
+
+    ):
+        if (
+            deferrable and
+            not self.connection.features.supports_deferrable_unique_constraints
+        ):
+            return None
+        if condition or include or opclasses or expressions:
+            # Databases support conditional, covering, and functional unique
+            # constraints via a unique index.
+            sql = self._create_unique_sql(
+                model,
+                fields,
+                name=name,
+                condition=condition,
+                include=include,
+                opclasses=opclasses,
+                expressions=expressions,
+            )
+            if sql:
+                self.deferred_sql.append(sql)
+            return None
+        constraint = self.sql_unique_constraint % {
+            'columns': ', '.join([self.quote_name(field.column) for field in fields]),
+            'deferrable': self._deferrable_constraint_sql(deferrable),
+        }
+        return self.sql_constraint % {
+            'name': self.quote_name(name),
+            'constraint': constraint,
+        }
+
+    def _create_unique_sql(
+        ...
+
+    ):
+        if (
+            (
+                deferrable and
+                not self.connection.features.supports_deferrable_unique_constraints
+            ) or
+            (condition and not self.connection.features.supports_partial_indexes) or
+            (include and not self.connection.features.supports_covering_indexes) or
+            (expressions and not self.connection.features.supports_expression_indexes)
+        ):
+            return None
+
+        def create_unique_name(*args, **kwargs):
+            ...
+
+        compiler = Query(model, alias_cols=False).get_compiler(connection=self.connection)
+        table = model._meta.db_table
+        columns = [field.column for field in fields]
+        if name is None:
+            name = IndexName(table, columns, '_uniq', create_unique_name)
+        else:
+            name = self.quote_name(name)
+        if condition or include or opclasses or expressions:
+            sql = self.sql_create_unique_index
+        else:
+            sql = self.sql_create_unique
+        if columns:
+            columns = self._index_columns(table, columns, col_suffixes=(), opclasses=opclasses)
+        else:
+            columns = Expressions(table, expressions, compiler, self.quote_value)
+        return Statement(
+            sql,
+            table=Table(table, self.quote_name),
+            name=name,
+            columns=columns,
+            condition=self._index_condition_sql(condition),
+            deferrable=self._deferrable_constraint_sql(deferrable),
+            include=self._index_include_sql(model, include),
+        )
+
+    def _delete_unique_sql(
+        ...
+
+    ):
+        if (
+            (
+                deferrable and
+                not self.connection.features.supports_deferrable_unique_constraints
+            ) or
+            (condition and not self.connection.features.supports_partial_indexes) or
+            (include and not self.connection.features.supports_covering_indexes) or
+            (expressions and not self.connection.features.supports_expression_indexes)
+
+        ):
+            return None
+        if condition or include or opclasses or expressions:
+            sql = self.sql_delete_index
+        else:
+            sql = self.sql_delete_unique
+        return self._delete_constraint_sql(sql, model, name)
+
+    def _check_sql(self, name, check):
+        ...
+
+    def _create_check_sql(self, model, name, check):
+        ...
+
+    def _delete_check_sql(self, model, name):
+        ...
+
+    def _delete_constraint_sql(self, template, model, name):
+        ...
+
+    def _constraint_names(self, model, column_names=None, unique=None,
+        ...
+
+    def _delete_primary_key(self, model, strict=False):
+        ...
+
+    def _create_primary_key_sql(self, model, field):
+        ...
+
+    def _delete_primary_key_sql(self, model, name):
+        ...
+
+    def _collate_sql(self, collation):
+        ...
+
+    def remove_procedure(self, procedure_name, param_types=()):
+        ...
+```
+
+
+### API INVOKE: search_class_in_file("django/db/backends/sqlite3/schema.py", "DatabaseSchemaEditor")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor
+```python
+class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+
+    sql_delete_table = "DROP TABLE %(table)s"
+    sql_create_fk = None
+    sql_create_inline_fk = "REFERENCES %(to_table)s (%(to_column)s) DEFERRABLE INITIALLY DEFERRED"
+    sql_create_column_inline_fk = sql_create_inline_fk
+    sql_create_unique = "CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)"
+    sql_delete_unique = "DROP INDEX %(name)s"
+
+    def __enter__(self):
+        ...
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        ...
+
+    def quote_value(self, value):
+        ...
+
+    def prepare_default(self, value):
+        ...
+
+    def _is_referenced_by_fk_constraint(self, table_name, column_name=None, ignore_self=False):
+        ...
+
+    def alter_db_table(self, model, old_db_table, new_db_table, disable_constraints=True):
+        ...
+
+    def alter_field(self, model, old_field, new_field, strict=False):
+        ...
+
+    def _remake_table(self, model, create_field=None, delete_field=None, alter_field=None):
+        ...
+
+    def delete_model(self, model, handle_autom2m=True):
+        ...
+
+    def add_field(self, model, field):
+        ...
+
+    def remove_field(self, model, field):
+        ...
+
+    def _alter_field(self, model, old_field, new_field, old_type, new_type,
+        ...
+
+    def _alter_many_to_many(self, model, old_field, new_field, strict):
+        ...
+
+    def add_constraint(self, model, constraint):
+        ...
+
+    def remove_constraint(self, model, constraint):
+        ...
+
+    def _collate_sql(self, collation):
+        ...
+```
+
+
+==================================================
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+## IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+## IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

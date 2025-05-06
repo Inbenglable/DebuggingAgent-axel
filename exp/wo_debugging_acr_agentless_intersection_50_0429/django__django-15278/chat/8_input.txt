@@ -1,0 +1,423 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+To resolve this issue, we need to understand how Django handles database migrations when using SQLite. Specifically, we are interested in the process of adding a `OneToOneField` with `unique` constraints in the `ALTER TABLE` operation. The error message indicates that SQLite does not allow adding a UNIQUE column in an `ALTER TABLE` statement. 
+
+The solution will likely involve updating the migration logic for SQLite to handle this constraint differently. This may involve creating a new table or restructuring the way nullable unique fields are added.
+
+Before generating a patch, I need to review the source code related to:
+1. Django's migration operations concerning `AddField`.
+2. Any SQLite-specific handling of migration operations in Django.
+3. `OneToOneField` definition and related migration logic.
+
+Let's start by finding the relevant parts of the codebase to review the above points. 
+
+```python
+search_class_in_codebase("AddField")
+search_class_in_codebase("SQLiteSchemaEditor")
+search_class_in_codebase("OneToOneField")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_class_in_codebase("AddField")
+RESULT:
+#### django/db/migrations/operations/fields.py:AddField
+```python
+class AddField(FieldOperation):
+    """Add a field to a model."""
+
+    def __init__(self, model_name, name, field, preserve_default=True):
+        ...
+
+    def deconstruct(self):
+        ...
+
+    def state_forwards(self, app_label, state):
+        ...
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        ...
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        ...
+
+    def describe(self):
+        ...
+
+    @property
+    def migration_name_fragment(self):
+        ...
+
+    def reduce(self, operation, app_label):
+        ...
+```
+
+
+### API INVOKE: search_class_in_codebase("OneToOneField")
+RESULT:
+#### django/db/models/fields/related.py:OneToOneField
+```python
+class OneToOneField(ForeignKey):
+    """
+    A OneToOneField is essentially the same as a ForeignKey, with the exception
+    that it always carries a "unique" constraint with it and the reverse
+    relation always returns the object pointed to (since there will only ever
+    be one), rather than returning a list.
+    """
+
+    # Field flags
+    many_to_many = False
+    many_to_one = False
+    one_to_many = False
+    one_to_one = True
+
+    related_accessor_class = ReverseOneToOneDescriptor
+    forward_related_accessor_class = ForwardOneToOneDescriptor
+    rel_class = OneToOneRel
+
+    description = _("One-to-one relationship")
+
+    def __init__(self, to, on_delete, to_field=None, **kwargs):
+        ...
+
+    def deconstruct(self):
+        ...
+
+    def formfield(self, **kwargs):
+        ...
+
+    def save_form_data(self, instance, data):
+        ...
+
+    def _check_unique(self, **kwargs):
+        ...
+```
+
+
+==================================================
+
+Your Output:
+To resolve the issue, I need to review the implementation details of the `database_forwards` method in the `AddField` class and any SQLite-specific migration logic in Django, especially within the `SQLiteSchemaEditor`. This is to understand how fields with unique constraints are added in migrations.
+
+I'll start by retrieving the source code for the `database_forwards` method in the `AddField` class and inspect any SQLite-specific schema handling in the `SQLiteSchemaEditor`.
+
+```python
+search_method_in_file("django/db/migrations/operations/fields.py", "AddField.database_forwards")
+search_class_in_codebase("SQLiteSchemaEditor")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("django/db/migrations/operations/fields.py", "AddField.database_forwards")
+RESULT:
+#### django/db/migrations/operations/fields.py:AddField.database_forwards
+```python
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        to_model = to_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
+            from_model = from_state.apps.get_model(app_label, self.model_name)
+            field = to_model._meta.get_field(self.name)
+            if not self.preserve_default:
+                field.default = self.field.default
+            schema_editor.add_field(
+                from_model,
+                field,
+            )
+            if not self.preserve_default:
+                field.default = NOT_PROVIDED
+
+```
+
+
+==================================================
+
+Your Output:
+To proceed with generating the patch, I need to understand how `add_field` is handled in the `SQLiteSchemaEditor`. This involves inspecting the `SQLiteSchemaEditor.add_field` method to see if there's a special case for unique constraints, particularly since it's known that adding a UNIQUE column directly is not allowed in SQLite.
+
+Given the error and the process handled in `AddField.database_forwards`, gaining insight into the `SQLiteSchemaEditor` implementation is necessary.
+
+I'll retrieve the `add_field` method in the `SQLiteSchemaEditor` class to evaluate how fields, particularly unique columns, are added under SQLite specifically.
+
+```python
+search_method_in_codebase("SQLiteSchemaEditor.add_field")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("SQLiteSchemaEditor.add_field")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """Create a field on a model."""
+        # Fields with default values cannot by handled by ALTER TABLE ADD
+        # COLUMN statement because DROP DEFAULT is not supported in
+        # ALTER TABLE.
+        if not field.null or self.effective_default(field) is not None:
+            self._remake_table(model, create_field=field)
+        else:
+            super().add_field(model, field)
+
+```
+
+
+==================================================
+
+Your Output:
+The `add_field` method within the `SQLiteSchemaEditor` class already contains logic for handling fields with a default value or non-nullable fields by rebuilding the table via the `_remake_table` method. Given the issue with adding a unique column in SQLite, it could be that this logic needs to be extended or modified to also account for nullable fields with unique constraints. 
+
+Before generating a patch, I might need to understand how `_remake_table` functions, particularly with a focus on creating fields that carry unique constraints into consideration. Additionally, I need to confirm the handling of unique constraints in this method considering any necessary changes.
+
+I'll retrieve the `_remake_table` method in the `SQLiteSchemaEditor` to get full clarity on its potential handling for fields with unique constraints to make sure adjustments can be made effectively.
+
+```python
+search_method_in_file("django/db/backends/sqlite3/schema.py", "SQLiteSchemaEditor._remake_table")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("django/db/backends/sqlite3/schema.py", "SQLiteSchemaEditor._remake_table")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor._remake_table
+```python
+    def _remake_table(self, model, create_field=None, delete_field=None, alter_field=None):
+        """
+        Shortcut to transform a model from old_model into new_model
+
+        This follows the correct procedure to perform non-rename or column
+        addition operations based on SQLite's documentation
+
+        https://www.sqlite.org/lang_altertable.html#caution
+
+        The essential steps are:
+          1. Create a table with the updated definition called "new__app_model"
+          2. Copy the data from the existing "app_model" table to the new table
+          3. Drop the "app_model" table
+          4. Rename the "new__app_model" table to "app_model"
+          5. Restore any index of the previous "app_model" table.
+        """
+        # Self-referential fields must be recreated rather than copied from
+        # the old model to ensure their remote_field.field_name doesn't refer
+        # to an altered field.
+        def is_self_referential(f):
+            return f.is_relation and f.remote_field.model is model
+        # Work out the new fields dict / mapping
+        body = {
+            f.name: f.clone() if is_self_referential(f) else f
+            for f in model._meta.local_concrete_fields
+        }
+        # Since mapping might mix column names and default values,
+        # its values must be already quoted.
+        mapping = {f.column: self.quote_name(f.column) for f in model._meta.local_concrete_fields}
+        # This maps field names (not columns) for things like unique_together
+        rename_mapping = {}
+        # If any of the new or altered fields is introducing a new PK,
+        # remove the old one
+        restore_pk_field = None
+        if getattr(create_field, 'primary_key', False) or (
+                alter_field and getattr(alter_field[1], 'primary_key', False)):
+            for name, field in list(body.items()):
+                if field.primary_key:
+                    field.primary_key = False
+                    restore_pk_field = field
+                    if field.auto_created:
+                        del body[name]
+                        del mapping[field.column]
+        # Add in any created fields
+        if create_field:
+            body[create_field.name] = create_field
+            # Choose a default and insert it into the copy map
+            if not create_field.many_to_many and create_field.concrete:
+                mapping[create_field.column] = self.prepare_default(
+                    self.effective_default(create_field),
+                )
+        # Add in any altered fields
+        if alter_field:
+            old_field, new_field = alter_field
+            body.pop(old_field.name, None)
+            mapping.pop(old_field.column, None)
+            body[new_field.name] = new_field
+            if old_field.null and not new_field.null:
+                case_sql = "coalesce(%(col)s, %(default)s)" % {
+                    'col': self.quote_name(old_field.column),
+                    'default': self.prepare_default(self.effective_default(new_field)),
+                }
+                mapping[new_field.column] = case_sql
+            else:
+                mapping[new_field.column] = self.quote_name(old_field.column)
+            rename_mapping[old_field.name] = new_field.name
+        # Remove any deleted fields
+        if delete_field:
+            del body[delete_field.name]
+            del mapping[delete_field.column]
+            # Remove any implicit M2M tables
+            if delete_field.many_to_many and delete_field.remote_field.through._meta.auto_created:
+                return self.delete_model(delete_field.remote_field.through)
+        # Work inside a new app registry
+        apps = Apps()
+
+        # Work out the new value of unique_together, taking renames into
+        # account
+        unique_together = [
+            [rename_mapping.get(n, n) for n in unique]
+            for unique in model._meta.unique_together
+        ]
+
+        # Work out the new value for index_together, taking renames into
+        # account
+        index_together = [
+            [rename_mapping.get(n, n) for n in index]
+            for index in model._meta.index_together
+        ]
+
+        indexes = model._meta.indexes
+        if delete_field:
+            indexes = [
+                index for index in indexes
+                if delete_field.name not in index.fields
+            ]
+
+        constraints = list(model._meta.constraints)
+
+        # Provide isolated instances of the fields to the new model body so
+        # that the existing model's internals aren't interfered with when
+        # the dummy model is constructed.
+        body_copy = copy.deepcopy(body)
+
+        # Construct a new model with the new fields to allow self referential
+        # primary key to resolve to. This model won't ever be materialized as a
+        # table and solely exists for foreign key reference resolution purposes.
+        # This wouldn't be required if the schema editor was operating on model
+        # states instead of rendered models.
+        meta_contents = {
+            'app_label': model._meta.app_label,
+            'db_table': model._meta.db_table,
+            'unique_together': unique_together,
+            'index_together': index_together,
+            'indexes': indexes,
+            'constraints': constraints,
+            'apps': apps,
+        }
+        meta = type("Meta", (), meta_contents)
+        body_copy['Meta'] = meta
+        body_copy['__module__'] = model.__module__
+        type(model._meta.object_name, model.__bases__, body_copy)
+
+        # Construct a model with a renamed table name.
+        body_copy = copy.deepcopy(body)
+        meta_contents = {
+            'app_label': model._meta.app_label,
+            'db_table': 'new__%s' % strip_quotes(model._meta.db_table),
+            'unique_together': unique_together,
+            'index_together': index_together,
+            'indexes': indexes,
+            'constraints': constraints,
+            'apps': apps,
+        }
+        meta = type("Meta", (), meta_contents)
+        body_copy['Meta'] = meta
+        body_copy['__module__'] = model.__module__
+        new_model = type('New%s' % model._meta.object_name, model.__bases__, body_copy)
+
+        # Create a new table with the updated schema.
+        self.create_model(new_model)
+
+        # Copy data from the old table into the new table
+        self.execute("INSERT INTO %s (%s) SELECT %s FROM %s" % (
+            self.quote_name(new_model._meta.db_table),
+            ', '.join(self.quote_name(x) for x in mapping),
+            ', '.join(mapping.values()),
+            self.quote_name(model._meta.db_table),
+        ))
+
+        # Delete the old table to make way for the new
+        self.delete_model(model, handle_autom2m=False)
+
+        # Rename the new table to take way for the old
+        self.alter_db_table(
+            new_model, new_model._meta.db_table, model._meta.db_table,
+            disable_constraints=False,
+        )
+
+        # Run deferred SQL on correct table
+        for sql in self.deferred_sql:
+            self.execute(sql)
+        self.deferred_sql = []
+        # Fix any PK-removed field
+        if restore_pk_field:
+            restore_pk_field.primary_key = True
+
+```
+
+
+==================================================
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+## IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+## IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

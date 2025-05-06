@@ -1,0 +1,277 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **astropy** project:
+## ISSUE
+<ISSUE>
+units.quantity_input decorator fails for constructors with type hinted return value -> None
+### Summary
+I am using the `units.quantity_input` decorator with typing hints for constructors, however when I add the correct return value for the constructor (`None`) then I get an exception, because `None` has no attribute `to`.
+
+### Reproducer
+The issue can be reproduced with the following file:
+``` Python
+import astropy.units as u
+
+
+class PoC(object):
+
+    @u.quantity_input
+    def __init__(self, voltage: u.V) -> None:
+        pass
+
+
+if __name__ == '__main__':
+    poc = PoC(1.*u.V)
+```
+which results in the following error:
+```
+$ python3 poc.py
+Traceback (most recent call last):
+  File "poc.py", line 12, in <module>
+    poc = PoC(1.*u.V)
+  File "/usr/lib64/python3.6/site-packages/astropy/utils/decorators.py", line 868, in __init__
+    func = make_function_with_signature(func, name=name, **wrapped_args)
+  File "/usr/lib64/python3.6/site-packages/astropy/units/decorators.py", line 225, in wrapper
+    return return_.to(wrapped_signature.return_annotation)
+AttributeError: 'NoneType' object has no attribute 'to'
+```
+
+This has been tested on Fedora 27 with python 3.6.3, astropy 2.0.2 and numpy 1.13.3 all from Fedora's repository.
+
+### Workaround
+The issue can be circumvented by not adding the return type typing hint. Unfortunately, then a static type checker cannot infer that this function returns nothing.
+
+### Possible fix
+Maybe the decorator could explicitly check whether None is returned and then omit the unit check.
+
+</ISSUE>
+
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+To resolve the issue, I need to understand how the `quantity_input` decorator is implemented and where the error is occurring. Specifically, I'll be looking for the code that processes the return value and attempts to call the `.to` method on it. Let's start by searching for the relevant methods and classes in the `astropy` codebase related to this functionality.
+
+```python
+search_method_in_codebase("make_function_with_signature")
+search_method_in_codebase("quantity_input")
+search_method_in_codebase("return_")
+search_method_in_codebase("wrapper")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("make_function_with_signature")
+RESULT:
+#### astropy/utils/codegen.py:make_function_with_signature
+```python
+def make_function_with_signature(func, args=(), kwargs={}, varargs=None,
+                                 varkwargs=None, name=None):
+    """
+    Make a new function from an existing function but with the desired
+    signature.
+
+    The desired signature must of course be compatible with the arguments
+    actually accepted by the input function.
+
+    The ``args`` are strings that should be the names of the positional
+    arguments.  ``kwargs`` can map names of keyword arguments to their
+    default values.  It may be either a ``dict`` or a list of ``(keyword,
+    default)`` tuples.
+
+    If ``varargs`` is a string it is added to the positional arguments as
+    ``*<varargs>``.  Likewise ``varkwargs`` can be the name for a variable
+    keyword argument placeholder like ``**<varkwargs>``.
+
+    If not specified the name of the new function is taken from the original
+    function.  Otherwise, the ``name`` argument can be used to specify a new
+    name.
+
+    Note, the names may only be valid Python variable names.
+    """
+
+    pos_args = []
+    key_args = []
+
+    if isinstance(kwargs, dict):
+        iter_kwargs = kwargs.items()
+    else:
+        iter_kwargs = iter(kwargs)
+
+    # Check that all the argument names are valid
+    for item in itertools.chain(args, iter_kwargs):
+        if isinstance(item, tuple):
+            argname = item[0]
+            key_args.append(item)
+        else:
+            argname = item
+            pos_args.append(item)
+
+        if keyword.iskeyword(argname) or not _ARGNAME_RE.match(argname):
+            raise SyntaxError('invalid argument name: {0}'.format(argname))
+
+    for item in (varargs, varkwargs):
+        if item is not None:
+            if keyword.iskeyword(item) or not _ARGNAME_RE.match(item):
+                raise SyntaxError('invalid argument name: {0}'.format(item))
+
+    def_signature = [', '.join(pos_args)]
+
+    if varargs:
+        def_signature.append(', *{0}'.format(varargs))
+
+    call_signature = def_signature[:]
+
+    if name is None:
+        name = func.__name__
+
+    global_vars = {'__{0}__func'.format(name): func}
+    local_vars = {}
+    # Make local variables to handle setting the default args
+    for idx, item in enumerate(key_args):
+        key, value = item
+        default_var = '_kwargs{0}'.format(idx)
+        local_vars[default_var] = value
+        def_signature.append(', {0}={1}'.format(key, default_var))
+        call_signature.append(', {0}={0}'.format(key))
+
+    if varkwargs:
+        def_signature.append(', **{0}'.format(varkwargs))
+        call_signature.append(', **{0}'.format(varkwargs))
+
+    def_signature = ''.join(def_signature).lstrip(', ')
+    call_signature = ''.join(call_signature).lstrip(', ')
+
+    mod = find_current_module(2)
+    frm = inspect.currentframe().f_back
+
+    if mod:
+        filename = mod.__file__
+        modname = mod.__name__
+        if filename.endswith('.pyc'):
+            filename = os.path.splitext(filename)[0] + '.py'
+    else:
+        filename = '<string>'
+        modname = '__main__'
+
+    # Subtract 2 from the line number since the length of the template itself
+    # is two lines.  Therefore we have to subtract those off in order for the
+    # pointer in tracebacks from __{name}__func to point to the right spot.
+    lineno = frm.f_lineno - 2
+
+    # The lstrip is in case there were *no* positional arguments (a rare case)
+    # in any context this will actually be used...
+    template = textwrap.dedent("""{0}\
+    def {name}({sig1}):
+        return __{name}__func({sig2})
+    """.format('\n' * lineno, name=name, sig1=def_signature,
+               sig2=call_signature))
+
+    code = compile(template, filename, 'single')
+
+    eval(code, global_vars, local_vars)
+
+    new_func = local_vars[name]
+    new_func.__module__ = modname
+    new_func.__doc__ = func.__doc__
+
+    return new_func
+
+```
+
+
+==================================================
+
+Your Output:
+To resolve the issue, it is crucial to understand how the `quantity_input` decorator and the related processing (likely within `make_function_with_signature` or similar functionality) handle return values. We need to inspect the method that is directly related to this error, which seems to be wrapped by a decorator that incorrectly checks return values for constructors.
+
+I'll start by looking into the `quantity_input` method's implementation to determine how it handles return annotations. Additionally, I will explore the affected code paths from the traceback: `astropy/utils/decorators.py` and `astropy/units/decorators.py`.
+
+```python
+search_method_in_codebase("quantity_input")
+search_code_in_file("astropy/utils/decorators.py", "def __init__")
+search_code_in_file("astropy/units/decorators.py", "return_.to(wrapped_signature.return_annotation)")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_code_in_file("astropy/utils/decorators.py", "def __init__")
+RESULT:
+#### astropy/utils/decorators.py:697-703
+```python
+    http://code.activestate.com/recipes/363602-lazy-property-evaluation
+    """
+
+    def __init__(self, fget, fset=None, fdel=None, doc=None):
+        super().__init__(fget, fset, fdel, doc)
+        self._key = self.fget.__name__
+
+```
+
+#### astropy/utils/decorators.py:697-703
+```python
+    http://code.activestate.com/recipes/363602-lazy-property-evaluation
+    """
+
+    def __init__(self, fget, fset=None, fdel=None, doc=None):
+        super().__init__(fget, fset, fdel, doc)
+        self._key = self.fget.__name__
+
+```
+
+
+### API INVOKE: search_code_in_file("astropy/units/decorators.py", "return_.to(wrapped_signature.return_annotation)")
+RESULT:
+#### astropy/units/decorators.py:221-227
+```python
+            with add_enabled_equivalencies(self.equivalencies):
+                return_ = wrapped_function(*func_args, **func_kwargs)
+            if wrapped_signature.return_annotation is not inspect.Signature.empty:
+                return return_.to(wrapped_signature.return_annotation)
+            else:
+                return return_
+
+```
+
+
+==================================================
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+## IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+## IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

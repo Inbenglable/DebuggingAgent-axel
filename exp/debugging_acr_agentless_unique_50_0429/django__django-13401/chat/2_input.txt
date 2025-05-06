@@ -1,0 +1,876 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Abstract model field should not be equal across models
+Description
+	
+Consider the following models:
+class A(models.Model):
+	class Meta:
+		abstract = True
+	myfield = IntegerField()
+class B(A):
+	pass
+class C(A):
+	pass
+If I pull the fields of B and C into a shared set, one will be de-duplicated away, because they compare as equal. I found this surprising, though in practice using a list was sufficient for my need. The root of the issue is that they compare equal, as fields only consider self.creation_counter when comparing for equality.
+len({B._meta.get_field('myfield'), C._meta.get_field('myfield')}) == 1
+B._meta.get_field('myfield') == C._meta.get_field('myfield')
+We should adjust __eq__ so that if the field.model is different, they will compare unequal. Similarly, it is probably wise to adjust __hash__ and __lt__ to match.
+When adjusting __lt__, it may be wise to order first by self.creation_counter so that cases not affected by this equality collision won't be re-ordered. In my experimental branch, there was one test that broke if I ordered them by model first.
+I brought this up on IRC django-dev to check my intuitions, and those conversing with me there seemed to agree that the current behavior is not intuitive.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+from django.conf import settings
+from django.db import models
+from django.apps import apps
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Configure Django settings
+if not settings.configured:
+    settings.configure(
+        DEBUG=True,
+        DATABASES={
+            'default': {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': ':memory:',
+            }
+        },
+        INSTALLED_APPS=[
+            'django.contrib.contenttypes',
+        ],
+        SECRET_KEY='dummy',
+    )
+
+# Initialize Django application registry
+apps.populate(settings.INSTALLED_APPS)
+
+class A(models.Model):
+    class Meta:
+        abstract = True
+    myfield = models.IntegerField()
+
+class B(A):
+    pass
+
+class C(A):
+    pass
+
+def main():
+    field_b = B._meta.get_field('myfield')
+    field_c = C._meta.get_field('myfield')
+    
+    try:
+        # Check if the fields are considered equal
+        assert field_b != field_c, "Fields should not be equal"
+        # Check if the length of the set is 2 (indicating no de-duplication)
+        assert len({field_b, field_c}) == 2, "Set should contain two unique fields"
+    except AssertionError as e:
+        print_stacktrace(e)
+        sys.exit(1)
+    else:
+        print("Issue is fixed.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+
+
+This is the tracing and analysis history:
+
+==================================================
+The current issue arises because Django models `B` and `C` do not declare explicit app labels and do not belong to any application in `INSTALLED_APPS`. The error message indicates that Django is unable to identify the app to which these models belong.
+
+The reproducibility script attempts to configure Django settings and check whether two fields obtained from classes `B` and `C` are mistakenly seen as equal due to the issue with field equality. However, the script fails because the models `B` and `C` do not belong to any application in `INSTALLED_APPS`, which prevents their recognition as valid Django models.
+
+To resolve this issue, the test setup must include a dummy app under `INSTALLED_APPS` that these models can belong to, and perhaps assign explicit `app_label`s. This is crucial for testing the equality of fields across different models while ensuring model recognition and functionality within Django's ORM framework.
+
+Here's what can be discerned:
+
+1. The error `Model class __main__.B doesn't declare an explicit app_label and isn't in an application in INSTALLED_APPS.` indicates that the test environment hasn't properly configured these models as part of a Django application.
+2. This configuration error occurs in the model class instantiation process within `django/db/models/base.py` in the `ModelBase.__new__` method.
+
+Therefore, it is essential to locate and inspect the method responsible for model instantiation and configuration, especially the part dealing with `INSTALLED_APPS`.
+
+Observed method: `django/db/models/base.py:ModelBase.__new__`
+==================================================
+
+
+Now you choose downstream method ModelBase.__new__ to further observe, tracing the abnormal program behavior.
+This is the method code:
+    74	    def __new__(cls, name, bases, attrs, **kwargs):
+    75	        super_new = super().__new__
+    76	
+    77	        # Also ensure initialization is only performed for subclasses of Model
+    78	        # (excluding Model class itself).
+    79	        parents = [b for b in bases if isinstance(b, ModelBase)]
+    80	        if not parents:
+    81	            return super_new(cls, name, bases, attrs)
+    82	
+    83	        # Create the class.
+    84	        module = attrs.pop('__module__')
+    85	        new_attrs = {'__module__': module}
+    86	        classcell = attrs.pop('__classcell__', None)
+    87	        if classcell is not None:
+    88	            new_attrs['__classcell__'] = classcell
+    89	        attr_meta = attrs.pop('Meta', None)
+    90	        # Pass all attrs without a (Django-specific) contribute_to_class()
+    91	        # method to type.__new__() so that they're properly initialized
+    92	        # (i.e. __set_name__()).
+    93	        contributable_attrs = {}
+    94	        for obj_name, obj in attrs.items():
+    95	            if _has_contribute_to_class(obj):
+    96	                contributable_attrs[obj_name] = obj
+    97	            else:
+    98	                new_attrs[obj_name] = obj
+    99	        new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+   100	
+   101	        abstract = getattr(attr_meta, 'abstract', False)
+   102	        meta = attr_meta or getattr(new_class, 'Meta', None)
+   103	        base_meta = getattr(new_class, '_meta', None)
+   104	
+   105	        app_label = None
+   106	
+   107	        # Look for an application configuration to attach the model to.
+   108	        app_config = apps.get_containing_app_config(module)
+   109	
+   110	        if getattr(meta, 'app_label', None) is None:
+   111	            if app_config is None:
+   112	                if not abstract:
+   113	                    raise RuntimeError(
+   114	                        "Model class %s.%s doesn't declare an explicit "
+   115	                        "app_label and isn't in an application in "
+   116	                        "INSTALLED_APPS." % (module, name)
+   117	                    )
+   118	
+   119	            else:
+   120	                app_label = app_config.label
+   121	
+   122	        new_class.add_to_class('_meta', Options(meta, app_label))
+   123	        if not abstract:
+   124	            new_class.add_to_class(
+   125	                'DoesNotExist',
+   126	                subclass_exception(
+   127	                    'DoesNotExist',
+   128	                    tuple(
+   129	                        x.DoesNotExist for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+   130	                    ) or (ObjectDoesNotExist,),
+   131	                    module,
+   132	                    attached_to=new_class))
+   133	            new_class.add_to_class(
+   134	                'MultipleObjectsReturned',
+   135	                subclass_exception(
+   136	                    'MultipleObjectsReturned',
+   137	                    tuple(
+   138	                        x.MultipleObjectsReturned for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+   139	                    ) or (MultipleObjectsReturned,),
+   140	                    module,
+   141	                    attached_to=new_class))
+   142	            if base_meta and not base_meta.abstract:
+   143	                # Non-abstract child classes inherit some attributes from their
+   144	                # non-abstract parent (unless an ABC comes before it in the
+   145	                # method resolution order).
+   146	                if not hasattr(meta, 'ordering'):
+   147	                    new_class._meta.ordering = base_meta.ordering
+   148	                if not hasattr(meta, 'get_latest_by'):
+   149	                    new_class._meta.get_latest_by = base_meta.get_latest_by
+   150	
+   151	        is_proxy = new_class._meta.proxy
+   152	
+   153	        # If the model is a proxy, ensure that the base class
+   154	        # hasn't been swapped out.
+   155	        if is_proxy and base_meta and base_meta.swapped:
+   156	            raise TypeError("%s cannot proxy the swapped model '%s'." % (name, base_meta.swapped))
+   157	
+   158	        # Add remaining attributes (those with a contribute_to_class() method)
+   159	        # to the class.
+   160	        for obj_name, obj in contributable_attrs.items():
+   161	            new_class.add_to_class(obj_name, obj)
+   162	
+   163	        # All the fields of any type declared on this model
+   164	        new_fields = chain(
+   165	            new_class._meta.local_fields,
+   166	            new_class._meta.local_many_to_many,
+   167	            new_class._meta.private_fields
+   168	        )
+   169	        field_names = {f.name for f in new_fields}
+   170	
+   171	        # Basic setup for proxy models.
+   172	        if is_proxy:
+   173	            base = None
+   174	            for parent in [kls for kls in parents if hasattr(kls, '_meta')]:
+   175	                if parent._meta.abstract:
+   176	                    if parent._meta.fields:
+   177	                        raise TypeError(
+   178	                            "Abstract base class containing model fields not "
+   179	                            "permitted for proxy model '%s'." % name
+   180	                        )
+   181	                    else:
+   182	                        continue
+   183	                if base is None:
+   184	                    base = parent
+   185	                elif parent._meta.concrete_model is not base._meta.concrete_model:
+   186	                    raise TypeError("Proxy model '%s' has more than one non-abstract model base class." % name)
+   187	            if base is None:
+   188	                raise TypeError("Proxy model '%s' has no non-abstract model base class." % name)
+   189	            new_class._meta.setup_proxy(base)
+   190	            new_class._meta.concrete_model = base._meta.concrete_model
+   191	        else:
+   192	            new_class._meta.concrete_model = new_class
+   193	
+   194	        # Collect the parent links for multi-table inheritance.
+   195	        parent_links = {}
+   196	        for base in reversed([new_class] + parents):
+   197	            # Conceptually equivalent to `if base is Model`.
+   198	            if not hasattr(base, '_meta'):
+   199	                continue
+   200	            # Skip concrete parent classes.
+   201	            if base != new_class and not base._meta.abstract:
+   202	                continue
+   203	            # Locate OneToOneField instances.
+   204	            for field in base._meta.local_fields:
+   205	                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+   206	                    related = resolve_relation(new_class, field.remote_field.model)
+   207	                    parent_links[make_model_tuple(related)] = field
+   208	
+   209	        # Track fields inherited from base models.
+   210	        inherited_attributes = set()
+   211	        # Do the appropriate setup for any model parents.
+   212	        for base in new_class.mro():
+   213	            if base not in parents or not hasattr(base, '_meta'):
+   214	                # Things without _meta aren't functional models, so they're
+   215	                # uninteresting parents.
+   216	                inherited_attributes.update(base.__dict__)
+   217	                continue
+   218	
+   219	            parent_fields = base._meta.local_fields + base._meta.local_many_to_many
+   220	            if not base._meta.abstract:
+   221	                # Check for clashes between locally declared fields and those
+   222	                # on the base classes.
+   223	                for field in parent_fields:
+   224	                    if field.name in field_names:
+   225	                        raise FieldError(
+   226	                            'Local field %r in class %r clashes with field of '
+   227	                            'the same name from base class %r.' % (
+   228	                                field.name,
+   229	                                name,
+   230	                                base.__name__,
+   231	                            )
+   232	                        )
+   233	                    else:
+   234	                        inherited_attributes.add(field.name)
+   235	
+   236	                # Concrete classes...
+   237	                base = base._meta.concrete_model
+   238	                base_key = make_model_tuple(base)
+   239	                if base_key in parent_links:
+   240	                    field = parent_links[base_key]
+   241	                elif not is_proxy:
+   242	                    attr_name = '%s_ptr' % base._meta.model_name
+   243	                    field = OneToOneField(
+   244	                        base,
+   245	                        on_delete=CASCADE,
+   246	                        name=attr_name,
+   247	                        auto_created=True,
+   248	                        parent_link=True,
+   249	                    )
+   250	
+   251	                    if attr_name in field_names:
+   252	                        raise FieldError(
+   253	                            "Auto-generated field '%s' in class %r for "
+   254	                            "parent_link to base class %r clashes with "
+   255	                            "declared field of the same name." % (
+   256	                                attr_name,
+   257	                                name,
+   258	                                base.__name__,
+   259	                            )
+   260	                        )
+   261	
+   262	                    # Only add the ptr field if it's not already present;
+   263	                    # e.g. migrations will already have it specified
+   264	                    if not hasattr(new_class, attr_name):
+   265	                        new_class.add_to_class(attr_name, field)
+   266	                else:
+   267	                    field = None
+   268	                new_class._meta.parents[base] = field
+   269	            else:
+   270	                base_parents = base._meta.parents.copy()
+   271	
+   272	                # Add fields from abstract base class if it wasn't overridden.
+   273	                for field in parent_fields:
+   274	                    if (field.name not in field_names and
+   275	                            field.name not in new_class.__dict__ and
+   276	                            field.name not in inherited_attributes):
+   277	                        new_field = copy.deepcopy(field)
+   278	                        new_class.add_to_class(field.name, new_field)
+   279	                        # Replace parent links defined on this base by the new
+   280	                        # field. It will be appropriately resolved if required.
+   281	                        if field.one_to_one:
+   282	                            for parent, parent_link in base_parents.items():
+   283	                                if field == parent_link:
+   284	                                    base_parents[parent] = new_field
+   285	
+   286	                # Pass any non-abstract parent classes onto child.
+   287	                new_class._meta.parents.update(base_parents)
+   288	
+   289	            # Inherit private fields (like GenericForeignKey) from the parent
+   290	            # class
+   291	            for field in base._meta.private_fields:
+   292	                if field.name in field_names:
+   293	                    if not base._meta.abstract:
+   294	                        raise FieldError(
+   295	                            'Local field %r in class %r clashes with field of '
+   296	                            'the same name from base class %r.' % (
+   297	                                field.name,
+   298	                                name,
+   299	                                base.__name__,
+   300	                            )
+   301	                        )
+   302	                else:
+   303	                    field = copy.deepcopy(field)
+   304	                    if not base._meta.abstract:
+   305	                        field.mti_inherited = True
+   306	                    new_class.add_to_class(field.name, field)
+   307	
+   308	        # Copy indexes so that index names are unique when models extend an
+   309	        # abstract model.
+   310	        new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+   311	
+   312	        if abstract:
+   313	            # Abstract base models can't be instantiated and don't appear in
+   314	            # the list of models for an app. We do the final setup for them a
+   315	            # little differently from normal models.
+   316	            attr_meta.abstract = False
+   317	            new_class.Meta = attr_meta
+   318	            return new_class
+   319	
+   320	        new_class._prepare()
+   321	        new_class._meta.apps.register_model(new_class._meta.app_label, new_class)
+   322	        return new_class
+
+
+This is the runtime information of ModelBase.__new__:
+
+Error occurred during script execution:Model class __main__.B doesn't declare an explicit app_label and isn't in an application in INSTALLED_APPS.
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-13401/django/db/models/base.py
+New var:....... __module__ = 'django.db.models.base'
+New var:....... __qualname__ = 'ModelBase'
+New var:....... __doc__ = 'Metaclass for all models.'
+ line        74     def __new__(cls, name, bases, attrs, **kwargs):
+Starting var:.. cls = <class 'django.db.models.base.ModelBase'>
+Starting var:.. name = 'Model'
+Starting var:.. bases = ()
+Starting var:.. attrs = {'__module__': 'django.db.models.base', '__qualn...'__classcell__': <cell at 0x7f7d111dff18: empty>}
+Starting var:.. kwargs = {}
+Starting var:.. __class__ = <class 'django.db.models.base.ModelBase'>
+ call        74     def __new__(cls, name, bases, attrs, **kwargs):
+ line        75         super_new = super().__new__
+New var:....... super_new = <built-in method __new__ of type object at 0x558fdfdd6880>
+ line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    Starting var:.. .0 = <tuple_iterator object at 0x7f7d111cd198>
+     call        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+     line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+     return      79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    Return value:.. []
+New var:....... parents = []
+ line        80         if not parents:
+ line        81             return super_new(cls, name, bases, attrs)
+Modified var:.. attrs = {'__module__': 'django.db.models.base', '__qualn...f7d111dff18: ModelBase object at 0x558fe1508f78>}
+ return      81             return super_new(cls, name, bases, attrs)
+Return value:.. <class 'django.db.models.base.Model'>
+Starting var:.. cls = <class 'django.db.models.base.ModelBase'>
+Starting var:.. name = 'ContentType'
+Starting var:.. bases = (<class 'django.db.models.base.Model'>,)
+Starting var:.. attrs = {'__module__': 'django.contrib.contenttypes.mode...ction ContentType.natural_key at 0x7f7d1112aea0>}
+Starting var:.. kwargs = {}
+Starting var:.. __class__ = <class 'django.db.models.base.ModelBase'>
+ call        74     def __new__(cls, name, bases, attrs, **kwargs):
+ line        75         super_new = super().__new__
+New var:....... super_new = <built-in method __new__ of type object at 0x558fdfdd6880>
+ line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    Starting var:.. .0 = <tuple_iterator object at 0x7f7d1111ce48>
+     call        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+     line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    New var:....... b = <class 'django.db.models.base.Model'>
+     line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+     return      79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    Return value:.. [<class 'django.db.models.base.Model'>]
+New var:....... parents = [<class 'django.db.models.base.Model'>]
+ line        80         if not parents:
+ line        84         module = attrs.pop('__module__')
+Modified var:.. attrs = {'__qualname__': 'ContentType', 'app_label': <dj...ction ContentType.natural_key at 0x7f7d1112aea0>}
+New var:....... module = 'django.contrib.contenttypes.models'
+ line        85         new_attrs = {'__module__': module}
+New var:....... new_attrs = {'__module__': 'django.contrib.contenttypes.models'}
+ line        86         classcell = attrs.pop('__classcell__', None)
+New var:....... classcell = None
+ line        87         if classcell is not None:
+ line        89         attr_meta = attrs.pop('Meta', None)
+New var:....... attr_meta = <class 'django.contrib.contenttypes.models.ContentType.Meta'>
+ line        93         contributable_attrs = {}
+New var:....... contributable_attrs = {}
+ line        94         for obj_name, obj in attrs.items():
+New var:....... obj_name = '__qualname__'
+New var:....... obj = 'ContentType'
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': 'django.contrib.contenttypes.models', '__qualname__': 'ContentType'}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'app_label'
+Modified var:.. obj = <django.db.models.fields.CharField>
+ line        95             if _has_contribute_to_class(obj):
+ line        96                 contributable_attrs[obj_name] = obj
+Modified var:.. contributable_attrs = {'app_label': <django.db.models.fields.CharField>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'model'
+ line        95             if _has_contribute_to_class(obj):
+ line        96                 contributable_attrs[obj_name] = obj
+Modified var:.. contributable_attrs = {'app_label': <django.db.models.fields.CharField>, 'model': <django.db.models.fields.CharField>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'objects'
+Modified var:.. obj = <django.contrib.contenttypes.models.ContentTypeManager object at 0x7f7d1111ccc0>
+ line        95             if _has_contribute_to_class(obj):
+ line        96                 contributable_attrs[obj_name] = obj
+Modified var:.. contributable_attrs = {'app_label': <django.db.models.fields.CharField...els.ContentTypeManager object at 0x7f7d1111ccc0>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = '__str__'
+Modified var:.. obj = <function ContentType.__str__ at 0x7f7d1112ab70>
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': 'django.contrib.contenttypes.mode...<function ContentType.__str__ at 0x7f7d1112ab70>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'name'
+Modified var:.. obj = <property object at 0x7f7d11127c28>
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': 'django.contrib.contenttypes.mode...70>, 'name': <property object at 0x7f7d11127c28>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'app_labeled_name'
+Modified var:.. obj = <property object at 0x7f7d11127c78>
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': 'django.contrib.contenttypes.mode...beled_name': <property object at 0x7f7d11127c78>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'model_class'
+Modified var:.. obj = <function ContentType.model_class at 0x7f7d1112ad08>
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': 'django.contrib.contenttypes.mode...ction ContentType.model_class at 0x7f7d1112ad08>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'get_object_for_this_type'
+Modified var:.. obj = <function ContentType.get_object_for_this_type at 0x7f7d1112ad90>
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': 'django.contrib.contenttypes.mode...Type.get_object_for_this_type at 0x7f7d1112ad90>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'get_all_objects_for_this_type'
+Modified var:.. obj = <function ContentType.get_all_objects_for_this_type at 0x7f7d1112ae18>
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': 'django.contrib.contenttypes.mode...get_all_objects_for_this_type at 0x7f7d1112ae18>}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'natural_key'
+Modified var:.. obj = <function ContentType.natural_key at 0x7f7d1112aea0>
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': 'django.contrib.contenttypes.mode...ction ContentType.natural_key at 0x7f7d1112aea0>}
+ line        94         for obj_name, obj in attrs.items():
+ line        99         new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+New var:....... new_class = <class 'django.contrib.contenttypes.models.ContentType'>
+ line       101         abstract = getattr(attr_meta, 'abstract', False)
+New var:....... abstract = False
+ line       102         meta = attr_meta or getattr(new_class, 'Meta', None)
+New var:....... meta = <class 'django.contrib.contenttypes.models.ContentType.Meta'>
+ line       103         base_meta = getattr(new_class, '_meta', None)
+New var:....... base_meta = None
+ line       105         app_label = None
+New var:....... app_label = None
+ line       108         app_config = apps.get_containing_app_config(module)
+New var:....... app_config = <ContentTypesConfig: contenttypes>
+ line       110         if getattr(meta, 'app_label', None) is None:
+ line       111             if app_config is None:
+ line       120                 app_label = app_config.label
+Modified var:.. app_label = 'contenttypes'
+ line       122         new_class.add_to_class('_meta', Options(meta, app_label))
+ line       123         if not abstract:
+ line       124             new_class.add_to_class(
+ line       125                 'DoesNotExist',
+ line       126                 subclass_exception(
+ line       127                     'DoesNotExist',
+ line       128                     tuple(
+ line       129                         x.DoesNotExist for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+    Starting var:.. .0 = <list_iterator object at 0x7f7d1111ce48>
+     call       129                         x.DoesNotExist for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+     line       129                         x.DoesNotExist for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+    New var:....... x = <class 'django.db.models.base.Model'>
+     line       129                         x.DoesNotExist for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+     return     129                         x.DoesNotExist for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+    Return value:.. None
+ line       130                     ) or (ObjectDoesNotExist,),
+ line       131                     module,
+ line       132                     attached_to=new_class))
+ line       133             new_class.add_to_class(
+ line       134                 'MultipleObjectsReturned',
+ line       135                 subclass_exception(
+ line       136                     'MultipleObjectsReturned',
+ line       137                     tuple(
+ line       138                         x.MultipleObjectsReturned for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+    Starting var:.. .0 = <list_iterator object at 0x7f7d1111cf60>
+     call       138                         x.MultipleObjectsReturned for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+     line       138                         x.MultipleObjectsReturned for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+    New var:....... x = <class 'django.db.models.base.Model'>
+     line       138                         x.MultipleObjectsReturned for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+     return     138                         x.MultipleObjectsReturned for x in parents if hasattr(x, '_meta') and not x._meta.abstract
+    Return value:.. None
+ line       139                     ) or (MultipleObjectsReturned,),
+ line       140                     module,
+ line       141                     attached_to=new_class))
+ line       142             if base_meta and not base_meta.abstract:
+ line       151         is_proxy = new_class._meta.proxy
+New var:....... is_proxy = False
+ line       155         if is_proxy and base_meta and base_meta.swapped:
+ line       160         for obj_name, obj in contributable_attrs.items():
+Modified var:.. obj_name = 'app_label'
+Modified var:.. obj = <django.db.models.fields.CharField>
+ line       161             new_class.add_to_class(obj_name, obj)
+Modified var:.. obj = <django.db.models.fields.CharField: app_label>
+ line       160         for obj_name, obj in contributable_attrs.items():
+Modified var:.. obj_name = 'model'
+Modified var:.. obj = <django.db.models.fields.CharField>
+ line       161             new_class.add_to_class(obj_name, obj)
+Modified var:.. obj = <django.db.models.fields.CharField: model>
+ line       160         for obj_name, obj in contributable_attrs.items():
+Modified var:.. obj_name = 'objects'
+Modified var:.. obj = <django.contrib.contenttypes.models.ContentTypeManager object at 0x7f7d1111ccc0>
+ line       161             new_class.add_to_class(obj_name, obj)
+ line       160         for obj_name, obj in contributable_attrs.items():
+ line       164         new_fields = chain(
+ line       165             new_class._meta.local_fields,
+ line       166             new_class._meta.local_many_to_many,
+ line       167             new_class._meta.private_fields
+New var:....... new_fields = <itertools.chain object at 0x7f7d1111cf28>
+ line       169         field_names = {f.name for f in new_fields}
+    Starting var:.. .0 = <itertools.chain object at 0x7f7d1111cf28>
+     call       169         field_names = {f.name for f in new_fields}
+     line       169         field_names = {f.name for f in new_fields}
+    New var:....... f = <django.db.models.fields.CharField: app_label>
+     line       169         field_names = {f.name for f in new_fields}
+    Modified var:.. f = <django.db.models.fields.CharField: model>
+     line       169         field_names = {f.name for f in new_fields}
+     return     169         field_names = {f.name for f in new_fields}
+    Return value:.. {'app_label', 'model'}
+New var:....... field_names = {'app_label', 'model'}
+ line       172         if is_proxy:
+ line       192             new_class._meta.concrete_model = new_class
+ line       195         parent_links = {}
+New var:....... parent_links = {}
+ line       196         for base in reversed([new_class] + parents):
+New var:....... base = <class 'django.db.models.base.Model'>
+ line       198             if not hasattr(base, '_meta'):
+ line       199                 continue
+ line       196         for base in reversed([new_class] + parents):
+Modified var:.. base = <class 'django.contrib.contenttypes.models.ContentType'>
+ line       198             if not hasattr(base, '_meta'):
+ line       201             if base != new_class and not base._meta.abstract:
+ line       204             for field in base._meta.local_fields:
+New var:....... field = <django.db.models.fields.CharField: app_label>
+ line       205                 if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+ line       204             for field in base._meta.local_fields:
+Modified var:.. field = <django.db.models.fields.CharField: model>
+ line       205                 if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+ line       204             for field in base._meta.local_fields:
+ line       196         for base in reversed([new_class] + parents):
+ line       210         inherited_attributes = set()
+New var:....... inherited_attributes = set()
+ line       212         for base in new_class.mro():
+ line       213             if base not in parents or not hasattr(base, '_meta'):
+ line       216                 inherited_attributes.update(base.__dict__)
+Modified var:.. inherited_attributes = {'name', '_meta', 'app_label', 'objects', 'model..., 'app_labeled_name', 'get_object_for_this_type'}
+ line       217                 continue
+ line       212         for base in new_class.mro():
+Modified var:.. base = <class 'django.db.models.base.Model'>
+ line       213             if base not in parents or not hasattr(base, '_meta'):
+ line       216                 inherited_attributes.update(base.__dict__)
+Modified var:.. inherited_attributes = {'unique_error_message', '_check_m2m_through_sam...MultipleObjectsReturned', '_check_indexes', 'pk'}
+ line       217                 continue
+ line       212         for base in new_class.mro():
+Modified var:.. base = <class 'object'>
+ line       213             if base not in parents or not hasattr(base, '_meta'):
+ line       216                 inherited_attributes.update(base.__dict__)
+Modified var:.. inherited_attributes = {'_check_m2m_through_same_relationship', '_meta'...ectsReturned', '_check_indexes', '_save_parents'}
+ line       217                 continue
+ line       212         for base in new_class.mro():
+ line       310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+    Starting var:.. .0 = <list_iterator object at 0x7f7d11131208>
+     call       310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+     line       310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+     return     310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+    Return value:.. []
+ line       312         if abstract:
+ line       320         new_class._prepare()
+ line       321         new_class._meta.apps.register_model(new_class._meta.app_label, new_class)
+ line       322         return new_class
+ return     322         return new_class
+Return value:.. <class 'django.contrib.contenttypes.models.ContentType'>
+Starting var:.. cls = <class 'django.db.models.base.ModelBase'>
+Starting var:.. name = 'A'
+Starting var:.. bases = (<class 'django.db.models.base.Model'>,)
+Starting var:.. attrs = {'__module__': '__main__', '__qualname__': 'A', ...myfield': <django.db.models.fields.IntegerField>}
+Starting var:.. kwargs = {}
+Starting var:.. __class__ = <class 'django.db.models.base.ModelBase'>
+ call        74     def __new__(cls, name, bases, attrs, **kwargs):
+ line        75         super_new = super().__new__
+New var:....... super_new = <built-in method __new__ of type object at 0x558fdfdd6880>
+ line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    Starting var:.. .0 = <tuple_iterator object at 0x7f7d1111c9b0>
+     call        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+     line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    New var:....... b = <class 'django.db.models.base.Model'>
+     line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+     return      79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    Return value:.. [<class 'django.db.models.base.Model'>]
+New var:....... parents = [<class 'django.db.models.base.Model'>]
+ line        80         if not parents:
+ line        84         module = attrs.pop('__module__')
+Modified var:.. attrs = {'__qualname__': 'A', 'Meta': <class '__main__.A...myfield': <django.db.models.fields.IntegerField>}
+New var:....... module = '__main__'
+ line        85         new_attrs = {'__module__': module}
+New var:....... new_attrs = {'__module__': '__main__'}
+ line        86         classcell = attrs.pop('__classcell__', None)
+New var:....... classcell = None
+ line        87         if classcell is not None:
+ line        89         attr_meta = attrs.pop('Meta', None)
+Modified var:.. attrs = {'__qualname__': 'A', 'myfield': <django.db.models.fields.IntegerField>}
+New var:....... attr_meta = <class '__main__.A.Meta'>
+ line        93         contributable_attrs = {}
+New var:....... contributable_attrs = {}
+ line        94         for obj_name, obj in attrs.items():
+New var:....... obj_name = '__qualname__'
+New var:....... obj = 'A'
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': '__main__', '__qualname__': 'A'}
+ line        94         for obj_name, obj in attrs.items():
+Modified var:.. obj_name = 'myfield'
+Modified var:.. obj = <django.db.models.fields.IntegerField>
+ line        95             if _has_contribute_to_class(obj):
+ line        96                 contributable_attrs[obj_name] = obj
+Modified var:.. contributable_attrs = {'myfield': <django.db.models.fields.IntegerField>}
+ line        94         for obj_name, obj in attrs.items():
+ line        99         new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+New var:....... new_class = <class '__main__.A'>
+ line       101         abstract = getattr(attr_meta, 'abstract', False)
+New var:....... abstract = True
+ line       102         meta = attr_meta or getattr(new_class, 'Meta', None)
+New var:....... meta = <class '__main__.A.Meta'>
+ line       103         base_meta = getattr(new_class, '_meta', None)
+New var:....... base_meta = None
+ line       105         app_label = None
+New var:....... app_label = None
+ line       108         app_config = apps.get_containing_app_config(module)
+New var:....... app_config = None
+ line       110         if getattr(meta, 'app_label', None) is None:
+ line       111             if app_config is None:
+ line       112                 if not abstract:
+ line       122         new_class.add_to_class('_meta', Options(meta, app_label))
+ line       123         if not abstract:
+ line       151         is_proxy = new_class._meta.proxy
+New var:....... is_proxy = False
+ line       155         if is_proxy and base_meta and base_meta.swapped:
+ line       160         for obj_name, obj in contributable_attrs.items():
+ line       161             new_class.add_to_class(obj_name, obj)
+Modified var:.. attrs = {'__qualname__': 'A', 'myfield': <django.db.models.fields.IntegerField: myfield>}
+Modified var:.. contributable_attrs = {'myfield': <django.db.models.fields.IntegerField: myfield>}
+Modified var:.. obj = <django.db.models.fields.IntegerField: myfield>
+ line       160         for obj_name, obj in contributable_attrs.items():
+ line       164         new_fields = chain(
+ line       165             new_class._meta.local_fields,
+ line       166             new_class._meta.local_many_to_many,
+ line       167             new_class._meta.private_fields
+New var:....... new_fields = <itertools.chain object at 0x7f7d10e4ea58>
+ line       169         field_names = {f.name for f in new_fields}
+    Starting var:.. .0 = <itertools.chain object at 0x7f7d10e4ea58>
+     call       169         field_names = {f.name for f in new_fields}
+     line       169         field_names = {f.name for f in new_fields}
+    New var:....... f = <django.db.models.fields.IntegerField: myfield>
+     line       169         field_names = {f.name for f in new_fields}
+     return     169         field_names = {f.name for f in new_fields}
+    Return value:.. {'myfield'}
+New var:....... field_names = {'myfield'}
+ line       172         if is_proxy:
+ line       192             new_class._meta.concrete_model = new_class
+ line       195         parent_links = {}
+New var:....... parent_links = {}
+ line       196         for base in reversed([new_class] + parents):
+New var:....... base = <class 'django.db.models.base.Model'>
+ line       198             if not hasattr(base, '_meta'):
+ line       199                 continue
+ line       196         for base in reversed([new_class] + parents):
+Modified var:.. base = <class '__main__.A'>
+ line       198             if not hasattr(base, '_meta'):
+ line       201             if base != new_class and not base._meta.abstract:
+ line       204             for field in base._meta.local_fields:
+New var:....... field = <django.db.models.fields.IntegerField: myfield>
+ line       205                 if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+ line       204             for field in base._meta.local_fields:
+ line       196         for base in reversed([new_class] + parents):
+ line       210         inherited_attributes = set()
+New var:....... inherited_attributes = set()
+ line       212         for base in new_class.mro():
+ line       213             if base not in parents or not hasattr(base, '_meta'):
+ line       216                 inherited_attributes.update(base.__dict__)
+Modified var:.. inherited_attributes = {'__doc__', '__module__', '_meta', 'myfield'}
+ line       217                 continue
+ line       212         for base in new_class.mro():
+Modified var:.. base = <class 'django.db.models.base.Model'>
+ line       213             if base not in parents or not hasattr(base, '_meta'):
+ line       216                 inherited_attributes.update(base.__dict__)
+Modified var:.. inherited_attributes = {'unique_error_message', '_check_m2m_through_sam...heck_field_name_clashes', '_check_indexes', 'pk'}
+ line       217                 continue
+ line       212         for base in new_class.mro():
+Modified var:.. base = <class 'object'>
+ line       213             if base not in parents or not hasattr(base, '_meta'):
+ line       216                 inherited_attributes.update(base.__dict__)
+Modified var:.. inherited_attributes = {'unique_error_message', '_check_m2m_through_sam...name_clashes', '_check_indexes', '__new__', 'pk'}
+ line       217                 continue
+ line       212         for base in new_class.mro():
+ line       310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+    Starting var:.. .0 = <list_iterator object at 0x7f7d1111cf28>
+     call       310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+     line       310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+     return     310         new_class._meta.indexes = [copy.deepcopy(idx) for idx in new_class._meta.indexes]
+    Return value:.. []
+ line       312         if abstract:
+ line       316             attr_meta.abstract = False
+ line       317             new_class.Meta = attr_meta
+ line       318             return new_class
+ return     318             return new_class
+Return value:.. <class '__main__.A'>
+Starting var:.. cls = <class 'django.db.models.base.ModelBase'>
+Starting var:.. name = 'B'
+Starting var:.. bases = (<class '__main__.A'>,)
+Starting var:.. attrs = {'__module__': '__main__', '__qualname__': 'B'}
+Starting var:.. kwargs = {}
+Starting var:.. __class__ = <class 'django.db.models.base.ModelBase'>
+ call        74     def __new__(cls, name, bases, attrs, **kwargs):
+ line        75         super_new = super().__new__
+New var:....... super_new = <built-in method __new__ of type object at 0x558fdfdd6880>
+ line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    Starting var:.. .0 = <tuple_iterator object at 0x7f7d111310b8>
+     call        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+     line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    New var:....... b = <class '__main__.A'>
+     line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+     return      79         parents = [b for b in bases if isinstance(b, ModelBase)]
+    Return value:.. [<class '__main__.A'>]
+New var:....... parents = [<class '__main__.A'>]
+ line        80         if not parents:
+ line        84         module = attrs.pop('__module__')
+Modified var:.. attrs = {'__qualname__': 'B'}
+New var:....... module = '__main__'
+ line        85         new_attrs = {'__module__': module}
+New var:....... new_attrs = {'__module__': '__main__'}
+ line        86         classcell = attrs.pop('__classcell__', None)
+New var:....... classcell = None
+ line        87         if classcell is not None:
+ line        89         attr_meta = attrs.pop('Meta', None)
+New var:....... attr_meta = None
+ line        93         contributable_attrs = {}
+New var:....... contributable_attrs = {}
+ line        94         for obj_name, obj in attrs.items():
+New var:....... obj_name = '__qualname__'
+New var:....... obj = 'B'
+ line        95             if _has_contribute_to_class(obj):
+ line        98                 new_attrs[obj_name] = obj
+Modified var:.. new_attrs = {'__module__': '__main__', '__qualname__': 'B'}
+ line        94         for obj_name, obj in attrs.items():
+ line        99         new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+New var:....... new_class = <class '__main__.B'>
+ line       101         abstract = getattr(attr_meta, 'abstract', False)
+New var:....... abstract = False
+ line       102         meta = attr_meta or getattr(new_class, 'Meta', None)
+New var:....... meta = <class '__main__.A.Meta'>
+ line       103         base_meta = getattr(new_class, '_meta', None)
+New var:....... base_meta = <Options for A>
+ line       105         app_label = None
+New var:....... app_label = None
+ line       108         app_config = apps.get_containing_app_config(module)
+New var:....... app_config = None
+ line       110         if getattr(meta, 'app_label', None) is None:
+ line       111             if app_config is None:
+ line       112                 if not abstract:
+ line       113                     raise RuntimeError(
+ line       114                         "Model class %s.%s doesn't declare an explicit "
+ line       116                         "INSTALLED_APPS." % (module, name)
+ exception  116                         "INSTALLED_APPS." % (module, name)
+Exception:..... RuntimeError: Model class __main__.B doesn't dec...el and isn't in an application in INSTALLED_APPS.
+New var:....... cls = <class 'django.db.models.base.ModelBase'>
+New var:....... name = 'B'
+New var:....... bases = (<class '__main__.A'>,)
+New var:....... attrs = {'__qualname__': 'B'}
+New var:....... kwargs = {}
+New var:....... super_new = <built-in method __new__ of type object at 0x558fdfdd6880>
+New var:....... parents = [<class '__main__.A'>]
+New var:....... module = '__main__'
+New var:....... new_attrs = {'__module__': '__main__', '__qualname__': 'B'}
+New var:....... classcell = None
+New var:....... attr_meta = None
+New var:....... contributable_attrs = {}
+New var:....... obj_name = '__qualname__'
+New var:....... obj = 'B'
+New var:....... new_class = <class '__main__.B'>
+New var:....... abstract = False
+New var:....... meta = <class '__main__.A.Meta'>
+New var:....... base_meta = <Options for A>
+New var:....... app_label = None
+New var:....... app_config = None
+New var:....... __class__ = <class 'django.db.models.base.ModelBase'>
+Call ended by exception
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-13401/reproduce.py", line 42, in <module>
+    class B(A):
+  File "/data/swe-fl/TMP/testbed/django__django-13401/django/db/models/base.py", line 116, in __new__
+    "INSTALLED_APPS." % (module, name)
+RuntimeError: Model class __main__.B doesn't declare an explicit app_label and isn't in an application in INSTALLED_APPS.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

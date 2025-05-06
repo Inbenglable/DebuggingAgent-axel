@@ -1,0 +1,372 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Use proper whitespace in CREATE INDEX statements
+Description
+	 
+		(last modified by Hannes Ljungberg)
+	 
+Creating an index through:
+index = Index(
+	fields=['-name’],
+	name='idx'
+)
+Will generate the valid but not so pretty CREATE INDEX statement: 
+CREATE INDEX "idx" ON "schema_author" ("name"DESC)
+The following would be expected:
+CREATE INDEX "idx" ON "schema_author" ("name" DESC)
+This was partially fixed for indexes using opclasses in https://code.djangoproject.com/ticket/30903#ticket but it introduced a new quirk when opclasses is used without explicit ordering:
+index = Index(
+	fields=['name’],
+	name='idx'
+	opclasses=['text_pattern_ops’]
+)
+Will result in:
+CREATE INDEX "idx" ON "schema_author" (“name” text_pattern_ops )
+Note the whitespace after text_pattern_ops. When used with a descending order it will look correct. 
+Unfortunately in the fix in #30903 it was assumed that the col_suffixes passed to django.db.backends.ddl_references.Columns would be empty for ascending order but instead it will contain empty strings and thus causing this bug. See: ​https://github.com/django/django/blob/master/django/db/backends/ddl_references.py#L87
+The expected output would be:
+CREATE INDEX "idx" ON "schema_author" (“name” text_pattern_ops)
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+from django.conf import settings
+from django.db import models
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+from django.db.migrations.state import ModelState
+from django.db.migrations.operations.models import CreateModel
+from django.db.migrations.operations.indexes import AddIndex
+from django.db.migrations.state import ProjectState
+from django.db.migrations.executor import MigrationExecutor
+from django.db.migrations.recorder import MigrationRecorder
+from django.test.utils import setup_test_environment, teardown_test_environment
+from django.test.testcases import TestCase
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Configure Django settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': 'test_db.sqlite3',
+        }
+    },
+    INSTALLED_APPS=[
+        'django.contrib.contenttypes',
+    ],
+    MIDDLEWARE_CLASSES=(),
+    ROOT_URLCONF='',
+    SECRET_KEY='fake-key',
+    TEMPLATES=[],
+    USE_I18N=True,
+    USE_L10N=True,
+)
+
+# Set up the test environment
+setup_test_environment()
+
+# Create a model with an index
+class Author(models.Model):
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['-name'], name='idx'),
+            models.Index(fields=['name'], name='idx_opclass', opclasses=['text_pattern_ops']),
+        ]
+
+# Create a migration state
+state = ModelState(
+    'test_app',
+    'Author',
+    fields=[
+        ('id', models.AutoField(primary_key=True)),
+        ('name', models.CharField(max_length=100)),
+    ],
+    options={
+        'indexes': [
+            models.Index(fields=['-name'], name='idx'),
+            models.Index(fields=['name'], name='idx_opclass', opclasses=['text_pattern_ops']),
+        ],
+    },
+)
+
+# Create a migration operation
+operation = AddIndex('Author', models.Index(fields=['-name'], name='idx'))
+operation_opclass = AddIndex('Author', models.Index(fields=['name'], name='idx_opclass', opclasses=['text_pattern_ops']))
+
+# Create a schema editor
+schema_editor = BaseDatabaseSchemaEditor(connection=state.db_alias)
+
+# Generate SQL for the index
+sql = schema_editor._create_index_sql(model=state, index=operation.index)
+sql_opclass = schema_editor._create_index_sql(model=state, index=operation_opclass.index)
+
+# Check the generated SQL for correct whitespace
+try:
+    assert 'DESC)' in sql, f"Expected 'DESC)' in SQL, got {sql}"
+    assert 'text_pattern_ops)' in sql_opclass, f"Expected 'text_pattern_ops)' in SQL, got {sql_opclass}"
+    print("Issue is fixed.")
+except AssertionError as e:
+    print_stacktrace(e)
+    raise
+
+# Teardown the test environment
+teardown_test_environment()
+
+# Exit with code 0 if the issue is fixed
+sys.exit(0)
+
+
+This is the tracing and analysis history:
+
+==================================================
+The error output indicates that the script is attempting to import `AddIndex` from `django.db.migrations.operations.indexes`, but it encounters a `ModuleNotFoundError` because the specified module does not exist. In Django, index operations are typically handled through other mechanisms rather than inside this specific path. This suggests that the referencing might be incorrect or outdated.
+
+Additionally, examining the given test script, it's clear that the intended functionality is to validate the SQL generation for creating database indexes, including the formatting and whitespace issues raised in the issue description. The script, however, fails right at the beginning before anything meaningful in terms of testing could be executed.
+
+Steps for resolution:
+1. Verify the import paths and adjust them to the correct module if they have changed in recent Django versions. For instance, index operations for migrations are handled differently, and finding their correct path is critical.
+2. We need to identify where the SQL generation for indexes is handled in Django’s codebase to be able to trace the root of the incorrect whitespace formatting.
+
+Based on the error message and context, the immediate next step is to ensure the correct module is identified where index operations are addressed or generated in Django as the current file is inconsistent with Django's known structure.
+
+Observed method: `django/db/backends/base/schema.py:BaseDatabaseSchemaEditor._create_index_sql`
+==================================================
+The issue with the SQL generation for creating indexes with proper whitespace was being observed with the `BaseDatabaseSchemaEditor._create_index_sql` method. The key part of this method responsible for handling the index generation is the line:
+
+```python
+columns=self._index_columns(table, columns, col_suffixes, opclasses)
+```
+
+This line calls another internal utility to format the columns for the SQL statement, which seems pertinent to why the whitespace is not generated correctly, particularly around suffixes and opclasses.
+
+Given the issue in the runtime trace showing import errors, there is evidence of a misalignment with how modules are structured in the test environment. To resolve the SQL formatting issue, the logic mainly lies in how `_index_columns` processes the column suffixes, including opclasses and ordering indications.
+
+The incorrect whitespace primarily comes from how these components are concatenated without a space when converting them into the SQL string representation.
+
+To debug the whitespace issues specifically, I need to look further into the `_index_columns` method or potentially another utility it may call that handles the formatting of the SQL statement parts.
+
+**Next Step:**
+
+I will observe the code that deals directly with formatting of the index-related SQL generation components—specifically, the section where the logic for combining column names and associated suffixes (`col_suffixes`) is implemented, as they appear in `_create_index_sql`.
+
+Observed scope: `django/db/backends/base/schema.py:953-971`
+==================================================
+Based on the provided information and the runtime error, the observed code snippet in `BaseDatabaseSchemaEditor._create_index_sql` references a method `_index_columns`, which appears to be integral to constructing the SQL for creating an index. This part of the method is called out as potentially mishandling column suffixes that include opclasses and order indicators—leading to the whitespace issues described in the original issue report.
+
+The execution trace indicates a problem early in the program due to a `ModuleNotFoundError` for the `AddIndex` import, which halts the test before any SQL generation can occur. However, the existing analysis has specified the following points:
+- The key method for SQL generation is `BaseDatabaseSchemaEditor._create_index_sql`, particularly the call to `self._index_columns`.
+
+The issue likely resides within the `_index_columns` method or yet another lower-level utility it calls to properly join column names and their suffixes with correct spacing. Therefore, the next logical step would be to trace what is happening inside `_index_columns` as it processes suffixes and opclasses.
+
+Observed method: `django/db/backends/base/schema.py:BaseDatabaseSchemaEditor._index_columns`
+==================================================
+The observed method `_index_columns` seems to be responsible for constructing how table columns are represented in SQL statements, specifically when generating a SQL statement for creating an index. This method calls the `Columns` class with several parameters, including `col_suffixes` and `opclasses`, which are likely responsible for appending order indicators and operational classes to column names. 
+
+Considering the runtime information and the given task to fix the whitespace issues in the index creation SQL, the problematic area likely stems from the inability of `_index_columns` or the `Columns` class it invokes to correctly handle and format these suffixes and opclasses when creating the SQL string. The whitespace anomaly arises particularly when opclasses are used without explicit ordering.
+
+However, to effectively locate the buggy method or code, we need further details on the `Columns` class implementation called within `_index_columns`, as this class seems to be directly responsible for column formatting.
+
+Therefore, the next step is to observe how the `Columns` class processes the given `col_suffixes` and `opclasses`, which appears to be directly involved in creating malformed SQL strings.
+
+Observed scope: `django/db/backends/ddl_references.py:87-107`
+==================================================
+The current issue pertains to the whitespace formatting in the SQL statements generated by Django's index creation logic. This is particularly focused on incorrect handling of column suffixes and opclasses, as noted in the test cases and issue description. 
+
+### Analysis of the Current Observed Code:
+The observed code snippet is from the `IndexColumns` class within `ddl_references.py`. This class inherits from `Columns`, and it appears to play a role in specifying or formatting how columns are included in SQL statements when creating indexes.
+
+The `__init__` method of `IndexColumns` is shown, but the completion of this method or any relevant logic thereafter isn't visible here. However, this method accepts parameters such as `col_suffixes` and `opclasses`. Thus, while this snippet itself doesn't show any specific string handling or formatting, the received parameters suggest that this is indeed the point where column details, including suffixes and opclasses, need careful string concatenation to ensure correct SQL formation.
+
+The traceback also indicates an import error for `AddIndex`, which prevents the test script from executing properly. This points to structural inconsistencies in the test environment setup.
+
+### Based on the Observed Code and Context:
+
+Since this part of the code doesn't yet directly show string handling or concatenation regarding the actual SQL generation, the next logical step would be to examine how `IndexColumns` interacts with its base `Columns` class for more concrete evidence of SQL string construction.
+
+### Next Step:
+
+Given the direct involvement of `IndexColumns` and its `col_suffixes`, I will proceed to observe how the `Columns` class processes these attributes.
+
+**Observed method: `django/db/backends/ddl_references.py:Columns.__init__`**
+==================================================
+Based on the observed code and runtime information:
+
+### Analysis:
+
+1. **Current Code Analysis**:
+   - In the `Columns.__init__` method, `col_suffixes` are passed as a parameter and stored as an attribute. However, there is no immediate logic within the constructor showing how these suffixes are concatenated or formatted as part of SQL generation.
+   - The observed method, `__init__`, acts solely to initialize properties without modifying them.
+
+2. **Runtime Information**:
+   - The runtime traceback indicates an import error for `AddIndex`, preventing further execution. This suggests an environmental setup issue, requiring adjustment of import paths for Django modules if those have changed.
+   - Import issues block the test script before SQL-related methods can be executed, where the SQL string formatting problem would manifest.
+
+3. **Traceback Context**:
+   - There is a consistent problem with improper spacing for `col_suffixes` and `opclasses` in generated SQL across the issue description and test cases.
+   - The problems likely happen in how subsequent methods, outside of initialization, concatenate these suffix values into an SQL string—particularly when `Columns` instances are used.
+
+### Next Steps:
+- The issue's root cause likely resides further in how `Columns` instances are used to generate SQL strings. The `__init__` method does not provide enough context on formatting.
+- Observing downstream logic where `col_suffixes` are concatenated to generate SQL might reveal the spot that incorrectly handles whitespace.
+
+Given this, the next step is to observe the scope where `Columns` class instances are used to generate SQL strings, specifically focusing near their formatting logic.
+
+### Request for Further Observation:
+I will proceed to observe more code downstream in relation to `Columns` where string formatting is demonstrated.
+
+**Observed scope**: `django/db/backends/ddl_references.py:108-130`
+==================================================
+### Analysis of the Current Observed Code and Abnormal Program Behavior:
+
+1. **Observed Code**:
+   - The `__str__` method within `IndexColumns` constructs column strings by concatenating column names with opclasses and suffixes, demonstrating potential spots for incorrect whitespace handling.
+   - The use of `format` functions without explicit space between `col` and string elements in the construction: `col = '{} {}'.format(self.quote_name(column), self.opclasses[idx])` indicates potential whitespace issues due to lack of handling with `col_suffixes`.
+
+2. **Abnormal Program Behavior**:
+   - The entire test script fails due to a `ModuleNotFoundError` for `django.db.migrations.operations.indexes`. This implies structural changes in Django that require updated import paths.
+   - The core issue highlighted was incorrect SQL output with malformed spacing between column declarations and attributes like `DESC` and `text_pattern_ops`.
+
+3. **Root Cause Analysis**:
+   - Given the `__str__` method logic seen here, incorrect spacing could occur when formatting opclasses and suffixes for SQL column declarations.
+   - The broader issue relates to `self.col_suffixes[idx]`, in which an empty suffix string causes improper spacing when joined with `col`.
+
+### Determination of Next Steps:
+
+Given the observed method and understanding where whitespace in index creation SQL might falter—within concatenation logic at index column construction—I need to locate operationally similar logic within the broader framework.
+
+Hence, observing more closely within `BaseDatabaseSchemaEditor` to confirm how columns integrate into the SQL statement might pinpoint broader application and mechanisms impacting whitespace in SQL assembly.
+
+Observed method: `django/db/backends/base/schema.py:BaseDatabaseSchemaEditor._index_columns`
+==================================================
+
+
+Now you choose downstream method BaseDatabaseSchemaEditor._index_columns to further observe, tracing the abnormal program behavior.
+This is the method code:
+   981	    def _index_columns(self, table, columns, col_suffixes, opclasses):
+   982	        return Columns(table, columns, self.quote_name, col_suffixes=col_suffixes)
+
+
+This is the runtime information of BaseDatabaseSchemaEditor._index_columns:
+
+Error occurred during script execution:No module named 'django.db.migrations.operations.indexes'
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-12039/django/db/backends/base/schema.py
+New var:....... __module__ = 'django.db.backends.base.schema'
+New var:....... __qualname__ = 'BaseDatabaseSchemaEditor'
+New var:....... __doc__ = '\n    This class and its subclasses are respons...\n    renaming, index fiddling, and so on.\n    '
+New var:....... sql_create_table = 'CREATE TABLE %(table)s (%(definition)s)'
+New var:....... sql_rename_table = 'ALTER TABLE %(old_table)s RENAME TO %(new_table)s'
+New var:....... sql_retablespace_table = 'ALTER TABLE %(table)s SET TABLESPACE %(new_tablespace)s'
+New var:....... sql_delete_table = 'DROP TABLE %(table)s CASCADE'
+New var:....... sql_create_column = 'ALTER TABLE %(table)s ADD COLUMN %(column)s %(definition)s'
+New var:....... sql_alter_column = 'ALTER TABLE %(table)s %(changes)s'
+New var:....... sql_alter_column_type = 'ALTER COLUMN %(column)s TYPE %(type)s'
+New var:....... sql_alter_column_null = 'ALTER COLUMN %(column)s DROP NOT NULL'
+New var:....... sql_alter_column_not_null = 'ALTER COLUMN %(column)s SET NOT NULL'
+New var:....... sql_alter_column_default = 'ALTER COLUMN %(column)s SET DEFAULT %(default)s'
+New var:....... sql_alter_column_no_default = 'ALTER COLUMN %(column)s DROP DEFAULT'
+New var:....... sql_delete_column = 'ALTER TABLE %(table)s DROP COLUMN %(column)s CASCADE'
+New var:....... sql_rename_column = 'ALTER TABLE %(table)s RENAME COLUMN %(old_column)s TO %(new_column)s'
+New var:....... sql_update_with_default = 'UPDATE %(table)s SET %(column)s = %(default)s WHERE %(column)s IS NULL'
+New var:....... sql_unique_constraint = 'UNIQUE (%(columns)s)'
+New var:....... sql_check_constraint = 'CHECK (%(check)s)'
+New var:....... sql_delete_constraint = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_constraint = 'CONSTRAINT %(name)s %(constraint)s'
+New var:....... sql_create_check = 'ALTER TABLE %(table)s ADD CONSTRAINT %(name)s CHECK (%(check)s)'
+New var:....... sql_delete_check = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_create_unique = 'ALTER TABLE %(table)s ADD CONSTRAINT %(name)s UNIQUE (%(columns)s)'
+New var:....... sql_delete_unique = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_create_fk = 'ALTER TABLE %(table)s ADD CONSTRAINT %(name)s F...ENCES %(to_table)s (%(to_column)s)%(deferrable)s'
+New var:....... sql_create_inline_fk = None
+New var:....... sql_create_column_inline_fk = None
+New var:....... sql_delete_fk = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_create_index = 'CREATE INDEX %(name)s ON %(table)s (%(columns)s)%(extra)s%(condition)s'
+New var:....... sql_create_unique_index = 'CREATE UNIQUE INDEX %(name)s ON %(table)s (%(columns)s)%(condition)s'
+New var:....... sql_delete_index = 'DROP INDEX %(name)s'
+New var:....... sql_create_pk = 'ALTER TABLE %(table)s ADD CONSTRAINT %(name)s PRIMARY KEY (%(columns)s)'
+New var:....... sql_delete_pk = 'ALTER TABLE %(table)s DROP CONSTRAINT %(name)s'
+New var:....... sql_delete_procedure = 'DROP PROCEDURE %(procedure)s'
+New var:....... __init__ = <function BaseDatabaseSchemaEditor.__init__ at 0x7fbcb5bcdb70>
+New var:....... __enter__ = <function BaseDatabaseSchemaEditor.__enter__ at 0x7fbcb5bcdbf8>
+New var:....... __exit__ = <function BaseDatabaseSchemaEditor.__exit__ at 0x7fbcb5bcdc80>
+New var:....... execute = <function BaseDatabaseSchemaEditor.execute at 0x7fbcb5bcdd08>
+New var:....... quote_name = <function BaseDatabaseSchemaEditor.quote_name at 0x7fbcb5bcdd90>
+New var:....... table_sql = <function BaseDatabaseSchemaEditor.table_sql at 0x7fbcb5bcde18>
+New var:....... column_sql = <function BaseDatabaseSchemaEditor.column_sql at 0x7fbcb5bcdea0>
+New var:....... skip_default = <function BaseDatabaseSchemaEditor.skip_default at 0x7fbcb5bcdf28>
+New var:....... prepare_default = <function BaseDatabaseSchemaEditor.prepare_default at 0x7fbcb5bcf048>
+New var:....... _column_default_sql = <function BaseDatabaseSchemaEditor._column_default_sql at 0x7fbcb5bcf0d0>
+New var:....... _effective_default = <staticmethod object at 0x7fbcb5bbcf98>
+New var:....... effective_default = <function BaseDatabaseSchemaEditor.effective_default at 0x7fbcb5bcf1e0>
+New var:....... quote_value = <function BaseDatabaseSchemaEditor.quote_value at 0x7fbcb5bcf268>
+New var:....... create_model = <function BaseDatabaseSchemaEditor.create_model at 0x7fbcb5bcf2f0>
+New var:....... delete_model = <function BaseDatabaseSchemaEditor.delete_model at 0x7fbcb5bcf378>
+New var:....... add_index = <function BaseDatabaseSchemaEditor.add_index at 0x7fbcb5bcf400>
+New var:....... remove_index = <function BaseDatabaseSchemaEditor.remove_index at 0x7fbcb5bcf488>
+New var:....... add_constraint = <function BaseDatabaseSchemaEditor.add_constraint at 0x7fbcb5bcf510>
+New var:....... remove_constraint = <function BaseDatabaseSchemaEditor.remove_constraint at 0x7fbcb5bcf598>
+New var:....... alter_unique_together = <function BaseDatabaseSchemaEditor.alter_unique_together at 0x7fbcb5bcf620>
+New var:....... alter_index_together = <function BaseDatabaseSchemaEditor.alter_index_together at 0x7fbcb5bcf6a8>
+New var:....... _delete_composed_index = <function BaseDatabaseSchemaEditor._delete_composed_index at 0x7fbcb5bcf730>
+New var:....... alter_db_table = <function BaseDatabaseSchemaEditor.alter_db_table at 0x7fbcb5bcf7b8>
+New var:....... alter_db_tablespace = <function BaseDatabaseSchemaEditor.alter_db_tablespace at 0x7fbcb5bcf840>
+New var:....... add_field = <function BaseDatabaseSchemaEditor.add_field at 0x7fbcb5bcf8c8>
+New var:....... remove_field = <function BaseDatabaseSchemaEditor.remove_field at 0x7fbcb5bcf950>
+New var:....... alter_field = <function BaseDatabaseSchemaEditor.alter_field at 0x7fbcb5bcf9d8>
+New var:....... _alter_field = <function BaseDatabaseSchemaEditor._alter_field at 0x7fbcb5bcfa60>
+New var:....... _alter_column_null_sql = <function BaseDatabaseSchemaEditor._alter_column_null_sql at 0x7fbcb5bcfae8>
+New var:....... _alter_column_default_sql = <function BaseDatabaseSchemaEditor._alter_column_default_sql at 0x7fbcb5bcfb70>
+New var:....... _alter_column_type_sql = <function BaseDatabaseSchemaEditor._alter_column_type_sql at 0x7fbcb5bcfbf8>
+New var:....... _alter_many_to_many = <function BaseDatabaseSchemaEditor._alter_many_to_many at 0x7fbcb5bcfc80>
+New var:....... _create_index_name = <function BaseDatabaseSchemaEditor._create_index_name at 0x7fbcb5bcfd08>
+New var:....... _get_index_tablespace_sql = <function BaseDatabaseSchemaEditor._get_index_tablespace_sql at 0x7fbcb5bcfd90>
+New var:....... _create_index_sql = <function BaseDatabaseSchemaEditor._create_index_sql at 0x7fbcb5bcfe18>
+New var:....... _delete_index_sql = <function BaseDatabaseSchemaEditor._delete_index_sql at 0x7fbcb5bcfea0>
+ line       981     def _index_columns(self, table, columns, col_suffixes, opclasses):
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.1/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.1/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.1/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-12039/reproduce.py", line 9, in <module>
+    from django.db.migrations.operations.indexes import AddIndex
+ModuleNotFoundError: No module named 'django.db.migrations.operations.indexes'
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

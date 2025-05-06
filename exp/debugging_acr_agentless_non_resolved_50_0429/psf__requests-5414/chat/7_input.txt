@@ -1,0 +1,508 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **requests** project:
+## ISSUE
+<ISSUE>
+Getting http://.example.com raises UnicodeError
+Attempting to get e.g. `http://.example.com` results in a `UnicodeError`. It seems like the intention so far has been to raise `InvalidUrl` instead (see e.g. [this line](https://github.com/psf/requests/blob/ca6f9af5dba09591007b15a7368bc0f006b7cc50/requests/models.py#L401)).
+
+I see there was some hesitation in fixing a similar issue (#4168) and would like to add that even catching the error just to rethrow as a requests exception would be beneficial.
+
+## Expected Result
+
+Based on PR #774: `InvalidUrl: URL has an invalid label.`
+
+## Actual Result
+
+`UnicodeError: encoding with 'idna' codec failed (UnicodeError: label empty or too long)`
+
+## Reproduction Steps
+
+```python3
+import requests
+requests.get("http://.example.com")
+```
+
+## System Information
+
+    $ python -m requests.help
+
+```
+{
+  "chardet": {
+    "version": "3.0.4"
+  },
+  "cryptography": {
+    "version": "2.8"
+  },
+  "idna": {
+    "version": "2.8"
+  },
+  "implementation": {
+    "name": "CPython",
+    "version": "3.8.0"
+  },
+  "platform": {
+    "release": "5.3.0-40-generic",
+    "system": "Linux"
+  },
+  "pyOpenSSL": {
+    "openssl_version": "1010104f",
+    "version": "19.1.0"
+  },
+  "requests": {
+    "version": "2.23.0"
+  },
+  "system_ssl": {
+    "version": "1010103f"
+  },
+  "urllib3": {
+    "version": "1.25.8"
+  },
+  "using_pyopenssl": true
+}
+```
+
+</ISSUE>
+
+
+A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is its debugging history:
+
+==================================================
+To address the issue in the `requests` library, it's important to understand the stack trace and pinpoint where the error diverges from the expected behavior. The observed behavior involves an exception `urllib3.exceptions.LocationParseError: Failed to parse: '.example.com', label empty or too long`, which is not the expected `InvalidURL` exception from the `requests` module.
+
+Let's break down the stack trace:
+
+1. **Trace** begins with a call to `requests.get("http://.example.com")`.
+2. `requests.get` calls `requests.request()`.
+3. `requests.request` calls `requests.sessions.Session.request()`.
+4. `Session.request` calls `Session.send()`.
+5. `Session.send` calls `Adapter.send()`.
+6. `Adapter.send` calls `urllib3.connectionpool.ConnectionPool.urlopen()`.
+7. `ConnectionPool.urlopen` calls `_make_request()`.
+8. `_make_request` calls `urllib3.connection.HTTPConnection.request()`.
+9. This eventually progresses to `urllib3.util.connection.create_connection()` and raises a `LocationParseError`.
+
+The key point of failure is where `urllib3` encounters a location parsing error due to an invalid URL segment. The goal would be to ensure `requests` catches this and raises an `InvalidURL` exception instead.
+
+Given this trace, the issue seems to originate in the interaction between `requests` and `urllib3`. Specifically, how `requests` handles exceptions from `urllib3`.
+
+I need to observe the method that processes URL validation inside the `requests` package so I can verify how exceptions like `LocationParseError` are handled and determine if this is where `InvalidURL` should be raised instead.
+
+Observed method: `requests/sessions.py:Session.send`
+==================================================
+From the analysis of the `send` method in `requests/sessions.py`, the problem arises during the URL validation process carried out by the `adapter.send(request, **kwargs)` call, which eventually leads to `urllib3` raising a `LocationParseError`.
+
+The `requests.get` method should raise an `InvalidURL` exception instead. To achieve this, the `send` method should ideally catch the `LocationParseError` thrown by `urllib3` and convert it to `InvalidURL`.
+
+Based on the runtime information and error trace provided, the issue seems to manifest downstream in the `send` method:
+
+```python
+645: r = adapter.send(request, **kwargs)
+```
+
+This line delegates the request to an `adapter` which eventually triggers the `LocationParseError`. To confirm if this is the location to implement the fix, it's necessary to trace the `adapter.send()` method further to examine how exceptions are handled.
+
+Therefore, I want to observe the `send` method of the adapter being used to understand exception handling there.
+
+Observed scope: `requests/adapters.py:400-460`
+==================================================
+Analyzing the current situation, the issue stems from the fact that when an invalid domain is parsed (such as `http://.example.com`), `urllib3` raises a `LocationParseError`, which is not caught and transformed into a `requests.exceptions.InvalidURL` by `requests`. The trace indicates that the problem propagates from `Session.send` through `Adapter.send` and eventually results in a `LocationParseError`.
+
+Upon inspecting the code in `Session.send`, it seems like `location errors are partially handled with a try-except block where a `LocationValueError` is caught and re-raised as `InvalidURL`.
+
+However, the observed error is `LocationParseError`, which also needs to be captured:
+
+```python
+except LocationValueError as e:
+    raise InvalidURL(e, request=request)
+```
+
+This enters the realm of `requests.adapters.Adapter.send`, where URL parsing is undertaken, and the previous session code snippet doesn't cover `LocationParseError`. 
+
+To further analyze and solve the issue, I want to observe the `send` method within the `Adapter` class as it interacts directly with `urllib3`.
+
+Observed method: `requests/adapters.py:Adapter.send`
+==================================================
+The issue arises from the failure to parse the URL `http://.example.com`, which results in a `LocationParseError`. This error needs to be caught specifically in the `requests` library, so an appropriate `InvalidURL` exception can be raised instead. In the current trace through `requests.adapters.Adapter.send`, we can see that while `LocationValueError` is caught and transformed into `InvalidURL` on line 415, `LocationParseError` is not currently handled there.
+
+The current runtime stack trace confirms that the `LocationParseError` propagates without being caught properly and escalates through the call stack, leading to an unexpected exception.
+
+To confirm this is the correct location to implement the fix, we should verify how the `conn.urlopen()` call interacts with URL parsing. Since the `LocationParseError` originates from `urllib3`, catching it within `requests.adapters.Adapter.send` at the point where `conn` interacts with `urllib3` would be ideal.
+
+From earlier observation, the following scope, where exceptions from `self.get_connection(request.url, proxies)` are handled, is already under consideration:
+
+```python
+412-415: 
+```
+
+Thus, catching `LocationParseError` and re-raising it as an `InvalidURL` exception should also be attempted here.
+
+Since we're previously checking how exceptions from `conn.urlopen()` are treated, let's confirm the handling scope regarding exceptions from URL parsing or attempt connecting again within the following region:
+
+Observed scope: `requests/adapters.py:400-440`
+==================================================
+The current abnormal behavior stems from the program attempting to parse the URL `http://.example.com`, which results in a `LocationParseError`. The stack trace shows this error bubbling up from `urllib3`, specifically when attempting to make a connection. This issue should ideally be captured and converted into an `InvalidURL` exception by the `requests` library. However, this conversion isn't happening, indicating that the error is not being caught appropriately in the `requests` library before it reaches this higher level of the stack where `LocationParseError` is evident.
+
+From the analysis, the most relevant part of the code is within `requests/adapters.Adapter.send`, where a similar error, `LocationValueError`, is already being handled and re-thrown as `InvalidURL`. Given the insights gained from tracing the error, we need to expand this exception handling to include `LocationParseError`.
+
+**Buggy method**: `requests/adapters.py:Adapter.send`
+
+The method `Adapter.send` is responsible for sending the HTTP request via the connection pool, and it currently inadequately handles the parsing error. Therefore, this is the location where the fix needs to be implemented to correctly capture the `LocationParseError` and raise an `InvalidURL` exception in its stead.
+==================================================
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+To resolve the issue, I need to modify the `Adapter.send` method in the `requests/adapters.py` file to catch `LocationParseError` from `urllib3` and raise the appropriate `InvalidURL` exception.
+
+I will need to retrieve the source code of the `Adapter.send` method to make the necessary changes. 
+
+```python
+search_method_in_file("requests/adapters.py", "Adapter.send")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("requests/adapters.py", "Adapter.send")
+RESULT:
+#### requests/adapters.py:HTTPAdapter.send
+```python
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        """Sends PreparedRequest object. Returns Response object.
+
+        :param request: The :class:`PreparedRequest <PreparedRequest>` being sent.
+        :param stream: (optional) Whether to stream the request content.
+        :param timeout: (optional) How long to wait for the server to send
+            data before giving up, as a float, or a :ref:`(connect timeout,
+            read timeout) <timeouts>` tuple.
+        :type timeout: float or tuple or urllib3 Timeout object
+        :param verify: (optional) Either a boolean, in which case it controls whether
+            we verify the server's TLS certificate, or a string, in which case it
+            must be a path to a CA bundle to use
+        :param cert: (optional) Any user-provided SSL certificate to be trusted.
+        :param proxies: (optional) The proxies dictionary to apply to the request.
+        :rtype: requests.Response
+        """
+
+        try:
+            conn = self.get_connection(request.url, proxies)
+        except LocationValueError as e:
+            raise InvalidURL(e, request=request)
+
+        self.cert_verify(conn, request.url, verify, cert)
+        url = self.request_url(request, proxies)
+        self.add_headers(request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies)
+
+        chunked = not (request.body is None or 'Content-Length' in request.headers)
+
+        if isinstance(timeout, tuple):
+            try:
+                connect, read = timeout
+                timeout = TimeoutSauce(connect=connect, read=read)
+            except ValueError as e:
+                # this may raise a string formatting error.
+                err = ("Invalid timeout {}. Pass a (connect, read) "
+                       "timeout tuple, or a single float to set "
+                       "both timeouts to the same value".format(timeout))
+                raise ValueError(err)
+        elif isinstance(timeout, TimeoutSauce):
+            pass
+        else:
+            timeout = TimeoutSauce(connect=timeout, read=timeout)
+
+        try:
+            if not chunked:
+                resp = conn.urlopen(
+                    method=request.method,
+                    url=url,
+                    body=request.body,
+                    headers=request.headers,
+                    redirect=False,
+                    assert_same_host=False,
+                    preload_content=False,
+                    decode_content=False,
+                    retries=self.max_retries,
+                    timeout=timeout
+                )
+
+            # Send the request.
+            else:
+                if hasattr(conn, 'proxy_pool'):
+                    conn = conn.proxy_pool
+
+                low_conn = conn._get_conn(timeout=DEFAULT_POOL_TIMEOUT)
+
+                try:
+                    skip_host = 'Host' in request.headers
+                    low_conn.putrequest(request.method,
+                                        url,
+                                        skip_accept_encoding=True,
+                                        skip_host=skip_host)
+
+                    for header, value in request.headers.items():
+                        low_conn.putheader(header, value)
+
+                    low_conn.endheaders()
+
+                    for i in request.body:
+                        low_conn.send(hex(len(i))[2:].encode('utf-8'))
+                        low_conn.send(b'\r\n')
+                        low_conn.send(i)
+                        low_conn.send(b'\r\n')
+                    low_conn.send(b'0\r\n\r\n')
+
+                    # Receive the response from the server
+                    try:
+                        # For Python 2.7, use buffering of HTTP responses
+                        r = low_conn.getresponse(buffering=True)
+                    except TypeError:
+                        # For compatibility with Python 3.3+
+                        r = low_conn.getresponse()
+
+                    resp = HTTPResponse.from_httplib(
+                        r,
+                        pool=conn,
+                        connection=low_conn,
+                        preload_content=False,
+                        decode_content=False
+                    )
+                except:
+                    # If we hit any problems here, clean up the connection.
+                    # Then, reraise so that we can handle the actual exception.
+                    low_conn.close()
+                    raise
+
+        except (ProtocolError, socket.error) as err:
+            raise ConnectionError(err, request=request)
+
+        except MaxRetryError as e:
+            if isinstance(e.reason, ConnectTimeoutError):
+                # TODO: Remove this in 3.0.0: see #2811
+                if not isinstance(e.reason, NewConnectionError):
+                    raise ConnectTimeout(e, request=request)
+
+            if isinstance(e.reason, ResponseError):
+                raise RetryError(e, request=request)
+
+            if isinstance(e.reason, _ProxyError):
+                raise ProxyError(e, request=request)
+
+            if isinstance(e.reason, _SSLError):
+                # This branch is for urllib3 v1.22 and later.
+                raise SSLError(e, request=request)
+
+            raise ConnectionError(e, request=request)
+
+        except ClosedPoolError as e:
+            raise ConnectionError(e, request=request)
+
+        except _ProxyError as e:
+            raise ProxyError(e)
+
+        except (_SSLError, _HTTPError) as e:
+            if isinstance(e, _SSLError):
+                # This branch is for urllib3 versions earlier than v1.22
+                raise SSLError(e, request=request)
+            elif isinstance(e, ReadTimeoutError):
+                raise ReadTimeout(e, request=request)
+            elif isinstance(e, _InvalidHeader):
+                raise InvalidHeader(e, request=request)
+            else:
+                raise
+
+        return self.build_response(request, resp)
+
+```
+
+#### requests/adapters.py:HTTPAdapter.send
+```python
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        """Sends PreparedRequest object. Returns Response object.
+
+        :param request: The :class:`PreparedRequest <PreparedRequest>` being sent.
+        :param stream: (optional) Whether to stream the request content.
+        :param timeout: (optional) How long to wait for the server to send
+            data before giving up, as a float, or a :ref:`(connect timeout,
+            read timeout) <timeouts>` tuple.
+        :type timeout: float or tuple or urllib3 Timeout object
+        :param verify: (optional) Either a boolean, in which case it controls whether
+            we verify the server's TLS certificate, or a string, in which case it
+            must be a path to a CA bundle to use
+        :param cert: (optional) Any user-provided SSL certificate to be trusted.
+        :param proxies: (optional) The proxies dictionary to apply to the request.
+        :rtype: requests.Response
+        """
+
+        try:
+            conn = self.get_connection(request.url, proxies)
+        except LocationValueError as e:
+            raise InvalidURL(e, request=request)
+
+        self.cert_verify(conn, request.url, verify, cert)
+        url = self.request_url(request, proxies)
+        self.add_headers(request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies)
+
+        chunked = not (request.body is None or 'Content-Length' in request.headers)
+
+        if isinstance(timeout, tuple):
+            try:
+                connect, read = timeout
+                timeout = TimeoutSauce(connect=connect, read=read)
+            except ValueError as e:
+                # this may raise a string formatting error.
+                err = ("Invalid timeout {}. Pass a (connect, read) "
+                       "timeout tuple, or a single float to set "
+                       "both timeouts to the same value".format(timeout))
+                raise ValueError(err)
+        elif isinstance(timeout, TimeoutSauce):
+            pass
+        else:
+            timeout = TimeoutSauce(connect=timeout, read=timeout)
+
+        try:
+            if not chunked:
+                resp = conn.urlopen(
+                    method=request.method,
+                    url=url,
+                    body=request.body,
+                    headers=request.headers,
+                    redirect=False,
+                    assert_same_host=False,
+                    preload_content=False,
+                    decode_content=False,
+                    retries=self.max_retries,
+                    timeout=timeout
+                )
+
+            # Send the request.
+            else:
+                if hasattr(conn, 'proxy_pool'):
+                    conn = conn.proxy_pool
+
+                low_conn = conn._get_conn(timeout=DEFAULT_POOL_TIMEOUT)
+
+                try:
+                    skip_host = 'Host' in request.headers
+                    low_conn.putrequest(request.method,
+                                        url,
+                                        skip_accept_encoding=True,
+                                        skip_host=skip_host)
+
+                    for header, value in request.headers.items():
+                        low_conn.putheader(header, value)
+
+                    low_conn.endheaders()
+
+                    for i in request.body:
+                        low_conn.send(hex(len(i))[2:].encode('utf-8'))
+                        low_conn.send(b'\r\n')
+                        low_conn.send(i)
+                        low_conn.send(b'\r\n')
+                    low_conn.send(b'0\r\n\r\n')
+
+                    # Receive the response from the server
+                    try:
+                        # For Python 2.7, use buffering of HTTP responses
+                        r = low_conn.getresponse(buffering=True)
+                    except TypeError:
+                        # For compatibility with Python 3.3+
+                        r = low_conn.getresponse()
+
+                    resp = HTTPResponse.from_httplib(
+                        r,
+                        pool=conn,
+                        connection=low_conn,
+                        preload_content=False,
+                        decode_content=False
+                    )
+                except:
+                    # If we hit any problems here, clean up the connection.
+                    # Then, reraise so that we can handle the actual exception.
+                    low_conn.close()
+                    raise
+
+        except (ProtocolError, socket.error) as err:
+            raise ConnectionError(err, request=request)
+
+        except MaxRetryError as e:
+            if isinstance(e.reason, ConnectTimeoutError):
+                # TODO: Remove this in 3.0.0: see #2811
+                if not isinstance(e.reason, NewConnectionError):
+                    raise ConnectTimeout(e, request=request)
+
+            if isinstance(e.reason, ResponseError):
+                raise RetryError(e, request=request)
+
+            if isinstance(e.reason, _ProxyError):
+                raise ProxyError(e, request=request)
+
+            if isinstance(e.reason, _SSLError):
+                # This branch is for urllib3 v1.22 and later.
+                raise SSLError(e, request=request)
+
+            raise ConnectionError(e, request=request)
+
+        except ClosedPoolError as e:
+            raise ConnectionError(e, request=request)
+
+        except _ProxyError as e:
+            raise ProxyError(e)
+
+        except (_SSLError, _HTTPError) as e:
+            if isinstance(e, _SSLError):
+                # This branch is for urllib3 versions earlier than v1.22
+                raise SSLError(e, request=request)
+            elif isinstance(e, ReadTimeoutError):
+                raise ReadTimeout(e, request=request)
+            elif isinstance(e, _InvalidHeader):
+                raise InvalidHeader(e, request=request)
+            else:
+                raise
+
+        return self.build_response(request, resp)
+
+```
+
+
+==================================================
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+## IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+## IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

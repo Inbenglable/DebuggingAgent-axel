@@ -1,0 +1,242 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Allow autoreloading of `python -m pkg_other_than_django runserver`
+Description
+	 
+		(last modified by William Schwartz)
+	 
+​django.utils.autoreload.get_child_arguments detects if Python was launched as python -m django. Currently it detects only when ​-m was passed specifically django (and only in Python environments in which __file__ is set on modules, which is ​not true of all Python environments). Like #32177, this ticket aims to remove one impediment to creating Django-based command-line utilities that have their own ​__main__ sub-module while overriding Django's built-in management commands—in this case, runserver.
+The fix, which I have submitted in the ​attached PR, is to use Python's ​documented way of determining if -m was used in get_child_arguments:
+The top-level __main__ module is always the entry point of a ​complete Python program.
+ __main__.__spec__ is not None ​if and only if Python was launched with -m or the name of a "directory, zipfile or other sys.path entry." In the latter cases, the ​documentation says
+If the script name refers to a directory or zipfile, the script name is added to the start of sys.path and the __main__.py file in that location is executed as the __main__ module.
+Hence __main__.__spec__.parent (which is ​usually but not always __main__.__package__) exists and is the empty string when Python is started with the name of a directory or zip file.
+Therefore Python was started with -m pkg if and only if __main__.__spec__.parent == "pkg".
+Following this algorithm is guaranteed to work as long as Python obeys its own documentation, and has the side benefit of avoiding use of __file__.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import sys
+import traceback
+from pathlib import Path
+from django.utils.autoreload import get_child_arguments
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+def main():
+    # Simulate the environment as if the script was run with `python -m pkg_other_than_django runserver`
+    sys.argv = ['pkg_other_than_django/__main__.py', 'runserver']
+    sys.modules['__main__'].__spec__ = type('ModuleSpec', (object,), {'name': '__main__', 'parent': 'pkg_other_than_django'})()
+    
+    try:
+        args = get_child_arguments()
+        # We expect an error here because the current implementation only checks for 'django' in the parent
+        # and not for any generic package name.
+        assert 'pkg_other_than_django' in args, f"Expected 'pkg_other_than_django' in args, got {args}"
+    except AssertionError as e:
+        print_stacktrace(e)
+        raise
+    except Exception as e:
+        print_stacktrace(e)
+        raise AssertionError("An unexpected exception occurred") from e
+    else:
+        print("Issue is fixed. No AssertionError raised.")
+        sys.exit(0)
+
+if __name__ == '__main__':
+    main()
+
+
+This is the tracing and analysis history:
+
+==================================================
+The abnormal behavior in the program occurs when an exception is raised because the script path `pkg_other_than_django/__main__.py` does not exist. The issue is in how `django.utils.autoreload.get_child_arguments` handles the autoreloading. The autodetection logic within this method seems flawed as it only checks specifically for Django and not other packages.
+
+The test simulates running a Python module with `-m` and a package other than Django. The expectation is that `get_child_arguments()` should include 'pkg_other_than_django' in its arguments, but instead, it raises a `RuntimeError` indicating the script does not exist. This points to potential issues with how the method checks the module path or assumptions it's making about script execution.
+
+Given the traceback and code flow, the method `get_child_arguments` in the file `django/utils/autoreload.py` is a key focus area because the observed abnormal behavior (specifically the runtime error) occurs within this method. Therefore, I will need to delve deeper into its logic to pinpoint why it's failing for non-Django modules.
+
+Observed method: `django/utils/autoreload.py:get_child_arguments`
+==================================================
+
+
+Now you choose downstream method get_child_arguments to further observe, tracing the abnormal program behavior.
+This is the method code:
+   213	def get_child_arguments():
+   214	    """
+   215	    Return the executable. This contains a workaround for Windows if the
+   216	    executable is reported to not have the .exe extension which can cause bugs
+   217	    on reloading.
+   218	    """
+   219	    import django.__main__
+   220	    django_main_path = Path(django.__main__.__file__)
+   221	    py_script = Path(sys.argv[0])
+   222	
+   223	    args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+   224	    if py_script == django_main_path:
+   225	        # The server was started with `python -m django runserver`.
+   226	        args += ['-m', 'django']
+   227	        args += sys.argv[1:]
+   228	    elif not py_script.exists():
+   229	        # sys.argv[0] may not exist for several reasons on Windows.
+   230	        # It may exist with a .exe extension or have a -script.py suffix.
+   231	        exe_entrypoint = py_script.with_suffix('.exe')
+   232	        if exe_entrypoint.exists():
+   233	            # Should be executed directly, ignoring sys.executable.
+   234	            # TODO: Remove str() when dropping support for PY37.
+   235	            # args parameter accepts path-like on Windows from Python 3.8.
+   236	            return [str(exe_entrypoint), *sys.argv[1:]]
+   237	        script_entrypoint = py_script.with_name('%s-script.py' % py_script.name)
+   238	        if script_entrypoint.exists():
+   239	            # Should be executed as usual.
+   240	            # TODO: Remove str() when dropping support for PY37.
+   241	            # args parameter accepts path-like on Windows from Python 3.8.
+   242	            return [*args, str(script_entrypoint), *sys.argv[1:]]
+   243	        raise RuntimeError('Script %s does not exist.' % py_script)
+   244	    else:
+   245	        args += sys.argv
+   246	    return args
+
+
+This is the runtime information of get_child_arguments:
+
+Error occurred during script execution:An unexpected exception occurred
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-13837/django/utils/autoreload.py
+New var:....... __name__ = 'django.utils.autoreload'
+New var:....... __doc__ = None
+New var:....... __package__ = 'django.utils'
+New var:....... __loader__ = <_frozen_importlib_external.SourceFileLoader object at 0x7f5986f9cbe0>
+New var:....... __spec__ = ModuleSpec(name='django.utils.autoreload', loade...django__django-13837/django/utils/autoreload.py')
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-13837/django/utils/autoreload.py'
+New var:....... __cached__ = '/data/swe-fl/TMP/testbed/django__django-13837/django/utils/__pycache__/autoreload.cpython-36.pyc'
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... functools = <module 'functools' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/functools.py'>
+New var:....... itertools = <module 'itertools' (built-in)>
+New var:....... logging = <module 'logging' from '/root/miniforge3/envs/dj...__django__3.2/lib/python3.6/logging/__init__.py'>
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/os.py'>
+New var:....... signal = <module 'signal' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/signal.py'>
+New var:....... subprocess = <module 'subprocess' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/subprocess.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... threading = <module 'threading' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/threading.py'>
+New var:....... time = <module 'time' (built-in)>
+New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py'>
+New var:....... weakref = <module 'weakref' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/weakref.py'>
+New var:....... defaultdict = <class 'collections.defaultdict'>
+New var:....... Path = <class 'pathlib.Path'>
+New var:....... ModuleType = <class 'module'>
+New var:....... zipimporter = <class 'zipimport.zipimporter'>
+New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13837/django/__init__.py'>
+New var:....... apps = <django.apps.registry.Apps object at 0x7f59866be8d0>
+New var:....... request_finished = <django.dispatch.dispatcher.Signal object at 0x7f5986e9b6d8>
+New var:....... Signal = <class 'django.dispatch.dispatcher.Signal'>
+New var:....... cached_property = <class 'django.utils.functional.cached_property'>
+New var:....... get_version_tuple = <function get_version_tuple at 0x7f5986efd9d8>
+New var:....... autoreload_started = <django.dispatch.dispatcher.Signal object at 0x7f5986e73630>
+New var:....... file_changed = <django.dispatch.dispatcher.Signal object at 0x7f5986e73668>
+New var:....... DJANGO_AUTORELOAD_ENV = 'RUN_MAIN'
+New var:....... logger = <Logger django.utils.autoreload (WARNING)>
+New var:....... _error_files = []
+New var:....... _exception = None
+New var:....... termios = <module 'termios' from '/root/miniforge3/envs/dj...dynload/termios.cpython-36m-x86_64-linux-gnu.so'>
+New var:....... pywatchman = <module 'pywatchman' from '/root/miniforge3/envs.../python3.6/site-packages/pywatchman/__init__.py'>
+New var:....... is_django_module = <function is_django_module at 0x7f5986efdae8>
+New var:....... is_django_path = <function is_django_path at 0x7f5986640048>
+New var:....... check_errors = <function check_errors at 0x7f598664d620>
+New var:....... raise_last_exception = <function raise_last_exception at 0x7f598664d6a8>
+New var:....... ensure_echo_on = <function ensure_echo_on at 0x7f598664d730>
+New var:....... iter_all_python_module_files = <function iter_all_python_module_files at 0x7f598664d7b8>
+New var:....... iter_modules_and_files = <functools._lru_cache_wrapper object at 0x7f598664ba20>
+New var:....... common_roots = <functools._lru_cache_wrapper object at 0x7f5986ea5828>
+New var:....... sys_path_directories = <function sys_path_directories at 0x7f598664d840>
+ line       213 def get_child_arguments():
+ call       213 def get_child_arguments():
+ line       219     import django.__main__
+New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13837/django/__init__.py'>
+ line       220     django_main_path = Path(django.__main__.__file__)
+New var:....... django_main_path = PosixPath('/data/swe-fl/TMP/testbed/django__django-13837/django/__main__.py')
+ line       221     py_script = Path(sys.argv[0])
+New var:....... py_script = PosixPath('pkg_other_than_django/__main__.py')
+ line       223     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+    Starting var:.. .0 = <list_iterator object at 0x7f5986f9c3c8>
+     call       223     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+     line       223     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+     return     223     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+    Return value:.. []
+New var:....... args = ['/root/miniforge3/envs/django__django__3.2/bin/python']
+ line       224     if py_script == django_main_path:
+ line       228     elif not py_script.exists():
+ line       231         exe_entrypoint = py_script.with_suffix('.exe')
+New var:....... exe_entrypoint = PosixPath('pkg_other_than_django/__main__.exe')
+ line       232         if exe_entrypoint.exists():
+ line       237         script_entrypoint = py_script.with_name('%s-script.py' % py_script.name)
+New var:....... script_entrypoint = PosixPath('pkg_other_than_django/__main__.py-script.py')
+ line       238         if script_entrypoint.exists():
+ line       243         raise RuntimeError('Script %s does not exist.' % py_script)
+ exception  243         raise RuntimeError('Script %s does not exist.' % py_script)
+Exception:..... RuntimeError: Script pkg_other_than_django/__main__.py does not exist.
+New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13837/django/__init__.py'>
+New var:....... django_main_path = PosixPath('/data/swe-fl/TMP/testbed/django__django-13837/django/__main__.py')
+New var:....... py_script = PosixPath('pkg_other_than_django/__main__.py')
+New var:....... args = ['/root/miniforge3/envs/django__django__3.2/bin/python']
+New var:....... exe_entrypoint = PosixPath('pkg_other_than_django/__main__.exe')
+New var:....... script_entrypoint = PosixPath('pkg_other_than_django/__main__.py-script.py')
+Call ended by exception
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-13837/reproduce.py"
+    22: args = get_child_arguments()
+  File "/data/swe-fl/TMP/testbed/django__django-13837/django/utils/autoreload.py"
+    243: raise RuntimeError('Script %s does not exist.' % py_script)
+RuntimeError: Script pkg_other_than_django/__main__.py does not exist.
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-13837/reproduce.py", line 22, in main
+    args = get_child_arguments()
+  File "/data/swe-fl/TMP/testbed/django__django-13837/django/utils/autoreload.py", line 243, in get_child_arguments
+    raise RuntimeError('Script %s does not exist.' % py_script)
+RuntimeError: Script pkg_other_than_django/__main__.py does not exist.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 14, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 12, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-13837/reproduce.py", line 37, in <module>
+    main()
+  File "/data/swe-fl/TMP/testbed/django__django-13837/reproduce.py", line 31, in main
+    raise AssertionError("An unexpected exception occurred") from e
+AssertionError: An unexpected exception occurred
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

@@ -1,0 +1,225 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **scikit-learn** project:
+## ISSUE
+<ISSUE>
+ZeroDivisionError in _sparse_fit for SVM with empty support_vectors_
+#### Description
+When using sparse data, in the case where the support_vectors_ attribute is be empty, _fit_sparse gives a ZeroDivisionError
+
+#### Steps/Code to Reproduce
+```
+import numpy as np
+import scipy
+import sklearn
+from sklearn.svm import SVR
+x_train = np.array([[0, 1, 0, 0],
+[0, 0, 0, 1],
+[0, 0, 1, 0],
+[0, 0, 0, 1]])
+y_train = np.array([0.04, 0.04, 0.10, 0.16])
+model = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3, epsilon=0.1,
+  	    gamma=1.0, kernel='linear', max_iter=15000,
+  	    shrinking=True, tol=0.001, verbose=False)
+# dense x_train has no error
+model.fit(x_train, y_train)
+
+# convert to sparse
+xtrain= scipy.sparse.csr_matrix(x_train)
+model.fit(xtrain, y_train)
+
+```
+#### Expected Results
+No error is thrown and  `self.dual_coef_ = sp.csr_matrix([])`
+
+#### Actual Results
+```
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "/usr/local/lib/python3.5/dist-packages/sklearn/svm/base.py", line 209, in fit
+    fit(X, y, sample_weight, solver_type, kernel, random_seed=seed)
+  File "/usr/local/lib/python3.5/dist-packages/sklearn/svm/base.py", line 302, in _sparse_fit
+    dual_coef_indices.size / n_class)
+ZeroDivisionError: float division by zero
+```
+
+#### Versions
+```
+>>> sklearn.show_versions() 
+
+System:
+executable: /usr/bin/python3
+    python: 3.5.2 (default, Nov 12 2018, 13:43:14)  [GCC 5.4.0 20160609]
+   machine: Linux-4.15.0-58-generic-x86_64-with-Ubuntu-16.04-xenial
+
+Python deps:
+     numpy: 1.17.0
+    Cython: None
+       pip: 19.2.1
+    pandas: 0.22.0
+   sklearn: 0.21.3
+     scipy: 1.3.0
+setuptools: 40.4.3
+```
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To resolve the issue, I need to examine the implementation of the `_sparse_fit` method in the `scikit-learn` codebase. Since it involves the internal method that is likely part of a SVM-related class, it is advisable to search specifically for the class and method.
+
+I'll start by searching for the `_sparse_fit` method in the codebase to gather relevant information for generating the patch.
+
+```python
+search_method_in_codebase("_sparse_fit")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("_sparse_fit")
+RESULT:
+#### sklearn/impute/_base.py:SimpleImputer._sparse_fit
+```python
+    def _sparse_fit(self, X, strategy, missing_values, fill_value):
+        """Fit the transformer on sparse data."""
+        mask_data = _get_mask(X.data, missing_values)
+        n_implicit_zeros = X.shape[0] - np.diff(X.indptr)
+
+        statistics = np.empty(X.shape[1])
+
+        if strategy == "constant":
+            # for constant strategy, self.statistcs_ is used to store
+            # fill_value in each column
+            statistics.fill(fill_value)
+        else:
+            for i in range(X.shape[1]):
+                column = X.data[X.indptr[i]:X.indptr[i + 1]]
+                mask_column = mask_data[X.indptr[i]:X.indptr[i + 1]]
+                column = column[~mask_column]
+
+                # combine explicit and implicit zeros
+                mask_zeros = _get_mask(column, 0)
+                column = column[~mask_zeros]
+                n_explicit_zeros = mask_zeros.sum()
+                n_zeros = n_implicit_zeros[i] + n_explicit_zeros
+
+                if strategy == "mean":
+                    s = column.size + n_zeros
+                    statistics[i] = np.nan if s == 0 else column.sum() / s
+
+                elif strategy == "median":
+                    statistics[i] = _get_median(column,
+                                                n_zeros)
+
+                elif strategy == "most_frequent":
+                    statistics[i] = _most_frequent(column,
+                                                   0,
+                                                   n_zeros)
+        return statistics
+
+```
+
+#### sklearn/svm/base.py:BaseLibSVM._sparse_fit
+```python
+    def _sparse_fit(self, X, y, sample_weight, solver_type, kernel,
+                    random_seed):
+        X.data = np.asarray(X.data, dtype=np.float64, order='C')
+        X.sort_indices()
+
+        kernel_type = self._sparse_kernels.index(kernel)
+
+        libsvm_sparse.set_verbosity_wrap(self.verbose)
+
+        self.support_, self.support_vectors_, dual_coef_data, \
+            self.intercept_, self._n_support, \
+            self.probA_, self.probB_, self.fit_status_ = \
+            libsvm_sparse.libsvm_sparse_train(
+                X.shape[1], X.data, X.indices, X.indptr, y, solver_type,
+                kernel_type, self.degree, self._gamma, self.coef0, self.tol,
+                self.C, self.class_weight_,
+                sample_weight, self.nu, self.cache_size, self.epsilon,
+                int(self.shrinking), int(self.probability), self.max_iter,
+                random_seed)
+
+        self._warn_from_fit_status()
+
+        if hasattr(self, "classes_"):
+            n_class = len(self.classes_) - 1
+        else:  # regression
+            n_class = 1
+        n_SV = self.support_vectors_.shape[0]
+
+        dual_coef_indices = np.tile(np.arange(n_SV), n_class)
+        dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
+                                     dual_coef_indices.size / n_class)
+        self.dual_coef_ = sp.csr_matrix(
+            (dual_coef_data, dual_coef_indices, dual_coef_indptr),
+            (n_class, n_SV))
+
+```
+
+#### sklearn/preprocessing/data.py:QuantileTransformer._sparse_fit
+```python
+    def _sparse_fit(self, X, random_state):
+        """Compute percentiles for sparse matrices.
+
+        Parameters
+        ----------
+        X : sparse matrix CSC, shape (n_samples, n_features)
+            The data used to scale along the features axis. The sparse matrix
+            needs to be nonnegative.
+        """
+        n_samples, n_features = X.shape
+        references = self.references_ * 100
+
+        self.quantiles_ = []
+        for feature_idx in range(n_features):
+            column_nnz_data = X.data[X.indptr[feature_idx]:
+                                     X.indptr[feature_idx + 1]]
+            if len(column_nnz_data) > self.subsample:
+                column_subsample = (self.subsample * len(column_nnz_data) //
+                                    n_samples)
+                if self.ignore_implicit_zeros:
+                    column_data = np.zeros(shape=column_subsample,
+                                           dtype=X.dtype)
+                else:
+                    column_data = np.zeros(shape=self.subsample, dtype=X.dtype)
+                column_data[:column_subsample] = random_state.choice(
+                    column_nnz_data, size=column_subsample, replace=False)
+            else:
+                if self.ignore_implicit_zeros:
+                    column_data = np.zeros(shape=len(column_nnz_data),
+                                           dtype=X.dtype)
+                else:
+                    column_data = np.zeros(shape=n_samples, dtype=X.dtype)
+                column_data[:len(column_nnz_data)] = column_nnz_data
+
+            if not column_data.size:
+                # if no nnz, an error will be raised for computing the
+                # quantiles. Force the quantiles to be zeros.
+                self.quantiles_.append([0] * len(references))
+            else:
+                self.quantiles_.append(
+                        np.nanpercentile(column_data, references))
+        self.quantiles_ = np.transpose(self.quantiles_)
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

@@ -1,0 +1,156 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Query.resolve_lookup_value coerces value of type list to tuple
+Description
+	
+Changes introduced in #30687 cause an input value list to be coerced to tuple breaking exact value queries. This affects ORM field types that are dependent on matching input types such as PickledField.
+The expected iterable return type should match input iterable type.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import traceback
+import sys
+from django.db import models
+from django.db.models import QuerySet
+from django.test import TestCase
+from django.test.utils import setup_test_environment, teardown_test_environment
+from django.conf import settings
+from django.core.management import call_command
+
+# Configure Django settings
+settings.configure(
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': ':memory:',
+        }
+    },
+    INSTALLED_APPS=[
+        'django.contrib.contenttypes',
+        'django.contrib.auth',
+        'django.contrib.sessions',
+        'django.contrib.messages',
+        'django.contrib.staticfiles',
+        'django.contrib.admin',
+    ],
+    SECRET_KEY='fake-key',
+)
+
+# Setup Django test environment
+setup_test_environment()
+
+# Define a model with a PickledField
+class TestModel(models.Model):
+    data = models.PickledField()
+
+# Create the database tables
+call_command('migrate', verbosity=0)
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+class TestQueryLookup(TestCase):
+    def test_lookup_value_coercion(self):
+        # Create a test instance with a list
+        test_data = [1, 2, 3]
+        TestModel.objects.create(data=test_data)
+
+        # Query the database with the same list
+        try:
+            result = TestModel.objects.filter(data=test_data)
+            # If the issue is present, the result should be empty because the list was coerced to a tuple
+            assert len(result) == 1, "The query should return one result, but it returned none."
+        except AssertionError as e:
+            print_stacktrace(e)
+            raise
+
+# Run the test
+if __name__ == '__main__':
+    test_case = TestQueryLookup()
+    test_case.setUp()
+    try:
+        test_case.test_lookup_value_coercion()
+    finally:
+        test_case.tearDown()
+        teardown_test_environment()
+
+
+This is the tracing and analysis history:
+
+==================================================
+The test script encounters an error when attempting to use `models.PickledField()`. The error message indicates that the `django.db.models` module does not have an attribute `PickledField`. 
+
+The traceback confirms the absence of the `PickledField` attribute in the `django.db.models` module, which is the immediate cause of the error. However, the original issue is related to the coercion of list types to tuples in `Query.resolve_lookup_value`. This means you need to focus on finding where this coercion happens and address it.
+
+Since we have identified that `PickledField` is not part of the Django default fields and thus should be imported from an external library such as `django-picklefield` or another equivalent, the immediate next step is to focus on the section of the Django ORM that potentially coerces list types to tuples inside query resolution.
+
+Thus, this error does not directly relate to the location of the problem with `Query.resolve_lookup_value`. We now need to look into the `resolve_lookup_value` method to identify how this coercion happens.
+
+Observed method: `django/db/models/sql/query.py:Query.resolve_lookup_value`
+==================================================
+
+
+Now you choose downstream method Query.resolve_lookup_value to further observe, tracing the abnormal program behavior.
+This is the method code:
+  1053	    def resolve_lookup_value(self, value, can_reuse, allow_joins, simple_col):
+  1054	        if hasattr(value, 'resolve_expression'):
+  1055	            kwargs = {'reuse': can_reuse, 'allow_joins': allow_joins}
+  1056	            if isinstance(value, F):
+  1057	                kwargs['simple_col'] = simple_col
+  1058	            value = value.resolve_expression(self, **kwargs)
+  1059	        elif isinstance(value, (list, tuple)):
+  1060	            # The items of the iterable may be expressions and therefore need
+  1061	            # to be resolved independently.
+  1062	            resolved_values = []
+  1063	            for sub_value in value:
+  1064	                if hasattr(sub_value, 'resolve_expression'):
+  1065	                    if isinstance(sub_value, F):
+  1066	                        resolved_values.append(sub_value.resolve_expression(
+  1067	                            self, reuse=can_reuse, allow_joins=allow_joins,
+  1068	                            simple_col=simple_col,
+  1069	                        ))
+  1070	                    else:
+  1071	                        resolved_values.append(sub_value.resolve_expression(
+  1072	                            self, reuse=can_reuse, allow_joins=allow_joins,
+  1073	                        ))
+  1074	                else:
+  1075	                    resolved_values.append(sub_value)
+  1076	            value = tuple(resolved_values)
+  1077	        return value
+
+
+This is the runtime information of Query.resolve_lookup_value:
+
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 38, in <module>
+    debugging_test_execution_wrapper(args.test_path, file_scope_dict, args.depth, args.loop)
+  File "run_debugging_test.py", line 13, in debugging_test_execution_wrapper
+    @dbgsnooper.snoop(file_scope_dict=file_scope_dict, depth=depth, loop=loop)
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 249, in __init__
+    assert os.path.exists(file_path)
+AssertionError
+
+ERROR conda.cli.main_run:execute(125): `conda run python run_debugging_test.py --test-path /data/swe-fl/TMP/testbed/django__django-12050/reproduce.py --file-scope-dict {"/data/swe-fl/SRC/DebuggingAgent/src/django/db/models/sql/query.py": [1053, 1077]} --depth 1` failed. (See above for error)
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

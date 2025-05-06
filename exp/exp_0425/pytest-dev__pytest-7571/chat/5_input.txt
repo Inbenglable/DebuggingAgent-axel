@@ -1,0 +1,658 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **pytest** project:
+## ISSUE
+<ISSUE>
+caplog fixture doesn't restore log level after test
+From the documentation at https://docs.pytest.org/en/6.0.0/logging.html#caplog-fixture, "The log levels set are restored automatically at the end of the test".
+It used to work, but looks broken in new 6.0 release. Minimal example to reproduce:
+
+```
+def test_foo(caplog):
+    caplog.set_level(42)
+
+def test_bar(caplog):
+    print(caplog.handler.level)
+```
+
+It prints "0" for pytest<6, "42" after.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import pytest
+
+def test_foo(caplog):
+    print(f"Initial handler level: {caplog.handler.level}")
+    caplog.set_level(42)
+    print(f"Handler level after set_level: {caplog.handler.level}")
+
+def test_bar(caplog):
+    print(f"Handler level in next test: {caplog.handler.level}")
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+
+
+This is the tracing and analysis history:
+
+==================================================
+Given the issue description and the provided test script, the problem appears to stem from the `caplog` fixture not restoring the log level after a test when it should. The test script behavior shows that the log level set in `test_foo` (42) is still present in `test_bar`, indicating the log level was not reset to its original state after `test_foo` was completed.
+
+To address this defect, we need to analyze the behavior of the `caplog` fixture, particularly focusing on how it handles log level modifications and restoration at the end of each test function.
+
+The test appears to indicate that the handling or wrap up after test execution is where the issue lies, which would most likely involve the context or cleanup around tests in the logging handler.
+
+To trace further, we need to observe the method in the pytest codebase responsible for setting and restoring the log level, especially focusing on handler operations with `caplog`. Proceeding, I will observe potential methods involving hook functions or fixture tear-down mechanisms relevant to `caplog`.
+
+Observed method: `src/_pytest/logging.py:LogCaptureFixture.set_level`
+==================================================
+The initial analysis of the `LogCaptureFixture.set_level` method shows that it sets the log level on line 436 with `logger_obj.setLevel(level)` and presumably restores the original log level later using the `self._initial_logger_levels` dictionary which stores the initial log level on line 435. However, the issue is that these levels aren't restored automatically at the end of the test, as indicated by the user's complaint.
+
+The problem likely lies in how and when these stored initial levels are supposed to be used to reset the log level at the end of a test, which is usually handled in a tear-down or finalization method within the fixture lifecycle.
+
+To identify the root cause, I need to observe the finalization logic of the `LogCaptureFixture` to ensure the log levels stored in `self._initial_logger_levels` are indeed restored. This involves tracing the teardown processes or any cleanup mechanisms related to the fixture, which are typically located in methods like `_finalize`.
+
+To further investigate, I will observe the `_finalize` method, since this is logically connected with restoring states or performing cleanup. 
+
+Observed scope: `src/_pytest/logging.py:120-160`
+==================================================
+The runtime information provided pertains to the `auto_indent_option`, which seems unrelated to the `caplog` fixture issue and log level restoration. The observed lines of code essentially deal with indentation logic, rather than with logging.
+
+The issue lies in the fact that log levels are not restored after a test completes, and this code snippet does not address that aspect. We are interested in the procedures that involve handling logging fixtures, specifically focusing on the set and reset of log levels.
+
+To further probe into the root of the problem, we need to find the portion of the code that manages the teardown or cleanup of a test using the `caplog` fixture, ensuring that the log levels are reverted correctly after each test. This process will likely be managed by a method in the `LogCaptureFixture` class.
+
+The next logical step is to observe the `_finalize` method which appears pertinent to teardown procedures.
+
+Observed method: `src/_pytest/logging.py:LogCaptureFixture._finalize`
+==================================================
+The `_finalize` method in the `LogCaptureFixture` class appears to be correctly implemented for restoring logger levels. This method iterates over the initial logger levels stored in `self._initial_logger_levels` and resets them back to their original state at the end of the test. This aligns with the expected behavior described in the documentation. 
+
+However, from the issue description and the tests provided, it seems that the `_finalize` method is not being called as expected after each test, which leads to the log levels not being restored between tests.
+
+The problem might be elsewhere in the lifecycle of test fixtures or in the initialization or integration of this fixture itself, where this `_finalize` method is perhaps not triggered at the correct time or under the correct conditions.
+
+Given this deduction, the next logical step would be to observe how and when the `_finalize` method is invoked within the fixture lifecycle. This would involve understanding how fixture setup and teardown are managed in pytest, particularly for the `caplog` fixture. To trace this, I will need to examine the code responsible for managing fixture finalization.
+
+Therefore, I will move upstream to see how fixtures are finalized, which could lead us to further insights on why `_finalize` isn't called properly.
+
+Observed scope: `src/_pytest/logging.py:LogCaptureFixture.__init__` through any fixture lifecycle management methods. Let's observe:
+```plaintext
+Observed scope: src/_pytest/logging.py:300-350
+```
+==================================================
+
+
+Now you choose LogCaptureFixture._finalize's code snippet 
+   300	        root_logger.addHandler(self.handler)
+   301	        if self.level is not None:
+   302	            self.orig_level = root_logger.level
+   303	            root_logger.setLevel(min(self.orig_level, self.level))
+   304	        return self.handler
+   305	
+   306	    def __exit__(self, type, value, traceback):
+   307	        root_logger = logging.getLogger()
+   308	        if self.level is not None:
+   309	            root_logger.setLevel(self.orig_level)
+   310	        root_logger.removeHandler(self.handler)
+   311	
+   312	
+   313	class LogCaptureHandler(logging.StreamHandler):
+   314	    """A logging handler that stores log records and the log text."""
+   315	
+   316	    stream = None  # type: StringIO
+   317	
+   318	    def __init__(self) -> None:
+   319	        """Creates a new log handler."""
+   320	        super().__init__(StringIO())
+   321	        self.records = []  # type: List[logging.LogRecord]
+   322	
+   323	    def emit(self, record: logging.LogRecord) -> None:
+   324	        """Keep the log records in a list in addition to the log text."""
+   325	        self.records.append(record)
+   326	        super().emit(record)
+   327	
+   328	    def reset(self) -> None:
+   329	        self.records = []
+   330	        self.stream = StringIO()
+   331	
+   332	    def handleError(self, record: logging.LogRecord) -> None:
+   333	        if logging.raiseExceptions:
+   334	            # Fail the test if the log message is bad (emit failed).
+   335	            # The default behavior of logging is to print "Logging error"
+   336	            # to stderr with the call stack and some extra details.
+   337	            # pytest wants to make such mistakes visible during testing.
+   338	            raise
+   339	
+   340	
+   341	class LogCaptureFixture:
+   342	    """Provides access and control of log capturing."""
+   343	
+   344	    def __init__(self, item: nodes.Node) -> None:
+   345	        """Creates a new funcarg."""
+   346	        self._item = item
+   347	        # dict of log name -> log level
+   348	        self._initial_logger_levels = {}  # type: Dict[Optional[str], int]
+   349	
+   350	    def _finalize(self) -> None:
+
+for further observation, tracing the abnormal program behavior.
+
+This is the runtime information of the code snippet you choose to observed in LogCaptureFixture._finalize:
+
+============================= test session starts ==============================
+platform linux -- Python 3.9.21, pytest-6.0.0rc2.dev85+g422685d0b.d20250425, py-1.11.0, pluggy-0.13.1 -- /root/miniforge3/envs/pytest-dev__pytest__6.0/bin/python
+cachedir: .pytest_cache
+rootdir: /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571, configfile: pyproject.toml
+collecting ... collected 2 items
+
+../../../TMP/testbed/pytest-dev__pytest-7571/reproduce.py::test_foo PASSED [ 50%]
+../../../TMP/testbed/pytest-dev__pytest-7571/reproduce.py::test_bar PASSED [100%]
+
+============================== 2 passed in 0.08s ===============================
+
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... __module__ = '_pytest.logging'
+New var:....... __qualname__ = 'catching_logs'
+New var:....... __doc__ = 'Context manager that prepares the whole logging machinery properly.'
+New var:....... __slots__ = ('handler', 'level', 'orig_level')
+New var:....... __init__ = <function catching_logs.__init__ at 0x7fadd02ee5e0>
+New var:....... __enter__ = <function catching_logs.__enter__ at 0x7fadd02ee670>
+ line       306     def __exit__(self, type, value, traceback):
+New var:....... __exit__ = <function catching_logs.__exit__ at 0x7fadd02fab80>
+ return     306     def __exit__(self, type, value, traceback):
+Return value:.. None
+New var:....... __name__ = '_pytest.logging'
+New var:....... __doc__ = ' Access and control log capturing. '
+New var:....... __package__ = '_pytest'
+New var:....... __loader__ = <_frozen_importlib_external.SourceFileLoader object at 0x7fadd0320970>
+New var:....... __spec__ = ModuleSpec(name='_pytest.logging', loader=<_froz.../pytest-dev__pytest-7571/src/_pytest/logging.py')
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py'
+New var:....... __cached__ = '/data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/__pycache__/logging.cpython-39.pyc'
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... logging = <module 'logging' from '/root/miniforge3/envs/py...__pytest__6.0/lib/python3.9/logging/__init__.py'>
+New var:....... os = <module 'os' from '/root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/os.py'>
+New var:....... re = <module 're' from '/root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/re.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... contextmanager = <function contextmanager at 0x7fadd0edb3a0>
+New var:....... StringIO = <class '_io.StringIO'>
+New var:....... AbstractSet = typing.AbstractSet
+New var:....... Dict = typing.Dict
+New var:....... Generator = typing.Generator
+New var:....... List = typing.List
+New var:....... Mapping = typing.Mapping
+New var:....... Optional = typing.Optional
+New var:....... Tuple = typing.Tuple
+New var:....... TypeVar = <class 'typing.TypeVar'>
+New var:....... Union = typing.Union
+New var:....... pytest = <module 'pytest' from '/data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/pytest/__init__.py'>
+New var:....... nodes = <module '_pytest.nodes' from '/data/swe-fl/TMP/t...ed/pytest-dev__pytest-7571/src/_pytest/nodes.py'>
+New var:....... TerminalWriter = <class '_pytest._io.terminalwriter.TerminalWriter'>
+New var:....... CaptureManager = <class '_pytest.capture.CaptureManager'>
+New var:....... nullcontext = <class 'contextlib.nullcontext'>
+New var:....... _strtobool = <function _strtobool at 0x7fadd064bee0>
+New var:....... Config = <class '_pytest.config.Config'>
+New var:....... create_terminal_writer = <function create_terminal_writer at 0x7fadd064be50>
+New var:....... Parser = <class '_pytest.config.argparsing.Parser'>
+New var:....... FixtureRequest = <class '_pytest.fixtures.FixtureRequest'>
+New var:....... Session = <class '_pytest.main.Session'>
+New var:....... Path = <class 'pathlib.Path'>
+New var:....... StoreKey = <class '_pytest.store.StoreKey'>
+New var:....... TerminalReporter = <class '_pytest.terminal.TerminalReporter'>
+New var:....... DEFAULT_LOG_FORMAT = '%(levelname)-8s %(name)s:%(filename)s:%(lineno)d %(message)s'
+New var:....... DEFAULT_LOG_DATE_FORMAT = '%H:%M:%S'
+New var:....... _ANSI_ESCAPE_SEQ = re.compile('\\x1b\\[[\\d;]+m')
+New var:....... caplog_handler_key = <_pytest.store.StoreKey object at 0x7fadd03307a0>
+New var:....... caplog_records_key = <_pytest.store.StoreKey object at 0x7fadd03307c0>
+New var:....... _remove_ansi_escape_sequences = <function _remove_ansi_escape_sequences at 0x7fadd0327790>
+New var:....... ColoredLevelFormatter = <class '_pytest.logging.ColoredLevelFormatter'>
+New var:....... PercentStyleMultiline = <class '_pytest.logging.PercentStyleMultiline'>
+New var:....... get_option_ini = <function get_option_ini at 0x7fadd02c55e0>
+New var:....... pytest_addoption = <function pytest_addoption at 0x7fadd02ee4c0>
+New var:....... _HandlerType = ~_HandlerType
+New var:....... catching_logs = <class '_pytest.logging.catching_logs'>
+ line       313 class LogCaptureHandler(logging.StreamHandler):
+     call       313 class LogCaptureHandler(logging.StreamHandler):
+     line       313 class LogCaptureHandler(logging.StreamHandler):
+    New var:....... __module__ = '_pytest.logging'
+    New var:....... __qualname__ = 'LogCaptureHandler'
+     line       314     """A logging handler that stores log records and the log text."""
+    New var:....... __doc__ = 'A logging handler that stores log records and the log text.'
+     line       316     stream = None  # type: StringIO
+    New var:....... stream = None
+     line       318     def __init__(self) -> None:
+    New var:....... __init__ = <function LogCaptureHandler.__init__ at 0x7fadd02fad30>
+     line       323     def emit(self, record: logging.LogRecord) -> None:
+    New var:....... emit = <function LogCaptureHandler.emit at 0x7fadd02fadc0>
+     line       328     def reset(self) -> None:
+    New var:....... reset = <function LogCaptureHandler.reset at 0x7fadd02fae50>
+     line       332     def handleError(self, record: logging.LogRecord) -> None:
+    New var:....... handleError = <function LogCaptureHandler.handleError at 0x7fadd02faee0>
+    New var:....... __classcell__ = <cell at 0x7fadd0434e20: empty>
+     return     332     def handleError(self, record: logging.LogRecord) -> None:
+    Return value:.. <cell at 0x7fadd0434e20: empty>
+New var:....... LogCaptureHandler = <class '_pytest.logging.LogCaptureHandler'>
+ line       341 class LogCaptureFixture:
+     call       341 class LogCaptureFixture:
+     line       341 class LogCaptureFixture:
+    New var:....... __module__ = '_pytest.logging'
+    New var:....... __qualname__ = 'LogCaptureFixture'
+     line       342     """Provides access and control of log capturing."""
+    New var:....... __doc__ = 'Provides access and control of log capturing.'
+     line       344     def __init__(self, item: nodes.Node) -> None:
+    New var:....... __init__ = <function LogCaptureFixture.__init__ at 0x7fadd02faf70>
+     line       350     def _finalize(self) -> None:
+Starting var:.. self = REPR FAILED
+Starting var:.. __class__ = <class '_pytest.logging.LogCaptureHandler'>
+ call       318     def __init__(self) -> None:
+ line       320         super().__init__(StringIO())
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = REPR FAILED
+    Starting var:.. stream = <_io.StringIO object at 0x7fadd01c6940>
+     call      1049     def __init__(self, stream=None):
+     line      1055         Handler.__init__(self)
+    Modified var:.. self = <LogCaptureHandler (NOTSET)>
+     line      1056         if stream is None:
+     line      1058         self.stream = stream
+     return    1058         self.stream = stream
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+Modified var:.. self = <LogCaptureHandler (NOTSET)>
+ line       321         self.records = []  # type: List[logging.LogRecord]
+ return     321         self.records = []  # type: List[logging.LogRecord]
+Return value:.. None
+Starting var:.. self = REPR FAILED
+Starting var:.. __class__ = <class '_pytest.logging.LogCaptureHandler'>
+ call       318     def __init__(self) -> None:
+ line       320         super().__init__(StringIO())
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = REPR FAILED
+    Starting var:.. stream = <_io.StringIO object at 0x7fadd0193160>
+     call      1049     def __init__(self, stream=None):
+     line      1055         Handler.__init__(self)
+    Modified var:.. self = <LogCaptureHandler (NOTSET)>
+     line      1056         if stream is None:
+     line      1058         self.stream = stream
+     return    1058         self.stream = stream
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+Modified var:.. self = <LogCaptureHandler (NOTSET)>
+ line       321         self.records = []  # type: List[logging.LogRecord]
+ return     321         self.records = []  # type: List[logging.LogRecord]
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd023a400>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (WARNING)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (WARNING)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (WARNING)>
+    Starting var:.. hdlr = <_FileHandler /dev/null (NOTSET)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd02354c0>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (WARNING)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (WARNING)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (WARNING)>
+    Starting var:.. hdlr = <_LiveLoggingNullHandler (NOTSET)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd023a400>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (WARNING)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (WARNING)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (WARNING)>
+    Starting var:.. hdlr = <_FileHandler /dev/null (NOTSET)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd02354c0>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (WARNING)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (WARNING)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (WARNING)>
+    Starting var:.. hdlr = <_LiveLoggingNullHandler (NOTSET)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <LogCaptureHandler (NOTSET)>
+ call       328     def reset(self) -> None:
+ line       329         self.records = []
+ line       330         self.stream = StringIO()
+ return     330         self.stream = StringIO()
+Return value:.. None
+Starting var:.. self = <LogCaptureHandler (NOTSET)>
+ call       328     def reset(self) -> None:
+ line       329         self.records = []
+ line       330         self.stream = StringIO()
+ return     330         self.stream = StringIO()
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd0140b00>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (WARNING)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (WARNING)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (WARNING)>
+    Starting var:.. hdlr = <LogCaptureHandler (NOTSET)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd01407c0>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (WARNING)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (WARNING)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (WARNING)>
+    Starting var:.. hdlr = <LogCaptureHandler (NOTSET)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <LogCaptureHandler (NOTSET)>
+ call       328     def reset(self) -> None:
+ line       329         self.records = []
+ line       330         self.stream = StringIO()
+ return     330         self.stream = StringIO()
+Return value:.. None
+Starting var:.. self = <LogCaptureHandler (NOTSET)>
+ call       328     def reset(self) -> None:
+ line       329         self.records = []
+ line       330         self.stream = StringIO()
+ return     330         self.stream = StringIO()
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd0140d00>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (Level 42)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (Level 42)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (Level 42)>
+    Starting var:.. hdlr = <LogCaptureHandler (NOTSET)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd0140e00>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (Level 42)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (Level 42)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (Level 42)>
+    Starting var:.. hdlr = <LogCaptureHandler (Level 42)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <LogCaptureHandler (Level 42)>
+ call       328     def reset(self) -> None:
+ line       329         self.records = []
+ line       330         self.stream = StringIO()
+ return     330         self.stream = StringIO()
+Return value:.. None
+Starting var:.. self = <LogCaptureHandler (NOTSET)>
+ call       328     def reset(self) -> None:
+ line       329         self.records = []
+ line       330         self.stream = StringIO()
+ return     330         self.stream = StringIO()
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd01500c0>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (WARNING)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (WARNING)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (WARNING)>
+    Starting var:.. hdlr = <LogCaptureHandler (NOTSET)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd0150200>
+Starting var:.. type = None
+Starting var:.. value = None
+Starting var:.. traceback = None
+ call       306     def __exit__(self, type, value, traceback):
+ line       307         root_logger = logging.getLogger()
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. name = None
+     call      2034 def getLogger(name=None):
+     line      2040     if not name or isinstance(name, str) and name == root.name:
+     line      2041         return root
+     return    2041         return root
+    Return value:.. <RootLogger root (WARNING)>
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+New var:....... root_logger = <RootLogger root (WARNING)>
+ line       308         if self.level is not None:
+ line       310         root_logger.removeHandler(self.handler)
+    Source path:... /root/miniforge3/envs/pytest-dev__pytest__6.0/lib/python3.9/logging/__init__.py
+    Starting var:.. self = <RootLogger root (WARNING)>
+    Starting var:.. hdlr = <LogCaptureHandler (Level 42)>
+     call      1612     def removeHandler(self, hdlr):
+     line      1616         _acquireLock()
+     line      1617         try:
+     line      1618             if hdlr in self.handlers:
+     line      1619                 self.handlers.remove(hdlr)
+     line      1621             _releaseLock()
+     return    1621             _releaseLock()
+    Return value:.. None
+Source path:... /data/swe-fl/TMP/testbed/pytest-dev__pytest-7571/src/_pytest/logging.py
+ return     310         root_logger.removeHandler(self.handler)
+Return value:.. None
+Starting var:.. self = <LogCaptureHandler (Level 42)>
+ call       328     def reset(self) -> None:
+ line       329         self.records = []
+ line       330         self.stream = StringIO()
+ return     330         self.stream = StringIO()
+Return value:.. None
+Starting var:.. self = <LogCaptureHandler (NOTSET)>
+ call       328     def reset(self) -> None:
+ line       329         self.records = []
+ line       330         self.stream = StringIO()
+ return     330         self.stream = StringIO()
+Return value:.. None
+Starting var:.. self = <_pytest.logging.catching_logs object at 0x7fadd0150780>
+Starting var:.. type = None
+
+The debugging test execution result is too long to display here. Please re-select your `runtime_info` lists to narrow down the scope of your analysis.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

@@ -1,0 +1,400 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **sympy** project:
+## ISSUE
+<ISSUE>
+autowrap with cython backend fails when array arguments do not appear in wrapped expr
+When using the cython backend for autowrap, it appears that the code is not correctly generated when the function in question has array arguments that do not appear in the final expression. A minimal counterexample is:
+
+```python
+from sympy.utilities.autowrap import autowrap
+from sympy import MatrixSymbol
+import numpy as np
+
+x = MatrixSymbol('x', 2, 1)
+expr = 1.0
+f = autowrap(expr, args=(x,), backend='cython')
+
+f(np.array([[1.0, 2.0]]))
+```
+
+This should of course return `1.0` but instead fails with:
+```python
+TypeError: only size-1 arrays can be converted to Python scalars
+```
+
+A little inspection reveals that this is because the corresponding C function is generated with an incorrect signature:
+
+```C
+double autofunc(double x) {
+
+   double autofunc_result;
+   autofunc_result = 1.0;
+   return autofunc_result;
+
+}
+```
+
+(`x` should be `double *`, not `double` in this case)
+
+I've found that this error won't occur so long as `expr` depends at least in part on each argument. For example this slight modification of the above counterexample works perfectly:
+
+```python
+from sympy.utilities.autowrap import autowrap
+from sympy import MatrixSymbol
+import numpy as np
+
+x = MatrixSymbol('x', 2, 1)
+# now output depends on x
+expr = x[0,0]
+f = autowrap(expr, args=(x,), backend='cython')
+
+# returns 1.0 as expected, without failure
+f(np.array([[1.0, 2.0]]))
+```
+
+This may seem like a silly issue ("why even have `x` as an argument if it doesn't appear in the expression you're trying to evaluate?"). But of course in interfacing with external libraries (e.g. for numerical integration), one often needs functions to have a pre-defined signature regardless of whether a given argument contributes to the output.
+
+I think I've identified the problem in `codegen` and will suggest a PR shortly.
+
+</ISSUE>
+
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+The issue is with the code generation in the `codegen` part of the SymPy library. Specifically, the incorrect function signature is generated when using the cython backend with `autowrap`. To resolve this issue, I need to inspect the source code of the `codegen` module to understand how the function signature is being generated and where the transformation of argument types occurs.
+
+I need to retrieve the source code related to the `autowrap` function and then delve into the `codegen` logic that handles the generation of these C function signatures. It's likely that these are located in the `sympy/utilities/autowrap.py` file and potentially in `sympy/utilities/codegen.py`.
+
+```python
+search_method_in_file("sympy/utilities/autowrap.py", "autowrap")
+search_method_in_codebase("codegen")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("sympy/utilities/autowrap.py", "autowrap")
+RESULT:
+#### sympy/utilities/autowrap.py:autowrap
+```python
+def autowrap(expr, language=None, backend='f2py', tempdir=None, args=None,
+             flags=None, verbose=False, helpers=None, code_gen=None, **kwargs):
+    """Generates python callable binaries based on the math expression.
+
+    Parameters
+    ==========
+
+    expr
+        The SymPy expression that should be wrapped as a binary routine.
+    language : string, optional
+        If supplied, (options: 'C' or 'F95'), specifies the language of the
+        generated code. If ``None`` [default], the language is inferred based
+        upon the specified backend.
+    backend : string, optional
+        Backend used to wrap the generated code. Either 'f2py' [default],
+        or 'cython'.
+    tempdir : string, optional
+        Path to directory for temporary files. If this argument is supplied,
+        the generated code and the wrapper input files are left intact in the
+        specified path.
+    args : iterable, optional
+        An ordered iterable of symbols. Specifies the argument sequence for the
+        function.
+    flags : iterable, optional
+        Additional option flags that will be passed to the backend.
+    verbose : bool, optional
+        If True, autowrap will not mute the command line backends. This can be
+        helpful for debugging.
+    helpers : 3-tuple or iterable of 3-tuples, optional
+        Used to define auxiliary expressions needed for the main expr. If the
+        main expression needs to call a specialized function it should be
+        passed in via ``helpers``. Autowrap will then make sure that the
+        compiled main expression can link to the helper routine. Items should
+        be 3-tuples with (<function_name>, <sympy_expression>,
+        <argument_tuple>). It is mandatory to supply an argument sequence to
+        helper routines.
+    code_gen : CodeGen instance
+        An instance of a CodeGen subclass. Overrides ``language``.
+    include_dirs : [string]
+        A list of directories to search for C/C++ header files (in Unix form
+        for portability).
+    library_dirs : [string]
+        A list of directories to search for C/C++ libraries at link time.
+    libraries : [string]
+        A list of library names (not filenames or paths) to link against.
+    extra_compile_args : [string]
+        Any extra platform- and compiler-specific information to use when
+        compiling the source files in 'sources'.  For platforms and compilers
+        where "command line" makes sense, this is typically a list of
+        command-line arguments, but for other platforms it could be anything.
+    extra_link_args : [string]
+        Any extra platform- and compiler-specific information to use when
+        linking object files together to create the extension (or to create a
+        new static Python interpreter).  Similar interpretation as for
+        'extra_compile_args'.
+
+    Examples
+    ========
+
+    >>> from sympy.abc import x, y, z
+    >>> from sympy.utilities.autowrap import autowrap
+    >>> expr = ((x - y + z)**(13)).expand()
+    >>> binary_func = autowrap(expr)
+    >>> binary_func(1, 4, 2)
+    -1.0
+
+    """
+    if language:
+        if not isinstance(language, type):
+            _validate_backend_language(backend, language)
+    else:
+        language = _infer_language(backend)
+
+    # two cases 1) helpers is an iterable of 3-tuples and 2) helpers is a
+    # 3-tuple
+    if iterable(helpers) and len(helpers) != 0 and iterable(helpers[0]):
+        helpers = helpers if helpers else ()
+    else:
+        helpers = [helpers] if helpers else ()
+    args = list(args) if iterable(args, exclude=set) else args
+
+    if code_gen is None:
+        code_gen = get_code_generator(language, "autowrap")
+
+    CodeWrapperClass = {
+        'F2PY': F2PyCodeWrapper,
+        'CYTHON': CythonCodeWrapper,
+        'DUMMY': DummyWrapper
+    }[backend.upper()]
+    code_wrapper = CodeWrapperClass(code_gen, tempdir, flags if flags else (),
+                                    verbose, **kwargs)
+
+    helps = []
+    for name_h, expr_h, args_h in helpers:
+        helps.append(code_gen.routine(name_h, expr_h, args_h))
+
+    for name_h, expr_h, args_h in helpers:
+        if expr.has(expr_h):
+            name_h = binary_function(name_h, expr_h, backend='dummy')
+            expr = expr.subs(expr_h, name_h(*args_h))
+    try:
+        routine = code_gen.routine('autofunc', expr, args)
+    except CodeGenArgumentListError as e:
+        # if all missing arguments are for pure output, we simply attach them
+        # at the end and try again, because the wrappers will silently convert
+        # them to return values anyway.
+        new_args = []
+        for missing in e.missing_args:
+            if not isinstance(missing, OutputArgument):
+                raise
+            new_args.append(missing.name)
+        routine = code_gen.routine('autofunc', expr, args + new_args)
+
+    return code_wrapper.wrap_code(routine, helpers=helps)
+
+```
+
+
+### API INVOKE: search_method_in_codebase("codegen")
+RESULT:
+#### sympy/utilities/codegen.py:codegen
+```python
+def codegen(name_expr, language=None, prefix=None, project="project",
+            to_files=False, header=True, empty=True, argument_sequence=None,
+            global_vars=None, standard=None, code_gen=None, printer = None):
+    """Generate source code for expressions in a given language.
+
+    Parameters
+    ==========
+
+    name_expr : tuple, or list of tuples
+        A single (name, expression) tuple or a list of (name, expression)
+        tuples.  Each tuple corresponds to a routine.  If the expression is
+        an equality (an instance of class Equality) the left hand side is
+        considered an output argument.  If expression is an iterable, then
+        the routine will have multiple outputs.
+
+    language : string,
+        A string that indicates the source code language.  This is case
+        insensitive.  Currently, 'C', 'F95' and 'Octave' are supported.
+        'Octave' generates code compatible with both Octave and Matlab.
+
+    prefix : string, optional
+        A prefix for the names of the files that contain the source code.
+        Language-dependent suffixes will be appended.  If omitted, the name
+        of the first name_expr tuple is used.
+
+    project : string, optional
+        A project name, used for making unique preprocessor instructions.
+        [default: "project"]
+
+    to_files : bool, optional
+        When True, the code will be written to one or more files with the
+        given prefix, otherwise strings with the names and contents of
+        these files are returned. [default: False]
+
+    header : bool, optional
+        When True, a header is written on top of each source file.
+        [default: True]
+
+    empty : bool, optional
+        When True, empty lines are used to structure the code.
+        [default: True]
+
+    argument_sequence : iterable, optional
+        Sequence of arguments for the routine in a preferred order.  A
+        CodeGenError is raised if required arguments are missing.
+        Redundant arguments are used without warning.  If omitted,
+        arguments will be ordered alphabetically, but with all input
+        arguments first, and then output or in-out arguments.
+
+    global_vars : iterable, optional
+        Sequence of global variables used by the routine.  Variables
+        listed here will not show up as function arguments.
+
+    standard : string
+
+    code_gen : CodeGen instance
+        An instance of a CodeGen subclass. Overrides ``language``.
+
+    Examples
+    ========
+
+    >>> from sympy.utilities.codegen import codegen
+    >>> from sympy.abc import x, y, z
+    >>> [(c_name, c_code), (h_name, c_header)] = codegen(
+    ...     ("f", x+y*z), "C89", "test", header=False, empty=False)
+    >>> print(c_name)
+    test.c
+    >>> print(c_code)
+    #include "test.h"
+    #include <math.h>
+    double f(double x, double y, double z) {
+       double f_result;
+       f_result = x + y*z;
+       return f_result;
+    }
+    <BLANKLINE>
+    >>> print(h_name)
+    test.h
+    >>> print(c_header)
+    #ifndef PROJECT__TEST__H
+    #define PROJECT__TEST__H
+    double f(double x, double y, double z);
+    #endif
+    <BLANKLINE>
+
+    Another example using Equality objects to give named outputs.  Here the
+    filename (prefix) is taken from the first (name, expr) pair.
+
+    >>> from sympy.abc import f, g
+    >>> from sympy import Eq
+    >>> [(c_name, c_code), (h_name, c_header)] = codegen(
+    ...      [("myfcn", x + y), ("fcn2", [Eq(f, 2*x), Eq(g, y)])],
+    ...      "C99", header=False, empty=False)
+    >>> print(c_name)
+    myfcn.c
+    >>> print(c_code)
+    #include "myfcn.h"
+    #include <math.h>
+    double myfcn(double x, double y) {
+       double myfcn_result;
+       myfcn_result = x + y;
+       return myfcn_result;
+    }
+    void fcn2(double x, double y, double *f, double *g) {
+       (*f) = 2*x;
+       (*g) = y;
+    }
+    <BLANKLINE>
+
+    If the generated function(s) will be part of a larger project where various
+    global variables have been defined, the 'global_vars' option can be used
+    to remove the specified variables from the function signature
+
+    >>> from sympy.utilities.codegen import codegen
+    >>> from sympy.abc import x, y, z
+    >>> [(f_name, f_code), header] = codegen(
+    ...     ("f", x+y*z), "F95", header=False, empty=False,
+    ...     argument_sequence=(x, y), global_vars=(z,))
+    >>> print(f_code)
+    REAL*8 function f(x, y)
+    implicit none
+    REAL*8, intent(in) :: x
+    REAL*8, intent(in) :: y
+    f = x + y*z
+    end function
+    <BLANKLINE>
+
+    """
+
+    # Initialize the code generator.
+    if language is None:
+        if code_gen is None:
+            raise ValueError("Need either language or code_gen")
+    else:
+        if code_gen is not None:
+            raise ValueError("You cannot specify both language and code_gen.")
+        code_gen = get_code_generator(language, project, standard, printer)
+
+    if isinstance(name_expr[0], string_types):
+        # single tuple is given, turn it into a singleton list with a tuple.
+        name_expr = [name_expr]
+
+    if prefix is None:
+        prefix = name_expr[0][0]
+
+    # Construct Routines appropriate for this code_gen from (name, expr) pairs.
+    routines = []
+    for name, expr in name_expr:
+        routines.append(code_gen.routine(name, expr, argument_sequence,
+                                         global_vars))
+
+    # Write the code.
+    return code_gen.write(routines, prefix, to_files, header, empty)
+
+```
+
+
+==================================================
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+## IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+## IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

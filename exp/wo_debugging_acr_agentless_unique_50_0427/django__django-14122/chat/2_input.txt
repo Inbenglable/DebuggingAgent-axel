@@ -1,0 +1,171 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Meta.ordering fields must not be included in GROUP BY clause
+Description
+	
+This continues (closed) [1] ticket.
+I beleave it was not properly fixed in commit [0ddb4ebf].
+While commit [0ddb4ebf] removes ORDER BY when Meta.ordering is used it still does populates GROUP BY with Meta.ordering fields thus leads to wrong aggregation.
+PR with test case was added at [2].
+[1] https://code.djangoproject.com/ticket/14357
+[2] ​​https://github.com/django/django/pull/14122
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To address the issue regarding the inappropriate inclusion of `Meta.ordering` fields in the `GROUP BY` clause, I need to locate and potentially modify the code responsible for query generation, particularly where the `Meta.ordering` might be affecting the `GROUP BY` clause.
+
+As a starting point, I should retrieve the existing implementation related to query construction, focusing on how the `Meta.ordering` interacts with `GROUP BY`. This will likely involve examining the ORM components within Django, such as the queryset or query generation logic in the `Query` or `QuerySet` classes.
+
+I'll proceed by retrieving relevant source code to identify the specific points where changes might be required.
+
+```python
+search_class_in_codebase("Query")
+search_class_in_codebase("QuerySet")
+search_method_in_codebase("add_fields")
+search_method_in_codebase("add_ordering")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("add_fields")
+RESULT:
+#### tests/model_formsets_regress/tests.py:BaseCustomDeleteFormSet.add_fields
+```python
+    def add_fields(self, form, index):
+        super().add_fields(form, index)
+        self.can_delete = True
+        if DELETION_FIELD_NAME in form.fields:
+            del form.fields[DELETION_FIELD_NAME]
+
+```
+
+#### django/db/models/sql/query.py:Query.add_fields
+```python
+    def add_fields(self, field_names, allow_m2m=True):
+        """
+        Add the given (model) fields to the select set. Add the field names in
+        the order specified.
+        """
+        alias = self.get_initial_alias()
+        opts = self.get_meta()
+
+        try:
+            cols = []
+            for name in field_names:
+                # Join promotion note - we must not remove any rows here, so
+                # if there is no existing joins, use outer join.
+                join_info = self.setup_joins(name.split(LOOKUP_SEP), opts, alias, allow_many=allow_m2m)
+                targets, final_alias, joins = self.trim_joins(
+                    join_info.targets,
+                    join_info.joins,
+                    join_info.path,
+                )
+                for target in targets:
+                    cols.append(join_info.transform_function(target, final_alias))
+            if cols:
+                self.set_select(cols)
+        except MultiJoin:
+            raise FieldError("Invalid field name: '%s'" % name)
+        except FieldError:
+            if LOOKUP_SEP in name:
+                # For lookups spanning over relationships, show the error
+                # from the model on which the lookup failed.
+                raise
+            elif name in self.annotations:
+                raise FieldError(
+                    "Cannot select the '%s' alias. Use annotate() to promote "
+                    "it." % name
+                )
+            else:
+                names = sorted([
+                    *get_field_names_from_opts(opts), *self.extra,
+                    *self.annotation_select, *self._filtered_relations
+                ])
+                raise FieldError("Cannot resolve keyword %r into field. "
+                                 "Choices are: %s" % (name, ", ".join(names)))
+
+```
+
+#### django/forms/formsets.py:BaseFormSet.add_fields
+```python
+    def add_fields(self, form, index):
+        """A hook for adding extra fields on to each form instance."""
+        initial_form_count = self.initial_form_count()
+        if self.can_order:
+            # Only pre-fill the ordering field for initial forms.
+            if index is not None and index < initial_form_count:
+                form.fields[ORDERING_FIELD_NAME] = IntegerField(
+                    label=_('Order'),
+                    initial=index + 1,
+                    required=False,
+                    widget=self.get_ordering_widget(),
+                )
+            else:
+                form.fields[ORDERING_FIELD_NAME] = IntegerField(
+                    label=_('Order'),
+                    required=False,
+                    widget=self.get_ordering_widget(),
+                )
+        if self.can_delete and (self.can_delete_extra or index < initial_form_count):
+            form.fields[DELETION_FIELD_NAME] = BooleanField(label=_('Delete'), required=False)
+
+```
+
+#### django/forms/models.py:BaseInlineFormSet.add_fields
+```python
+    def add_fields(self, form, index):
+        super().add_fields(form, index)
+        if self._pk_field == self.fk:
+            name = self._pk_field.name
+            kwargs = {'pk_field': True}
+        else:
+            # The foreign key field might not be on the form, so we poke at the
+            # Model field to get the label, since we need that for error messages.
+            name = self.fk.name
+            kwargs = {
+                'label': getattr(form.fields.get(name), 'label', capfirst(self.fk.verbose_name))
+            }
+
+        # The InlineForeignKeyField assumes that the foreign key relation is
+        # based on the parent model's pk. If this isn't the case, set to_field
+        # to correctly resolve the initial form value.
+        if self.fk.remote_field.field_name != self.fk.remote_field.model._meta.pk.name:
+            kwargs['to_field'] = self.fk.remote_field.field_name
+
+        # If we're adding a new object, ignore a parent's auto-generated key
+        # as it will be regenerated on the save request.
+        if self.instance._state.adding:
+            if kwargs.get('to_field') is not None:
+                to_field = self.instance._meta.get_field(kwargs['to_field'])
+            else:
+                to_field = self.instance._meta.pk
+            if to_field.has_default():
+                setattr(self.instance, to_field.attname, None)
+
+        form.fields[name] = InlineForeignKeyField(self.instance, **kwargs)
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

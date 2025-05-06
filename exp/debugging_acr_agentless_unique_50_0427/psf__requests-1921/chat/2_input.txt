@@ -1,0 +1,191 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **requests** project:
+## ISSUE
+<ISSUE>
+Removing a default header of a session
+[The docs](http://docs.python-requests.org/en/latest/user/advanced/#session-objects) say that you can prevent sending a session header by setting the headers value to None in the method's arguments. You would expect (as [discussed on IRC](https://botbot.me/freenode/python-requests/msg/10788170/)) that this would work for session's default headers, too:
+
+``` python
+session = requests.Session()
+# Do not send Accept-Encoding
+session.headers['Accept-Encoding'] = None
+```
+
+What happens is that "None"  gets sent as the value of header.
+
+```
+Accept-Encoding: None
+```
+
+For the reference, here is a way that works:
+
+``` python
+del session.headers['Accept-Encoding']
+```
+
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import requests
+
+# Create a session
+session = requests.Session()
+
+# Try to remove Accept-Encoding header by setting it to None
+session.headers['Accept-Encoding'] = None
+
+# Make a request to see what headers are sent
+r = session.get('http://httpbin.org/headers')
+print(r.json())
+
+
+This is the tracing and analysis history:
+
+==================================================
+To analyze the abnormal behavior and identify why the `TypeError: expected string or bytes-like object` is occurring, let's trace through the process of setting the headers and making the request.
+
+The problematic behavior arises from setting a header value to `None`. When this value is used during a request, it is not compatible with expectations of the underlying HTTP client, which expects a string or bytes-like object.
+
+The execution trace shows the stack leading up to the error:
+1. `session.get('http://httpbin.org/headers')` ends up calling `self.request('GET', url, **kwargs)`.
+2. This leads to the `send` method in `requests.sessions.py`.
+3. Following that, it delves into `requests.adapters.py` to `adapter.send(request, **kwargs)`.
+4. Eventually, it reaches `urllib3.connectionpool.py`, and finally, the execution ends up in `http.client.py`, where the error arises due to the attempt to use a `None` value for a header.
+
+The key observation is the handling of headers within the `session` and how it propagates to a point where a header value ends up being processed by the HTTP client.
+
+Since setting a header value to `None` does not inherently remove it but instead leads to an invalid value passed downstream, the source resolution will need to be where headers are modified or read within the request process.
+
+For this, locating where headers are handled during requests in the `requests.sessions` module is pivotal. Based on the anomaly, we need to inspect how headers are stored and manipulated through the process of building an HTTP request.
+
+Further observation is necessary in:
+
+Observed method: `requests/sessions.py:Session.request`
+==================================================
+
+
+Now you choose downstream method Session.request to further observe, tracing the abnormal program behavior.
+This is the method code:
+   299	    def request(self, method, url,
+   300	        params=None,
+   301	        data=None,
+   302	        headers=None,
+   303	        cookies=None,
+   304	        files=None,
+   305	        auth=None,
+   306	        timeout=None,
+   307	        allow_redirects=True,
+   308	        proxies=None,
+   309	        hooks=None,
+   310	        stream=None,
+   311	        verify=None,
+   312	        cert=None):
+   313	        """Constructs a :class:`Request <Request>`, prepares it and sends it.
+   314	        Returns :class:`Response <Response>` object.
+   315	
+   316	        :param method: method for the new :class:`Request` object.
+   317	        :param url: URL for the new :class:`Request` object.
+   318	        :param params: (optional) Dictionary or bytes to be sent in the query
+   319	            string for the :class:`Request`.
+   320	        :param data: (optional) Dictionary or bytes to send in the body of the
+   321	            :class:`Request`.
+   322	        :param headers: (optional) Dictionary of HTTP Headers to send with the
+   323	            :class:`Request`.
+   324	        :param cookies: (optional) Dict or CookieJar object to send with the
+   325	            :class:`Request`.
+   326	        :param files: (optional) Dictionary of 'filename': file-like-objects
+   327	            for multipart encoding upload.
+   328	        :param auth: (optional) Auth tuple or callable to enable
+   329	            Basic/Digest/Custom HTTP Auth.
+   330	        :param timeout: (optional) Float describing the timeout of the
+   331	            request.
+   332	        :param allow_redirects: (optional) Boolean. Set to True by default.
+   333	        :param proxies: (optional) Dictionary mapping protocol to the URL of
+   334	            the proxy.
+   335	        :param stream: (optional) whether to immediately download the response
+   336	            content. Defaults to ``False``.
+   337	        :param verify: (optional) if ``True``, the SSL cert will be verified.
+   338	            A CA_BUNDLE path can also be provided.
+   339	        :param cert: (optional) if String, path to ssl client cert file (.pem).
+   340	            If Tuple, ('cert', 'key') pair.
+   341	        """
+   342	
+   343	        method = builtin_str(method)
+   344	
+   345	        # Create the Request.
+   346	        req = Request(
+   347	            method = method.upper(),
+   348	            url = url,
+   349	            headers = headers,
+   350	            files = files,
+   351	            data = data or {},
+   352	            params = params or {},
+   353	            auth = auth,
+   354	            cookies = cookies,
+   355	            hooks = hooks,
+   356	        )
+   357	        prep = self.prepare_request(req)
+   358	
+   359	        proxies = proxies or {}
+   360	
+   361	        # Gather clues from the surrounding environment.
+   362	        if self.trust_env:
+   363	            # Set environment's proxies.
+   364	            env_proxies = get_environ_proxies(url) or {}
+   365	            for (k, v) in env_proxies.items():
+   366	                proxies.setdefault(k, v)
+   367	
+   368	            # Look for configuration.
+   369	            if not verify and verify is not False:
+   370	                verify = os.environ.get('REQUESTS_CA_BUNDLE')
+   371	
+   372	            # Curl compatibility.
+   373	            if not verify and verify is not False:
+   374	                verify = os.environ.get('CURL_CA_BUNDLE')
+   375	
+   376	        # Merge all the kwargs.
+   377	        proxies = merge_setting(proxies, self.proxies)
+   378	        stream = merge_setting(stream, self.stream)
+   379	        verify = merge_setting(verify, self.verify)
+   380	        cert = merge_setting(cert, self.cert)
+   381	
+   382	        # Send the request.
+   383	        send_kwargs = {
+   384	            'stream': stream,
+   385	            'timeout': timeout,
+   386	            'verify': verify,
+   387	            'cert': cert,
+   388	            'proxies': proxies,
+   389	            'allow_redirects': allow_redirects,
+   390	        }
+   391	        resp = self.send(prep, **send_kwargs)
+   392	
+   393	        return resp
+
+
+This is the runtime information of Session.request:
+
+Traceback (most recent call last):
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 38, in <module>
+    debugging_test_execution_wrapper(args.test_path, file_scope_dict, args.depth, args.loop)
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 13, in debugging_test_execution_wrapper
+    @dbgsnooper.snoop(file_scope_dict=file_scope_dict, depth=depth, loop=loop)
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 249, in __init__
+    assert os.path.exists(file_path)
+AssertionError
+
+ERROR conda.cli.main_run:execute(125): `conda run python run_debugging_test.py --test-path /data/swe-fl/TMP/testbed/psf__requests-1921/reproduce.py --file-scope-dict {"/data/swe-fl/SRC/DebuggingAgent/src/requests/sessions.py": [299, 393]} --depth 1` failed. (See above for error)
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

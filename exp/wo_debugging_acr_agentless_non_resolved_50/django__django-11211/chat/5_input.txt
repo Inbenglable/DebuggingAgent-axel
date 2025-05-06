@@ -1,0 +1,241 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Prefetch related is not working when used GFK for model that uses UUID field as PK.
+Description
+	
+How to reproduce:
+create model with UUID as primary key
+class Foo(models.Model):
+	id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+	...
+create another model with GFK to model Foo
+class Bar(models.Model):
+	foo_content_type = models.ForeignKey(
+		ContentType, related_name='actor',
+		on_delete=models.CASCADE, db_index=True
+	)
+	foo_object_id = models.CharField(max_length=255, db_index=True)
+	foo = GenericForeignKey('foo_content_type', 'foo_object_id')
+	...
+and try to get queryset with prefetch related (django orm engine return None for attribute foo):
+Bar.objects.all().prefetch_related('foo')
+Thanks a lot for your attention! Also i wanna point out some related bug report from third party library in which previously i faced with that issue, maybe it would useful – ​https://github.com/justquick/django-activity-stream/issues/245
+
+</ISSUE>
+
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+To address the issue, it appears that the problem lies in how Django's ORM handles prefetching of GenericForeignKey relationships when the primary key is a UUID field. Specifically, the conversion between UUID objects and their string representations might be causing the problem.
+
+A typical approach to fix such a problem would be to ensure that the `foo_object_id` field stores the UUID in its canonical string format, and any retrieval operations correctly interpret this format as a UUID, especially when those operations interact with the ContentType framework.
+
+Before generating a patch, I need to:
+
+1. Explore Django's ORM prefetch-related and how it interacts with GenericForeignKey fields.
+2. Check any relevant utilities or methods in Django's source code that manage GenericForeignKeys, especially how they convert between UUID and string, which might not be directly evident without understanding the framework's internals.
+
+Therefore, I need to explore the Django source code related to GenericForeignKey and the prefetch_related functionality.
+
+```python
+search_class_in_codebase("GenericForeignKey")
+search_method_in_codebase("prefetch_related")
+search_code_in_codebase("UUIDField")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_class_in_codebase("GenericForeignKey")
+RESULT:
+#### django/contrib/contenttypes/fields.py:GenericForeignKey
+```python
+class GenericForeignKey(FieldCacheMixin):
+    """
+    Provide a generic many-to-one relation through the ``content_type`` and
+    ``object_id`` fields.
+
+    This class also doubles as an accessor to the related object (similar to
+    ForwardManyToOneDescriptor) by adding itself as a model attribute.
+    """
+
+    # Field flags
+    auto_created = False
+    concrete = False
+    editable = False
+    hidden = False
+
+    is_relation = True
+    many_to_many = False
+    many_to_one = True
+    one_to_many = False
+    one_to_one = False
+    related_model = None
+    remote_field = None
+
+    def __init__(self, ct_field='content_type', fk_field='object_id', for_concrete_model=True):
+        ...
+
+    def contribute_to_class(self, cls, name, **kwargs):
+        ...
+
+    def get_filter_kwargs_for_object(self, obj):
+        ...
+
+    def get_forward_related_filter(self, obj):
+        ...
+
+    def __str__(self):
+        ...
+
+    def check(self, **kwargs):
+        ...
+
+    def _check_field_name(self):
+        ...
+
+    def _check_object_id_field(self):
+        ...
+
+    def _check_content_type_field(self):
+        ...
+
+    def get_cache_name(self):
+        ...
+
+    def get_content_type(self, obj=None, id=None, using=None):
+        ...
+
+    def get_prefetch_queryset(self, instances, queryset=None):
+        ...
+
+    def __get__(self, instance, cls=None):
+        ...
+
+    def __set__(self, instance, value):
+        ...
+```
+
+
+### API INVOKE: search_method_in_codebase("prefetch_related")
+RESULT:
+#### django/db/models/query.py:RawQuerySet.prefetch_related
+```python
+    def prefetch_related(self, *lookups):
+        """Same as QuerySet.prefetch_related()"""
+        clone = self._clone()
+        if lookups == (None,):
+            clone._prefetch_related_lookups = ()
+        else:
+            clone._prefetch_related_lookups = clone._prefetch_related_lookups + lookups
+        return clone
+
+```
+
+
+==================================================
+
+Your Output:
+```python
+search_method_in_file("django/contrib/contenttypes/fields.py", "GenericForeignKey.get_prefetch_queryset")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("django/contrib/contenttypes/fields.py", "GenericForeignKey.get_prefetch_queryset")
+RESULT:
+#### django/contrib/contenttypes/fields.py:GenericForeignKey.get_prefetch_queryset
+```python
+    def get_prefetch_queryset(self, instances, queryset=None):
+        if queryset is not None:
+            raise ValueError("Custom queryset can't be used for this lookup.")
+
+        # For efficiency, group the instances by content type and then do one
+        # query per model
+        fk_dict = defaultdict(set)
+        # We need one instance for each group in order to get the right db:
+        instance_dict = {}
+        ct_attname = self.model._meta.get_field(self.ct_field).get_attname()
+        for instance in instances:
+            # We avoid looking for values if either ct_id or fkey value is None
+            ct_id = getattr(instance, ct_attname)
+            if ct_id is not None:
+                fk_val = getattr(instance, self.fk_field)
+                if fk_val is not None:
+                    fk_dict[ct_id].add(fk_val)
+                    instance_dict[ct_id] = instance
+
+        ret_val = []
+        for ct_id, fkeys in fk_dict.items():
+            instance = instance_dict[ct_id]
+            ct = self.get_content_type(id=ct_id, using=instance._state.db)
+            ret_val.extend(ct.get_all_objects_for_this_type(pk__in=fkeys))
+
+        # For doing the join in Python, we have to match both the FK val and the
+        # content type, so we use a callable that returns a (fk, class) pair.
+        def gfk_key(obj):
+            ct_id = getattr(obj, ct_attname)
+            if ct_id is None:
+                return None
+            else:
+                model = self.get_content_type(id=ct_id,
+                                              using=obj._state.db).model_class()
+                return (model._meta.pk.get_prep_value(getattr(obj, self.fk_field)),
+                        model)
+
+        return (
+            ret_val,
+            lambda obj: (obj.pk, obj.__class__),
+            gfk_key,
+            True,
+            self.name,
+            True,
+        )
+
+```
+
+
+==================================================
+
+Your Output:
+I have the necessary understanding of how the `GenericForeignKey.get_prefetch_queryset` method works and its interaction with UUID fields to proceed with generating a patch. The issue seems to arise from the storage and retrieval of UUIDs as strings, which needs to be handled properly during the prefetching process.
+
+Ready generation: `True`
+==================================================
+
+Now, you need to generate patches to resolve the issue. Please ensure that your patch does not disrupt the original functionality of the code.
+You should generate *SEARCH/REPLACE* format patches to fix the issue.
+Every *SEARCH/REPLACE* edit must use this format:
+```pythony
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+
+A final json reply example:
+```json
+{
+  "search_replace_edits": [
+    "### A/B.py\n<<<<<<< SEARCH
+       def foo():\n=======\n    def bar():\n>>>>>>> REPLACE\n",
+    "### A/B.py\n<<<<<<< SEARCH
+       x = x + 1\n=======\n    x = x - 1\n>>>>>>> REPLACE\n",
+}
+```
+
+

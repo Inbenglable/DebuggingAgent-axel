@@ -1,0 +1,771 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Add `nonform` CSS class for non form errors in FormSets
+Description
+	 
+		(last modified by Ties Jan Hefting)
+	 
+Forms add the nonfield CSS class for non field errors in ErrorList instances. This is documented in a section on ​rendering form error messages. Similarly, in FormSets I'd expect to see the nonform CSS class added for non form errors. This would allow a custom ErrorList to make a distinction in form field errors, non field errors (forms) and non form errors (FormSets) when rendering error messages. Therefore I'd suggest to add this nonform CSS class and document it for developers to use.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import traceback
+import sys
+import django
+from django import forms
+from django.forms.formsets import formset_factory, BaseFormSet
+from django.forms.utils import ErrorList
+from django.conf import settings
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Configure minimal Django settings
+settings.configure(
+    DEBUG=True,
+    USE_I18N=True,
+    INSTALLED_APPS=[
+        'django.forms',
+    ],
+)
+
+# Initialize Django
+django.setup()
+
+class MyForm(forms.Form):
+    name = forms.CharField()
+
+class BaseMyFormSet(BaseFormSet):
+    def clean(self):
+        super().clean()
+        if any(self.errors):
+            return
+        raise forms.ValidationError("Non-form error")
+
+MyFormSet = formset_factory(MyForm, formset=BaseMyFormSet, extra=1)
+
+def main():
+    formset = MyFormSet(data={})
+    if formset.is_valid():
+        print("FormSet is valid, no errors to check.")
+        return
+
+    # Check if non-form errors have the 'nonform' CSS class
+    non_form_errors = formset.non_form_errors()
+    if not non_form_errors:
+        print("No non-form errors found.")
+        return
+
+    # Check if the ErrorList has the 'nonform' CSS class
+    if not isinstance(non_form_errors, ErrorList) or 'nonform' not in non_form_errors.as_ul():
+        e = AssertionError("Non-form errors do not have the 'nonform' CSS class.")
+        print_stacktrace(e)
+        raise e
+
+    print("Issue is fixed: Non-form errors have the 'nonform' CSS class.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+This is the tracing and analysis history:
+
+==================================================
+Based on the provided test code, we know the issue is related to handling non-form errors within a `FormSet` in Django. The Django framework attaches a specific CSS class for non-field errors inside a form, but it appears not to do the same for non-form errors in a formset as expected. 
+
+Here's what we're seeing in the test setup:
+
+1. A minimal Django settings configuration is made, focusing on the forms app.
+2. `django.setup()` is called to initialize Django.
+3. A custom form and formset are created. The formset is designed to raise a non-form error.
+4. The test checks if the non-form errors have a 'nonform' CSS class and this leads to a failure, indicating the missing functionality.
+
+From this analysis, the issue likely lies within the Django formset error handling logic, specifically how it attaches CSS classes to non-form errors.
+
+Next, I will observe the creation of the formset, as this will give us insight into where errors are being processed.
+
+Observed method: `django/forms/formsets.py:formset_factory`
+==================================================
+The current analysis suggests that the issue lies within the handling of non-form errors in FormSets, specifically their CSS class decoration. In Django's `formset_factory`, a formset class is dynamically created with the given parameters and attributes. This part of the code is responsible for configuring the FormSet's behavior and attributes but does not deal directly with error handling or CSS class assignment.
+
+To locate the specific method where the 'nonform' CSS class should be applied to non-form errors, it would be useful to trace further into how non-form errors are generated and processed in the formset.
+
+Since the current information points to the main issue existing beyond merely setting up the FormSet, I am interested in further exploring the error handling specifically for FormSets.
+
+Therefore, the next step is to examine the methods responsible for error processing in FormSets. A likely candidate for this deeper observation would be the methods dealing with the cleaning process and error assignment in FormSets (possibly within the BaseFormSet class).
+
+Observed scope: `django/forms/formsets.py:BaseFormSet:Lin121-Lin191` (illustrative reference for accessing error handling in the BaseFormSet class)
+==================================================
+
+
+Now you choose downstream method BaseFormSet to further observe, tracing the abnormal program behavior.
+This is the method code:
+    54	class BaseFormSet:
+    55	    """
+    56	    A collection of instances of the same Form class.
+    57	    """
+    58	    ordering_widget = NumberInput
+    59	    default_error_messages = {
+    60	        'missing_management_form': _(
+    61	            'ManagementForm data is missing or has been tampered with. Missing fields: '
+    62	            '%(field_names)s. You may need to file a bug report if the issue persists.'
+    63	        ),
+    64	    }
+    65	
+    66	    def __init__(self, data=None, files=None, auto_id='id_%s', prefix=None,
+    67	                 initial=None, error_class=ErrorList, form_kwargs=None,
+    68	                 error_messages=None):
+    69	        self.is_bound = data is not None or files is not None
+    70	        self.prefix = prefix or self.get_default_prefix()
+    71	        self.auto_id = auto_id
+    72	        self.data = data or {}
+    73	        self.files = files or {}
+    74	        self.initial = initial
+    75	        self.form_kwargs = form_kwargs or {}
+    76	        self.error_class = error_class
+    77	        self._errors = None
+    78	        self._non_form_errors = None
+    79	
+    80	        messages = {}
+    81	        for cls in reversed(type(self).__mro__):
+    82	            messages.update(getattr(cls, 'default_error_messages', {}))
+    83	        if error_messages is not None:
+    84	            messages.update(error_messages)
+    85	        self.error_messages = messages
+    86	
+    87	    def __str__(self):
+    88	        return self.as_table()
+    89	
+    90	    def __iter__(self):
+    91	        """Yield the forms in the order they should be rendered."""
+    92	        return iter(self.forms)
+    93	
+    94	    def __getitem__(self, index):
+    95	        """Return the form at the given index, based on the rendering order."""
+    96	        return self.forms[index]
+    97	
+    98	    def __len__(self):
+    99	        return len(self.forms)
+   100	
+   101	    def __bool__(self):
+   102	        """
+   103	        Return True since all formsets have a management form which is not
+   104	        included in the length.
+   105	        """
+   106	        return True
+   107	
+   108	    @cached_property
+   109	    def management_form(self):
+   110	        """Return the ManagementForm instance for this FormSet."""
+   111	        if self.is_bound:
+   112	            form = ManagementForm(self.data, auto_id=self.auto_id, prefix=self.prefix)
+   113	            form.full_clean()
+   114	        else:
+   115	            form = ManagementForm(auto_id=self.auto_id, prefix=self.prefix, initial={
+   116	                TOTAL_FORM_COUNT: self.total_form_count(),
+   117	                INITIAL_FORM_COUNT: self.initial_form_count(),
+   118	                MIN_NUM_FORM_COUNT: self.min_num,
+   119	                MAX_NUM_FORM_COUNT: self.max_num
+   120	            })
+   121	        return form
+   122	
+   123	    def total_form_count(self):
+   124	        """Return the total number of forms in this FormSet."""
+   125	        if self.is_bound:
+   126	            # return absolute_max if it is lower than the actual total form
+   127	            # count in the data; this is DoS protection to prevent clients
+   128	            # from forcing the server to instantiate arbitrary numbers of
+   129	            # forms
+   130	            return min(self.management_form.cleaned_data[TOTAL_FORM_COUNT], self.absolute_max)
+   131	        else:
+   132	            initial_forms = self.initial_form_count()
+   133	            total_forms = max(initial_forms, self.min_num) + self.extra
+   134	            # Allow all existing related objects/inlines to be displayed,
+   135	            # but don't allow extra beyond max_num.
+   136	            if initial_forms > self.max_num >= 0:
+   137	                total_forms = initial_forms
+   138	            elif total_forms > self.max_num >= 0:
+   139	                total_forms = self.max_num
+   140	        return total_forms
+   141	
+   142	    def initial_form_count(self):
+   143	        """Return the number of forms that are required in this FormSet."""
+   144	        if self.is_bound:
+   145	            return self.management_form.cleaned_data[INITIAL_FORM_COUNT]
+   146	        else:
+   147	            # Use the length of the initial data if it's there, 0 otherwise.
+   148	            initial_forms = len(self.initial) if self.initial else 0
+   149	        return initial_forms
+   150	
+   151	    @cached_property
+   152	    def forms(self):
+   153	        """Instantiate forms at first property access."""
+   154	        # DoS protection is included in total_form_count()
+   155	        return [
+   156	            self._construct_form(i, **self.get_form_kwargs(i))
+   157	            for i in range(self.total_form_count())
+   158	        ]
+   159	
+   160	    def get_form_kwargs(self, index):
+   161	        """
+   162	        Return additional keyword arguments for each individual formset form.
+   163	
+   164	        index will be None if the form being constructed is a new empty
+   165	        form.
+   166	        """
+   167	        return self.form_kwargs.copy()
+   168	
+   169	    def _construct_form(self, i, **kwargs):
+   170	        """Instantiate and return the i-th form instance in a formset."""
+   171	        defaults = {
+   172	            'auto_id': self.auto_id,
+   173	            'prefix': self.add_prefix(i),
+   174	            'error_class': self.error_class,
+   175	            # Don't render the HTML 'required' attribute as it may cause
+   176	            # incorrect validation for extra, optional, and deleted
+   177	            # forms in the formset.
+   178	            'use_required_attribute': False,
+   179	        }
+   180	        if self.is_bound:
+   181	            defaults['data'] = self.data
+   182	            defaults['files'] = self.files
+   183	        if self.initial and 'initial' not in kwargs:
+   184	            try:
+   185	                defaults['initial'] = self.initial[i]
+   186	            except IndexError:
+   187	                pass
+   188	        # Allow extra forms to be empty, unless they're part of
+   189	        # the minimum forms.
+   190	        if i >= self.initial_form_count() and i >= self.min_num:
+   191	            defaults['empty_permitted'] = True
+   192	        defaults.update(kwargs)
+   193	        form = self.form(**defaults)
+   194	        self.add_fields(form, i)
+   195	        return form
+   196	
+   197	    @property
+   198	    def initial_forms(self):
+   199	        """Return a list of all the initial forms in this formset."""
+   200	        return self.forms[:self.initial_form_count()]
+   201	
+   202	    @property
+   203	    def extra_forms(self):
+   204	        """Return a list of all the extra forms in this formset."""
+   205	        return self.forms[self.initial_form_count():]
+   206	
+   207	    @property
+   208	    def empty_form(self):
+   209	        form = self.form(
+   210	            auto_id=self.auto_id,
+   211	            prefix=self.add_prefix('__prefix__'),
+   212	            empty_permitted=True,
+   213	            use_required_attribute=False,
+   214	            **self.get_form_kwargs(None)
+   215	        )
+   216	        self.add_fields(form, None)
+   217	        return form
+   218	
+   219	    @property
+   220	    def cleaned_data(self):
+   221	        """
+   222	        Return a list of form.cleaned_data dicts for every form in self.forms.
+   223	        """
+   224	        if not self.is_valid():
+   225	            raise AttributeError("'%s' object has no attribute 'cleaned_data'" % self.__class__.__name__)
+   226	        return [form.cleaned_data for form in self.forms]
+   227	
+   228	    @property
+   229	    def deleted_forms(self):
+   230	        """Return a list of forms that have been marked for deletion."""
+   231	        if not self.is_valid() or not self.can_delete:
+   232	            return []
+   233	        # construct _deleted_form_indexes which is just a list of form indexes
+   234	        # that have had their deletion widget set to True
+   235	        if not hasattr(self, '_deleted_form_indexes'):
+   236	            self._deleted_form_indexes = []
+   237	            for i, form in enumerate(self.forms):
+   238	                # if this is an extra form and hasn't changed, don't consider it
+   239	                if i >= self.initial_form_count() and not form.has_changed():
+   240	                    continue
+   241	                if self._should_delete_form(form):
+   242	                    self._deleted_form_indexes.append(i)
+   243	        return [self.forms[i] for i in self._deleted_form_indexes]
+   244	
+   245	    @property
+   246	    def ordered_forms(self):
+   247	        """
+   248	        Return a list of form in the order specified by the incoming data.
+   249	        Raise an AttributeError if ordering is not allowed.
+   250	        """
+   251	        if not self.is_valid() or not self.can_order:
+   252	            raise AttributeError("'%s' object has no attribute 'ordered_forms'" % self.__class__.__name__)
+   253	        # Construct _ordering, which is a list of (form_index, order_field_value)
+   254	        # tuples. After constructing this list, we'll sort it by order_field_value
+   255	        # so we have a way to get to the form indexes in the order specified
+   256	        # by the form data.
+   257	        if not hasattr(self, '_ordering'):
+   258	            self._ordering = []
+   259	            for i, form in enumerate(self.forms):
+   260	                # if this is an extra form and hasn't changed, don't consider it
+   261	                if i >= self.initial_form_count() and not form.has_changed():
+   262	                    continue
+   263	                # don't add data marked for deletion to self.ordered_data
+   264	                if self.can_delete and self._should_delete_form(form):
+   265	                    continue
+   266	                self._ordering.append((i, form.cleaned_data[ORDERING_FIELD_NAME]))
+   267	            # After we're done populating self._ordering, sort it.
+   268	            # A sort function to order things numerically ascending, but
+   269	            # None should be sorted below anything else. Allowing None as
+   270	            # a comparison value makes it so we can leave ordering fields
+   271	            # blank.
+   272	
+   273	            def compare_ordering_key(k):
+   274	                if k[1] is None:
+   275	                    return (1, 0)  # +infinity, larger than any number
+   276	                return (0, k[1])
+   277	            self._ordering.sort(key=compare_ordering_key)
+   278	        # Return a list of form.cleaned_data dicts in the order specified by
+   279	        # the form data.
+   280	        return [self.forms[i[0]] for i in self._ordering]
+   281	
+   282	    @classmethod
+   283	    def get_default_prefix(cls):
+   284	        return 'form'
+   285	
+   286	    @classmethod
+   287	    def get_ordering_widget(cls):
+   288	        return cls.ordering_widget
+   289	
+   290	    def non_form_errors(self):
+   291	        """
+   292	        Return an ErrorList of errors that aren't associated with a particular
+   293	        form -- i.e., from formset.clean(). Return an empty ErrorList if there
+   294	        are none.
+   295	        """
+   296	        if self._non_form_errors is None:
+   297	            self.full_clean()
+   298	        return self._non_form_errors
+   299	
+   300	    @property
+   301	    def errors(self):
+   302	        """Return a list of form.errors for every form in self.forms."""
+   303	        if self._errors is None:
+   304	            self.full_clean()
+   305	        return self._errors
+   306	
+   307	    def total_error_count(self):
+   308	        """Return the number of errors across all forms in the formset."""
+   309	        return len(self.non_form_errors()) +\
+   310	            sum(len(form_errors) for form_errors in self.errors)
+   311	
+   312	    def _should_delete_form(self, form):
+   313	        """Return whether or not the form was marked for deletion."""
+   314	        return form.cleaned_data.get(DELETION_FIELD_NAME, False)
+   315	
+   316	    def is_valid(self):
+   317	        """Return True if every form in self.forms is valid."""
+   318	        if not self.is_bound:
+   319	            return False
+   320	        # Accessing errors triggers a full clean the first time only.
+   321	        self.errors
+   322	        # List comprehension ensures is_valid() is called for all forms.
+   323	        # Forms due to be deleted shouldn't cause the formset to be invalid.
+   324	        forms_valid = all([
+   325	            form.is_valid() for form in self.forms
+   326	            if not (self.can_delete and self._should_delete_form(form))
+   327	        ])
+   328	        return forms_valid and not self.non_form_errors()
+   329	
+   330	    def full_clean(self):
+   331	        """
+   332	        Clean all of self.data and populate self._errors and
+   333	        self._non_form_errors.
+   334	        """
+   335	        self._errors = []
+   336	        self._non_form_errors = self.error_class()
+   337	        empty_forms_count = 0
+   338	
+   339	        if not self.is_bound:  # Stop further processing.
+   340	            return
+   341	
+   342	        if not self.management_form.is_valid():
+   343	            error = ValidationError(
+   344	                self.error_messages['missing_management_form'],
+   345	                params={
+   346	                    'field_names': ', '.join(
+   347	                        self.management_form.add_prefix(field_name)
+   348	                        for field_name in self.management_form.errors
+   349	                    ),
+   350	                },
+   351	                code='missing_management_form',
+   352	            )
+   353	            self._non_form_errors.append(error)
+   354	
+   355	        for i, form in enumerate(self.forms):
+   356	            # Empty forms are unchanged forms beyond those with initial data.
+   357	            if not form.has_changed() and i >= self.initial_form_count():
+   358	                empty_forms_count += 1
+   359	            # Accessing errors calls full_clean() if necessary.
+   360	            # _should_delete_form() requires cleaned_data.
+   361	            form_errors = form.errors
+   362	            if self.can_delete and self._should_delete_form(form):
+   363	                continue
+   364	            self._errors.append(form_errors)
+   365	        try:
+   366	            if (self.validate_max and
+   367	                    self.total_form_count() - len(self.deleted_forms) > self.max_num) or \
+   368	                    self.management_form.cleaned_data[TOTAL_FORM_COUNT] > self.absolute_max:
+   369	                raise ValidationError(ngettext(
+   370	                    "Please submit at most %d form.",
+   371	                    "Please submit at most %d forms.", self.max_num) % self.max_num,
+   372	                    code='too_many_forms',
+   373	                )
+   374	            if (self.validate_min and
+   375	                    self.total_form_count() - len(self.deleted_forms) - empty_forms_count < self.min_num):
+   376	                raise ValidationError(ngettext(
+   377	                    "Please submit at least %d form.",
+   378	                    "Please submit at least %d forms.", self.min_num) % self.min_num,
+   379	                    code='too_few_forms')
+   380	            # Give self.clean() a chance to do cross-form validation.
+   381	            self.clean()
+   382	        except ValidationError as e:
+   383	            self._non_form_errors = self.error_class(e.error_list)
+   384	
+   385	    def clean(self):
+   386	        """
+   387	        Hook for doing any extra formset-wide cleaning after Form.clean() has
+   388	        been called on every form. Any ValidationError raised by this method
+   389	        will not be associated with a particular form; it will be accessible
+   390	        via formset.non_form_errors()
+   391	        """
+   392	        pass
+   393	
+   394	    def has_changed(self):
+   395	        """Return True if data in any form differs from initial."""
+   396	        return any(form.has_changed() for form in self)
+   397	
+   398	    def add_fields(self, form, index):
+   399	        """A hook for adding extra fields on to each form instance."""
+   400	        initial_form_count = self.initial_form_count()
+   401	        if self.can_order:
+   402	            # Only pre-fill the ordering field for initial forms.
+   403	            if index is not None and index < initial_form_count:
+   404	                form.fields[ORDERING_FIELD_NAME] = IntegerField(
+   405	                    label=_('Order'),
+   406	                    initial=index + 1,
+   407	                    required=False,
+   408	                    widget=self.get_ordering_widget(),
+   409	                )
+   410	            else:
+   411	                form.fields[ORDERING_FIELD_NAME] = IntegerField(
+   412	                    label=_('Order'),
+   413	                    required=False,
+   414	                    widget=self.get_ordering_widget(),
+   415	                )
+   416	        if self.can_delete and (self.can_delete_extra or index < initial_form_count):
+   417	            form.fields[DELETION_FIELD_NAME] = BooleanField(label=_('Delete'), required=False)
+   418	
+   419	    def add_prefix(self, index):
+   420	        return '%s-%s' % (self.prefix, index)
+   421	
+   422	    def is_multipart(self):
+   423	        """
+   424	        Return True if the formset needs to be multipart, i.e. it
+   425	        has FileInput, or False otherwise.
+   426	        """
+   427	        if self.forms:
+   428	            return self.forms[0].is_multipart()
+   429	        else:
+   430	            return self.empty_form.is_multipart()
+   431	
+   432	    @property
+   433	    def media(self):
+   434	        # All the forms on a FormSet are the same, so you only need to
+   435	        # interrogate the first form for media.
+   436	        if self.forms:
+   437	            return self.forms[0].media
+   438	        else:
+   439	            return self.empty_form.media
+   440	
+   441	    def as_table(self):
+   442	        "Return this formset rendered as HTML <tr>s -- excluding the <table></table>."
+   443	        # XXX: there is no semantic division between forms here, there
+   444	        # probably should be. It might make sense to render each form as a
+   445	        # table row with each field as a td.
+   446	        forms = ' '.join(form.as_table() for form in self)
+   447	        return mark_safe(str(self.management_form) + '\n' + forms)
+   448	
+   449	    def as_p(self):
+   450	        "Return this formset rendered as HTML <p>s."
+   451	        forms = ' '.join(form.as_p() for form in self)
+   452	        return mark_safe(str(self.management_form) + '\n' + forms)
+   453	
+   454	    def as_ul(self):
+   455	        "Return this formset rendered as HTML <li>s."
+   456	        forms = ' '.join(form.as_ul() for form in self)
+   457	        return mark_safe(str(self.management_form) + '\n' + forms)
+
+
+This is the runtime information of BaseFormSet:
+
+Error occurred during script execution:Non-form errors do not have the 'nonform' CSS class.
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-14608/django/forms/formsets.py
+New var:....... __name__ = 'django.forms.formsets'
+New var:....... __doc__ = None
+New var:....... __package__ = 'django.forms'
+New var:....... __loader__ = <_frozen_importlib_external.SourceFileLoader object at 0x7f7c1a59bf10>
+New var:....... __spec__ = ModuleSpec(name='django.forms.formsets', loader=...d/django__django-14608/django/forms/formsets.py')
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-14608/django/forms/formsets.py'
+New var:....... __cached__ = '/data/swe-fl/TMP/testbed/django__django-14608/django/forms/__pycache__/formsets.cpython-38.pyc'
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... ValidationError = <class 'django.core.exceptions.ValidationError'>
+New var:....... Form = <class 'django.forms.forms.Form'>
+New var:....... BooleanField = <class 'django.forms.fields.BooleanField'>
+New var:....... IntegerField = <class 'django.forms.fields.IntegerField'>
+New var:....... ErrorList = <class 'django.forms.utils.ErrorList'>
+New var:....... HiddenInput = <class 'django.forms.widgets.HiddenInput'>
+New var:....... NumberInput = <class 'django.forms.widgets.NumberInput'>
+New var:....... cached_property = <class 'django.utils.functional.cached_property'>
+New var:....... html_safe = <function html_safe at 0x7f7c1a6f8700>
+New var:....... mark_safe = <function mark_safe at 0x7f7c1a7848b0>
+New var:....... _ = <function gettext at 0x7f7c1a6de9d0>
+New var:....... ngettext = <function ngettext at 0x7f7c1a6de820>
+New var:....... __all__ = ('BaseFormSet', 'formset_factory', 'all_valid')
+New var:....... TOTAL_FORM_COUNT = 'TOTAL_FORMS'
+New var:....... INITIAL_FORM_COUNT = 'INITIAL_FORMS'
+New var:....... MIN_NUM_FORM_COUNT = 'MIN_NUM_FORMS'
+New var:....... MAX_NUM_FORM_COUNT = 'MAX_NUM_FORMS'
+New var:....... ORDERING_FIELD_NAME = 'ORDER'
+New var:....... DELETION_FIELD_NAME = 'DELETE'
+New var:....... DEFAULT_MIN_NUM = 0
+New var:....... DEFAULT_MAX_NUM = 1000
+New var:....... ManagementForm = <class 'django.forms.formsets.ManagementForm'>
+ line        54 class BaseFormSet:
+Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+Starting var:.. data = {}
+Starting var:.. files = None
+Starting var:.. auto_id = 'id_%s'
+Starting var:.. prefix = None
+Starting var:.. initial = None
+Starting var:.. error_class = <class 'django.forms.utils.ErrorList'>
+Starting var:.. form_kwargs = None
+Starting var:.. error_messages = None
+ call        66     def __init__(self, data=None, files=None, auto_id='id_%s', prefix=None,
+ line        69         self.is_bound = data is not None or files is not None
+ line        70         self.prefix = prefix or self.get_default_prefix()
+    Starting var:.. cls = <class 'django.forms.formsets.MyFormFormSet'>
+     call       283     def get_default_prefix(cls):
+     line       284         return 'form'
+     return     284         return 'form'
+    Return value:.. 'form'
+ line        71         self.auto_id = auto_id
+ line        72         self.data = data or {}
+ line        73         self.files = files or {}
+ line        74         self.initial = initial
+ line        75         self.form_kwargs = form_kwargs or {}
+ line        76         self.error_class = error_class
+ line        77         self._errors = None
+ line        78         self._non_form_errors = None
+ line        80         messages = {}
+New var:....... messages = {}
+ line        81         for cls in reversed(type(self).__mro__):
+New var:....... cls = <class 'object'>
+ line        82             messages.update(getattr(cls, 'default_error_messages', {}))
+ line        81         for cls in reversed(type(self).__mro__):
+Modified var:.. cls = <class 'django.forms.formsets.BaseFormSet'>
+ line        82             messages.update(getattr(cls, 'default_error_messages', {}))
+Modified var:.. messages = {'missing_management_form': 'ManagementForm data...eed to file a bug report if the issue persists.'}
+ line        81         for cls in reversed(type(self).__mro__):
+Modified var:.. cls = <class '__main__.BaseMyFormSet'>
+ line        82             messages.update(getattr(cls, 'default_error_messages', {}))
+ line        81         for cls in reversed(type(self).__mro__):
+Modified var:.. cls = <class 'django.forms.formsets.MyFormFormSet'>
+ line        82             messages.update(getattr(cls, 'default_error_messages', {}))
+ line        81         for cls in reversed(type(self).__mro__):
+ line        83         if error_messages is not None:
+ line        85         self.error_messages = messages
+ return      85         self.error_messages = messages
+Return value:.. None
+Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+ call       316     def is_valid(self):
+ line       318         if not self.is_bound:
+ line       321         self.errors
+    Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+     call       301     def errors(self):
+     line       303         if self._errors is None:
+     line       304             self.full_clean()
+        Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+         call       330     def full_clean(self):
+         line       335         self._errors = []
+         line       336         self._non_form_errors = self.error_class()
+         line       337         empty_forms_count = 0
+        New var:....... empty_forms_count = 0
+         line       339         if not self.is_bound:  # Stop further processing.
+         line       342         if not self.management_form.is_valid():
+            Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+             call       109     def management_form(self):
+             line       111         if self.is_bound:
+             line       112             form = ManagementForm(self.data, auto_id=self.auto_id, prefix=self.prefix)
+            New var:....... form = <ManagementForm bound=True, valid=Unknown, field...FORMS;INITIAL_FORMS;MIN_NUM_FORMS;MAX_NUM_FORMS)>
+             line       113             form.full_clean()
+            Modified var:.. form = <ManagementForm bound=True, valid=False, fields=...FORMS;INITIAL_FORMS;MIN_NUM_FORMS;MAX_NUM_FORMS)>
+             line       121         return form
+             return     121         return form
+            Return value:.. <ManagementForm bound=True, valid=False, fields=...FORMS;INITIAL_FORMS;MIN_NUM_FORMS;MAX_NUM_FORMS)>
+                 line       343             error = ValidationError(
+         line       344                 self.error_messages['missing_management_form'],
+         line       346                     'field_names': ', '.join(
+         line       348                         for field_name in self.management_form.errors
+         line       346                     'field_names': ', '.join(
+            Starting var:.. .0 = <dict_keyiterator object at 0x7f7c19f4e2c0>
+            Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+             call       346                     'field_names': ', '.join(
+             line       346                     'field_names': ', '.join(
+             line       348                         for field_name in self.management_form.errors
+            New var:....... field_name = 'TOTAL_FORMS'
+             line       347                         self.management_form.add_prefix(field_name)
+             return     347                         self.management_form.add_prefix(field_name)
+            Return value:.. 'form-TOTAL_FORMS'
+                    Starting var:.. .0 = <dict_keyiterator object at 0x7f7c19f4e2c0>
+            Starting var:.. field_name = 'TOTAL_FORMS'
+            Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+             call       347                         self.management_form.add_prefix(field_name)
+             line       346                     'field_names': ', '.join(
+             line       348                         for field_name in self.management_form.errors
+            Modified var:.. field_name = 'INITIAL_FORMS'
+             line       347                         self.management_form.add_prefix(field_name)
+             return     347                         self.management_form.add_prefix(field_name)
+            Return value:.. 'form-INITIAL_FORMS'
+                    Starting var:.. .0 = <dict_keyiterator object at 0x7f7c19f4e2c0>
+            Starting var:.. field_name = 'INITIAL_FORMS'
+            Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+             call       347                         self.management_form.add_prefix(field_name)
+             line       346                     'field_names': ', '.join(
+             return     346                     'field_names': ', '.join(
+            Return value:.. None
+                 line       345                 params={
+         line       351                 code='missing_management_form',
+         line       343             error = ValidationError(
+        New var:....... error = ValidationError(['ManagementForm data is missing...ed to file a bug report if the issue persists.'])
+         line       353             self._non_form_errors.append(error)
+         line       355         for i, form in enumerate(self.forms):
+            Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+             call       152     def forms(self):
+             line       155         return [
+             line       157             for i in range(self.total_form_count())
+                Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+                 call       123     def total_form_count(self):
+                 line       125         if self.is_bound:
+                 line       130             return min(self.management_form.cleaned_data[TOTAL_FORM_COUNT], self.absolute_max)
+                 return     130             return min(self.management_form.cleaned_data[TOTAL_FORM_COUNT], self.absolute_max)
+                Return value:.. 0
+                         line       155         return [
+                Starting var:.. .0 = <range_iterator object at 0x7f7c19f46f60>
+                Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+                 call       155         return [
+                 line       155         return [
+                 return     155         return [
+                Return value:.. []
+                         return     155         return [
+            Return value:.. []
+                 line       365         try:
+         line       366             if (self.validate_max and
+         line       368                     self.management_form.cleaned_data[TOTAL_FORM_COUNT] > self.absolute_max:
+         line       366             if (self.validate_max and
+         line       374             if (self.validate_min and
+         line       381             self.clean()
+            Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+             call       385     def clean(self):
+             line       392         pass
+             return     392         pass
+            Return value:.. None
+                    Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+             call       301     def errors(self):
+             line       303         if self._errors is None:
+             line       305         return self._errors
+             return     305         return self._errors
+            Return value:.. []
+                 exception  381             self.clean()
+        Exception:..... django.core.exceptions.ValidationError: ['Non-form error']
+        New var:....... self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+    New var:....... empty_forms_count = 0
+    New var:....... error = ValidationError(['ManagementForm data is missing...ed to file a bug report if the issue persists.'])
+     line       382         except ValidationError as e:
+    New var:....... e = ValidationError(['Non-form error'])
+     line       383             self._non_form_errors = self.error_class(e.error_list)
+     return     383             self._non_form_errors = self.error_class(e.error_list)
+    Return value:.. None
+ line       305         return self._errors
+ return     305         return self._errors
+Return value:.. []
+ line       324         forms_valid = all([
+ line       325             form.is_valid() for form in self.forms
+ line       324         forms_valid = all([
+Starting var:.. .0 = <list_iterator object at 0x7f7c19f46fd0>
+Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+ call       324         forms_valid = all([
+ line       324         forms_valid = all([
+ return     324         forms_valid = all([
+Return value:.. []
+New var:....... forms_valid = True
+ line       328         return forms_valid and not self.non_form_errors()
+Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+ call       290     def non_form_errors(self):
+ line       296         if self._non_form_errors is None:
+ line       298         return self._non_form_errors
+ return     298         return self._non_form_errors
+Return value:.. ['Non-form error']
+ return     328         return forms_valid and not self.non_form_errors()
+Return value:.. False
+Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7f7c1a05edc0>
+ call       290     def non_form_errors(self):
+ line       296         if self._non_form_errors is None:
+ line       298         return self._non_form_errors
+ return     298         return self._non_form_errors
+Return value:.. ['Non-form error']
+Traceback (most recent call last):
+AssertionError: Non-form errors do not have the 'nonform' CSS class.
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__4.0/lib/python3.8/runpy.py", line 265, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/root/miniforge3/envs/django__django__4.0/lib/python3.8/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/root/miniforge3/envs/django__django__4.0/lib/python3.8/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-14608/reproduce.py", line 65, in <module>
+    sys.exit(main())
+  File "/data/swe-fl/TMP/testbed/django__django-14608/reproduce.py", line 59, in main
+    raise e
+AssertionError: Non-form errors do not have the 'nonform' CSS class.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

@@ -1,0 +1,2069 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **sympy** project:
+## ISSUE
+<ISSUE>
+Unexpected `PolynomialError` when using simple `subs()` for particular expressions
+I am seeing weird behavior with `subs` for particular expressions with hyperbolic sinusoids with piecewise arguments. When applying `subs`, I obtain an unexpected `PolynomialError`. For context, I was umbrella-applying a casting from int to float of all int atoms for a bunch of random expressions before using a tensorflow lambdify to avoid potential tensorflow type errors. You can pretend the expression below has a `+ 1` at the end, but below is the MWE that I could produce.
+
+See the expression below, and the conditions in which the exception arises.
+
+Sympy version: 1.8.dev
+
+```python
+from sympy import *
+from sympy.core.cache import clear_cache
+
+x, y, z = symbols('x y z')
+
+clear_cache()
+expr = exp(sinh(Piecewise((x, y > x), (y, True)) / z))
+# This works fine
+expr.subs({1: 1.0})
+
+clear_cache()
+x, y, z = symbols('x y z', real=True)
+expr = exp(sinh(Piecewise((x, y > x), (y, True)) / z))
+# This fails with "PolynomialError: Piecewise generators do not make sense"
+expr.subs({1: 1.0})  # error
+# Now run it again (isympy...) w/o clearing cache and everything works as expected without error
+expr.subs({1: 1.0})
+```
+
+I am not really sure where the issue is, but I think it has something to do with the order of assumptions in this specific type of expression. Here is what I found-
+
+- The error only (AFAIK) happens with `cosh` or `tanh` in place of `sinh`, otherwise it succeeds
+- The error goes away if removing the division by `z`
+- The error goes away if removing `exp` (but stays for most unary functions, `sin`, `log`, etc.)
+- The error only happens with real symbols for `x` and `y` (`z` does not have to be real)
+
+Not too sure how to debug this one.
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To resolve this issue, I need to understand the flow of how `subs()` is processed in SymPy, particularly when involving `Piecewise`, `sinh`, `exp`, and real symbols. It is possible that the issue stems from how assumptions about symbols are handled or propagated through these function calls.
+
+Given that, I should look into the implementation of how `subs()` works within these contexts, which might involve looking into the `Piecewise` class, and potentially the methods handling `sinh`, `exp`, and assumptions related to real symbols.
+
+Let's first check the relevant portions of the codebase to have a complete picture before creating the patch.
+
+```python
+search_class_in_codebase("Piecewise")
+search_method_in_codebase("subs")
+search_class_in_codebase("sinh")
+search_class_in_codebase("exp")
+search_code_in_codebase("real=True")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_code_in_codebase("real=True")
+RESULT:
+#### reproduce.py:15-21
+```python
+
+def main():
+    clear_cache()
+    x, y, z = symbols('x y z', real=True)
+    expr = exp(sinh(Piecewise((x, y > x), (y, True)) / z))
+    
+    try:
+```
+
+#### sympy/physics/hydrogen.py:122-128
+```python
+    >>> from sympy import Symbol
+    >>> r=Symbol("r", real=True, positive=True)
+    >>> phi=Symbol("phi", real=True)
+    >>> theta=Symbol("theta", real=True)
+    >>> Z=Symbol("Z", positive=True, integer=True, nonzero=True)
+    >>> Psi_nlm(1,0,0,r,phi,theta,Z)
+    Z**(3/2)*exp(-Z*r)/sqrt(pi)
+```
+
+#### sympy/physics/wigner.py:972-978
+```python
+    >>> from sympy.physics.wigner import wigner_d
+    >>> from sympy import Integer, symbols, pprint
+    >>> half = 1/Integer(2)
+    >>> alpha, beta, gamma = symbols("alpha, beta, gamma", real=True)
+    >>> pprint(wigner_d(half, alpha, beta, gamma), use_unicode=True)
+    ⎡  ⅈ⋅α  ⅈ⋅γ             ⅈ⋅α  -ⅈ⋅γ         ⎤
+    ⎢  ───  ───             ───  ─────        ⎥
+```
+
+#### sympy/physics/optics/polarization.py:684-690
+```python
+    >>> from sympy import pprint, symbols
+    >>> from sympy.physics.optics.polarization import polarizing_beam_splitter
+    >>> Ts, Rs, Tp, Rp = symbols(r"Ts, Rs, Tp, Rp", positive=True)
+    >>> phia, phib = symbols("phi_a, phi_b", real=True)
+    >>> PBS = polarizing_beam_splitter(Tp, Rs, Ts, Rp, phia, phib)
+    >>> pprint(PBS, use_unicode=False)
+    [   ____                           ____                    ]
+```
+
+#### sympy/physics/optics/tests/test_polarization.py:30-36
+```python
+    #################################################################
+    assert linear_polarizer(0) == Matrix([[1, 0], [0, 0]])
+    #################################################################
+    delta = symbols("delta", real=True)
+    res = Matrix([[exp(-I*delta/2), 0], [0, exp(I*delta/2)]])
+    assert phase_retarder(0, delta) == res
+    #################################################################
+```
+
+#### sympy/physics/continuum_mechanics/tests/test_beam.py:612-618
+```python
+def test_parabolic_loads():
+
+    E, I, L = symbols('E, I, L', positive=True, real=True)
+    R, M, P = symbols('R, M, P', real=True)
+
+    # cantilever beam fixed at x=0 and parabolic distributed loading across
+    # length of beam
+```
+
+#### sympy/physics/tests/test_clebsch_gordan.py:321-327
+```python
+
+def test_wigner_d():
+    half = S(1)/2
+    alpha, beta, gamma = symbols("alpha, beta, gamma", real=True)
+    d = wigner_d_small(half, beta).subs({beta: pi/2})
+    d_ = Matrix([[1, 1], [-1, 1]])/sqrt(2)
+    assert d == d_
+```
+
+#### sympy/physics/mechanics/functions.py:408-414
+```python
+    >>> from sympy.physics.mechanics import Particle, ReferenceFrame, RigidBody, outer
+    >>> from sympy.physics.mechanics.functions import center_of_mass
+    >>> a = ReferenceFrame('a')
+    >>> m = symbols('m', real=True)
+    >>> p1 = Particle('p1', Point('p1_pt'), S(1))
+    >>> p2 = Particle('p2', Point('p2_pt'), S(2))
+    >>> p3 = Particle('p3', Point('p3_pt'), S(3))
+```
+
+#### sympy/physics/mechanics/tests/test_functions.py:233-239
+```python
+# mass of a system of bodies.
+def test_center_of_mass():
+    a = ReferenceFrame('a')
+    m = symbols('m', real=True)
+    p1 = Particle('p1', Point('p1_pt'), S.One)
+    p2 = Particle('p2', Point('p2_pt'), S(2))
+    p3 = Particle('p3', Point('p3_pt'), S(3))
+```
+
+#### sympy/physics/vector/functions.py:610-616
+```python
+    >>> q1 = dynamicsymbols('q1')
+    >>> q1
+    q1(t)
+    >>> q2 = dynamicsymbols('q2', real=True)
+    >>> q2.is_real
+    True
+    >>> q3 = dynamicsymbols('q3', positive=True)
+```
+
+#### sympy/physics/vector/tests/test_functions.py:492-498
+```python
+def test_dynamicsymbols():
+    #Tests to check the assumptions applied to dynamicsymbols
+    f1 = dynamicsymbols('f1')
+    f2 = dynamicsymbols('f2', real=True)
+    f3 = dynamicsymbols('f3', positive=True)
+    f4, f5 = dynamicsymbols('f4,f5', commutative=False)
+    f6 = dynamicsymbols('f6', integer=True)
+```
+
+#### sympy/physics/quantum/state.py:993-999
+```python
+            >>> from sympy import symbols, pi
+            >>> from sympy.functions import sin
+            >>> from sympy.physics.quantum.state import Wavefunction
+            >>> x, L = symbols('x,L', real=True)
+            >>> n = symbols('n', integer=True)
+            >>> g = sin(n*pi*x/L)
+            >>> f = Wavefunction(g, (x, 0, L))
+```
+
+#### sympy/physics/quantum/tests/test_dagger.py:11-17
+```python
+    assert Dagger(x) == conjugate(x)
+    assert Dagger(I*x) == -I*conjugate(x)
+
+    i = symbols('i', real=True)
+    assert Dagger(i) == i
+
+    p = symbols('p')
+```
+
+#### sympy/physics/quantum/tests/test_state.py:178-184
+```python
+
+
+def test_wavefunction():
+    x, y = symbols('x y', real=True)
+    L = symbols('L', positive=True)
+    n = symbols('n', integer=True, positive=True)
+
+```
+
+#### sympy/physics/quantum/tests/test_hilbert.py:36-42
+```python
+    assert b1.interval == Interval(-oo, 1)
+
+    x = Symbol('x', real=True)
+    y = Symbol('y', real=True)
+    b2 = L2(Interval(x, y))
+    assert b2.dimension is oo
+    assert b2.interval == Interval(x, y)
+```
+
+#### sympy/core/basic.py:524-530
+```python
+
+        >>> from sympy import Integral, Symbol
+        >>> from sympy.abc import x
+        >>> r = Symbol('r', real=True)
+        >>> Integral(r, (r, x)).as_dummy()
+        Integral(_0, (_0, x))
+        >>> _.variables[0].is_real is None
+```
+
+#### sympy/core/function.py:915-921
+```python
+    def __new__(mcl, name, bases=(AppliedUndef,), __dict__=None, **kwargs):
+        from .symbol import _filter_assumptions
+        # Allow Function('f', real=True)
+        # and/or Function(Symbol('f', real=True))
+        assumptions, kwargs = _filter_assumptions(kwargs)
+        if isinstance(name, Symbol):
+            assumptions = name._merge(assumptions)
+```
+
+#### sympy/core/expr.py:3762-3768
+```python
+        if not x.is_number:
+            raise TypeError("can't round symbolic expression")
+        if not x.is_Atom:
+            if not pure_complex(x.n(2), or_real=True):
+                raise TypeError(
+                    'Expected a number but got %s:' % func_name(x))
+        elif x in (S.NaN, S.Infinity, S.NegativeInfinity, S.ComplexInfinity):
+```
+
+#### sympy/core/numbers.py:135-141
+```python
+            cb = pure_complex(b)
+            if not cb and fb:
+                b = b.n(prec_to_dps(min([i._prec for i in fb])))
+                cb = pure_complex(b, or_real=True)
+            if ca and cb and (ca[1] or cb[1]):
+                return all(comp(i, j) for i, j in zip(ca, cb))
+            tol = 10**prec_to_dps(min(a._prec, getattr(b, '_prec', a._prec)))
+```
+
+#### sympy/core/symbol.py:787-793
+```python
+    >>> abc # noqa: F821
+    abc
+
+    >>> var('x,y', real=True)
+    (x, y)
+    >>> x.is_real and y.is_real # noqa: F821
+    True
+```
+
+#### sympy/core/evalf.py:130-136
+```python
+    >>> from sympy import sqrt, I, S
+    >>> a, b, surd = S(2), S(3), sqrt(2)
+    >>> pure_complex(a)
+    >>> pure_complex(a, or_real=True)
+    (2, 0)
+    >>> pure_complex(surd)
+    >>> pure_complex(a + b*I)
+```
+
+#### sympy/core/assumptions.py:390-396
+```python
+    >>> check_assumptions(2*x - 1, x)
+
+    >>> z = Symbol('z')
+    >>> check_assumptions(z, real=True)
+
+    See Also
+    ========
+```
+
+#### sympy/core/mul.py:1523-1529
+```python
+            elif t.is_extended_nonnegative:
+                saw_NON = True
+            # FIXME: is_positive/is_negative is False doesn't take account of
+            # Symbol('x', infinite=True, extended_real=True) which has
+            # e.g. is_positive is False but has uncertain sign.
+            elif t.is_positive is False:
+                sign = -sign
+```
+
+#### sympy/core/tests/test_expr.py:2071-2077
+```python
+
+
+def test_issue_10161():
+    x = symbols('x', real=True)
+    assert x*abs(x)*abs(x) == x**3
+
+
+```
+
+#### sympy/core/tests/test_numbers.py:1602-1608
+```python
+    assert -oo + x is -oo
+    x = Symbol('x', extended_nonpositive=True)
+    assert -oo + x is -oo
+    x = Symbol('x', finite=True, real=True)
+    assert -oo + x is -oo
+
+
+```
+
+#### sympy/core/tests/test_power.py:548-554
+```python
+    assert sqrt(x).is_extended_negative is None
+    x = Symbol('x', complex=True)
+    assert sqrt(x).is_extended_negative is False
+    x = Symbol('x', extended_real=True)
+    assert sqrt(x).is_extended_negative is False
+    assert sqrt(zoo, evaluate=False).is_extended_negative is None
+    assert sqrt(nan, evaluate=False).is_extended_negative is None
+```
+
+#### sympy/core/tests/test_function.py:1214-1220
+```python
+    # Can also do it this way, but it won't be equal to f_real because of the
+    # way UndefinedFunction.__new__ works. Any non-recognized assumptions
+    # are just added literally as something which is used in the hash
+    f_real2 = Function('f', is_real=True)
+    assert f_real2(x).is_real is True
+
+
+```
+
+#### sympy/core/tests/test_complex.py:212-218
+```python
+
+def test_issue_11518():
+    x = Symbol("x", real=True)
+    y = Symbol("y", real=True)
+    r = sqrt(x**2 + y**2)
+    assert conjugate(r) == r
+    s = abs(x + I * y)
+```
+
+#### sympy/core/tests/test_subs.py:810-816
+```python
+
+
+def test_issue_15234():
+    x, y = symbols('x y', real=True)
+    p = 6*x**5 + x**4 - 4*x**3 + 4*x**2 - 2*x + 3
+    p_subbed = 6*x**5 - 4*x**3 - 2*x + y**4 + 4*y**2 + 3
+    assert p.subs([(x**i, y**i) for i in [2, 4]]) == p_subbed
+```
+
+#### sympy/core/tests/test_arit.py:2240-2246
+```python
+        e = Mul(z, b, evaluate=False)
+        test(z, b, e)
+        z = Dummy('z', nonzero=iz, extended_real=True)
+        b = Dummy('b', finite=ib, extended_real=True)
+        e = Mul(b, z, evaluate=False)
+        test(z, b, e)
+
+```
+
+#### sympy/core/tests/test_exprtools.py:380-386
+```python
+
+
+def test_issue_7903():
+    a = symbols(r'a', real=True)
+    t = exp(I*cos(a)) + exp(-I*sin(a))
+    assert t.simplify()
+
+```
+
+#### sympy/core/tests/test_args.py:388-394
+```python
+
+def test_sympy__codegen__fnodes__Subroutine():
+    from sympy.codegen.fnodes import Subroutine
+    x = symbols('x', real=True)
+    assert _test_args(Subroutine('foo', [x], []))
+
+
+```
+
+#### sympy/core/tests/test_var.py:45-51
+```python
+
+def test_var_keywords():
+    ns = {"var": var}
+    eval("var('x y', real=True)", ns)
+    assert ns['x'].is_real and ns['y'].is_real
+
+
+```
+
+#### sympy/core/tests/test_basic.py:294-300
+```python
+    assert Integral(x + _0, (x, x + 1), (_0, 1, 2)
+        ).as_dummy() == Integral(_0 + _1, (_0, x + 1), (_1, 1, 2))
+    for T in (Symbol, Dummy):
+        d = T('x', real=True)
+        D = d.as_dummy()
+        assert D != d and D.func == Dummy and D.is_real is None
+    assert Dummy().as_dummy().is_commutative
+```
+
+#### sympy/core/tests/test_symbol.py:355-361
+```python
+    assert F('x', real=True).is_real
+    y = Symbol('y')
+    assert F(('x', y), real=True).is_real
+    r = Symbol('x', real=True)
+    assert F(('x', r)).is_real
+    assert F(('x', r), real=False).is_real
+    assert F('x1', Symbol('x1'),
+```
+
+#### sympy/core/tests/test_assumptions.py:1255-1261
+```python
+
+
+def test_failing_assumptions():
+    x = Symbol('x', real=True, positive=True)
+    y = Symbol('y')
+    assert failing_assumptions(6*x + y, **x.assumptions0) == \
+    {'real': None, 'imaginary': None, 'complex': None, 'hermitian': None,
+```
+
+#### sympy/core/tests/test_relational.py:907-913
+```python
+    #
+    assert Eq(zoo, sqrt(2) + I*oo) is F
+    assert Eq(zoo, oo) is F
+    r = Symbol('r', real=True)
+    i = Symbol('i', imaginary=True)
+    assert Eq(i*I, r) not in (T, F)
+    assert Eq(infx, infnx) is F
+```
+
+#### sympy/tensor/indexed.py:405-411
+```python
+
+    Assumptions can be specified with keyword arguments the same way as for Symbol:
+
+    >>> A_real = IndexedBase('A', real=True)
+    >>> A_real.is_real
+    True
+    >>> A != A_real
+```
+
+#### sympy/tensor/tests/test_indexed.py:219-225
+```python
+        assert log(exp(c)) == c
+
+    assert A != IndexedBase(a)
+    assert A == IndexedBase(a, positive=True, real=True)
+    assert A[i] != Indexed(a, i)
+
+
+```
+
+#### sympy/diffgeom/diffgeom.py:273-279
+```python
+                        issue=19321,
+                        deprecated_since_version="1.7"
+                    ).warn()
+                    syms.append(Symbol(s, real=True))
+            symbols = Tuple(*syms)
+
+        # canonicallize the relations
+```
+
+#### sympy/diffgeom/rn.py:70-76
+```python
+
+R3_origin = Patch('origin', R3)  # type: Any
+
+x, y, z = symbols('x y z', real=True)
+rho, psi, r, theta, phi = symbols('rho psi r theta phi', nonnegative=True)
+
+relations_3d = {
+```
+
+#### sympy/diffgeom/tests/test_function_diffgeom_book.py:117-123
+```python
+
+
+def test_functional_diffgeom_ch6():
+    u0, u1, u2, v0, v1, v2, w0, w1, w2 = symbols('u0:3, v0:3, w0:3', real=True)
+
+    u = u0*R2.e_x + u1*R2.e_y
+    v = v0*R2.e_x + v1*R2.e_y
+```
+
+#### sympy/diffgeom/tests/test_diffgeom.py:15-21
+```python
+
+
+def test_R2():
+    x0, y0, r0, theta0 = symbols('x0, y0, r0, theta0', real=True)
+    point_r = R2_r.point([x0, y0])
+    point_p = R2_p.point([r0, theta0])
+
+```
+
+#### sympy/solvers/solveset.py:3535-3541
+```python
+
+    >>> from sympy import pprint
+    >>> from sympy.polys.polytools import is_zero_dimensional
+    >>> a, b, c, d = symbols('a, b, c, d', extended_real=True)
+    >>> eq1 =  a + b + c + d
+    >>> eq2 = a*b + b*c + c*d + d*a
+    >>> eq3 = a*b*c + b*c*d + c*d*a + d*a*b
+```
+
+#### sympy/solvers/inequalities.py:979-985
+```python
+            '''))
+
+    # make vanilla symbol real
+    recast = {i: Dummy(i.name, extended_real=True)
+        for i in gens if i.is_extended_real is None}
+    inequalities = [i.xreplace(recast) for i in inequalities]
+    symbols = {i.xreplace(recast) for i in symbols}
+```
+
+#### sympy/solvers/ode/tests/test_subscheck.py:10-16
+```python
+
+
+C0, C1, C2, C3, C4 = symbols('C0:5')
+u, x, y, z = symbols('u,x:z', real=True)
+f = Function('f')
+g = Function('g')
+h = Function('h')
+```
+
+#### sympy/solvers/ode/tests/test_single.py:2320-2326
+```python
+    # From Exercise 20, in Ordinary Differential Equations,
+    #                      Tenenbaum and Pollard, pg. 220
+    a = Symbol('a', positive=True)
+    k = Symbol('k', real=True)
+    r1, r2, r3, r4, r5 = [rootof(x**5 + 11*x - 2, n) for n in range(5)]
+    r6, r7, r8, r9, r10 = [rootof(x**5 - 3*x + 1, n) for n in range(5)]
+    r11, r12, r13, r14, r15 = [rootof(x**5 - 100*x**3 + 1000*x + 1, n) for n in range(5)]
+```
+
+#### sympy/solvers/ode/tests/test_ode.py:760-766
+```python
+
+
+def test_issue_5770():
+    k = Symbol("k", real=True)
+    t = Symbol('t')
+    w = Function('w')
+    sol = dsolve(w(t).diff(t, 6) - k**6*w(t), w(t))
+```
+
+#### sympy/solvers/ode/tests/test_systems.py:2109-2115
+```python
+
+    e1, e2, e3 = symbols("e1:4", real=True)
+    b1, b2, b3 = symbols("b1:4", real=True)
+    v1, v2, v3 = symbols("v1:4", cls=Function, real=True)
+
+    eqs = [
+        -e1*q + m*Derivative(v1(t), t) - q*(-b2*v3(t) + b3*v2(t)),
+```
+
+#### sympy/solvers/tests/test_recurr.py:209-215
+```python
+
+def test_issue_18751():
+    r = Symbol('r', real=True, positive=True)
+    theta = Symbol('theta', real=True)
+    f = y(n) - 2 * r * cos(theta) * y(n - 1) + r**2 * y(n - 2)
+    assert rsolve(f, y(n)) == \
+        C0*(r*(cos(theta) - I*Abs(sin(theta))))**n + C1*(r*(cos(theta) + I*Abs(sin(theta))))**n
+```
+
+#### sympy/solvers/tests/test_solvers.py:2335-2341
+```python
+
+
+def test_issue_21034():
+    a = symbols('a', real=True)
+    system = [x - cosh(cos(4)), y - sinh(cos(a)), z - tanh(x)]
+    assert solve(system, x, y, z) == {x: cosh(cos(4)), z: tanh(cosh(cos(4))),
+        y: sinh(cos(a))}
+```
+
+#### sympy/solvers/tests/test_pde.py:27-33
+```python
+
+def test_pde_separate_mul():
+    x, y, z, t = symbols("x,y,z,t")
+    c = Symbol("C", real=True)
+    Phi = Function('Phi')
+    F, R, T, X, Y, Z, u = map(Function, 'FRTXYZu')
+    r, theta, z = symbols('r,theta,z')
+```
+
+#### sympy/solvers/tests/test_solveset.py:2373-2379
+```python
+
+def test_exponential_symbols():
+    x, y, z = symbols('x y z', positive=True)
+    xr, zr = symbols('xr, zr', real=True)
+
+    assert solveset(z**x - y, x, S.Reals) == Intersection(
+        S.Reals, FiniteSet(log(y)/log(z)))
+```
+
+#### sympy/solvers/diophantine/diophantine.py:548-554
+```python
+                sqc = isqrt(c)
+                _c = e*sqc*D - sqa*E
+                if not _c:
+                    z = symbols("z", real=True)
+                    eq = sqa*g*z**2 + D*z + sqa*F
+                    roots = solveset_real(eq, z).intersect(S.Integers)
+                    for root in roots:
+```
+
+#### sympy/discrete/tests/test_transforms.py:24-30
+```python
+    assert ifft(ls) == ifls
+    assert fft(ifls) == ls + [S.Zero]
+
+    x = Symbol('x', real=True)
+    raises(TypeError, lambda: fft(x))
+    raises(ValueError, lambda: ifft([x, 2*x, 3*x**2, 4*x**3]))
+
+```
+
+#### sympy/concrete/tests/test_sums_products.py:544-550
+```python
+def test_equality():
+    # if this fails remove special handling below
+    raises(ValueError, lambda: Sum(x, x))
+    r = symbols('x', real=True)
+    for F in (Sum, Product, Integral):
+        try:
+            assert F(x, x) != F(y, y)
+```
+
+#### sympy/utilities/tests/test_codegen.py:1603-1609
+```python
+        "end function\n")
+    assert source == expected
+    x = Symbol('x')
+    y = Symbol('y',real=True)
+    result = codegen(('test',x+y), 'f95', 'test', header=False, empty=False)
+    source = (result[0][1])
+    expected = (
+```
+
+#### sympy/utilities/tests/test_wester.py:3033-3039
+```python
+def test_Z6():
+    # Second order ODE with initial conditions---solve  using Laplace
+    # transform: f(t) = sin(2 t)/8 - t cos(2 t)/4
+    t = symbols('t', real=True, positive=True)
+    s = symbols('s')
+    eq = Derivative(f(t), t, 2) + 4*f(t) - sin(2*t)
+    F, _, _ = laplace_transform(eq, t, s)
+```
+
+#### sympy/geometry/polygon.py:1874-1880
+```python
+        True
+        >>> p.encloses_point(Point(R/2, R/2 + (R - r)/10))
+        False
+        >>> t = Symbol('t', real=True)
+        >>> p.encloses_point(p.arbitrary_point().subs(t, S.Half))
+        False
+        >>> p.encloses_point(Point(5, 5))
+```
+
+#### sympy/geometry/curve.py:326-332
+```python
+        limits : Returns limits of the parameter interval
+
+        """
+        t = _symbol(parameter, self.parameter, real=True)
+        return [t] + list(self.limits[1:])
+
+    def rotate(self, angle=0, pt=None):
+```
+
+#### sympy/geometry/parabola.py:312-318
+```python
+        []
+
+        """
+        x, y = symbols('x y', real=True)
+        parabola_eq = self.equation()
+        if isinstance(o, Parabola):
+            if o in self:
+```
+
+#### sympy/geometry/ellipse.py:1651-1657
+```python
+
+        """
+        x = _symbol(x, real=True)
+        y = _symbol(y, real=True)
+        t1 = (x - self.center.x)**2
+        t2 = (y - self.center.y)**2
+        return t1 + t2 - self.major**2
+```
+
+#### sympy/geometry/line.py:2557-2563
+```python
+                issue=13742,
+                deprecated_since_version="1.2").warn()
+        from sympy import solve
+        x, y, z, k = [_symbol(i, real=True) for i in (x, y, z, 'k')]
+        p1, p2 = self.points
+        d1, d2, d3 = p1.direction_ratio(p2)
+        x1, y1, z1 = p1
+```
+
+#### sympy/geometry/plane.py:338-344
+```python
+        6*x + 6*y + 6*z - 42
+
+        """
+        x, y, z = [i if i else Symbol(j, real=True) for i, j in zip((x, y, z), 'xyz')]
+        a = Point3D(x, y, z)
+        b = self.p1.direction_ratio(a)
+        c = self.normal_vector
+```
+
+#### sympy/geometry/entity.py:525-531
+```python
+            other = Point(other, dim=self.ambient_dimension)
+        if not isinstance(other, Point):
+            raise ValueError("other must be a point")
+        T = Dummy('t', real=True)
+        sol = solve(self.arbitrary_point(T) - other, T, dict=True)
+        if not sol:
+            raise ValueError("Given point is not on %s" % func_name(self))
+```
+
+#### sympy/geometry/tests/test_polygon.py:389-395
+```python
+
+def test_reflect():
+    x = Symbol('x', real=True)
+    y = Symbol('y', real=True)
+    b = Symbol('b')
+    m = Symbol('m')
+    l = Line((0, b), slope=m)
+```
+
+#### sympy/geometry/tests/test_ellipse.py:361-367
+```python
+    raises(GeometryError, lambda: Ellipse(Point(3, 1), hradius=3, eccentricity = -0.5))
+
+def test_ellipse_random_point():
+    y1 = Symbol('y1', real=True)
+    e3 = Ellipse(Point(0, 0), y1, y1)
+    rx, ry = Symbol('rx'), Symbol('ry')
+    for ind in range(0, 5):
+```
+
+#### sympy/geometry/tests/test_point.py:167-173
+```python
+    x3 = Symbol('x3', real=True)
+    y1 = Symbol('y1', real=True)
+    y2 = Symbol('y2', real=True)
+    y3 = Symbol('y3', real=True)
+    half = S.Half
+    p1 = Point3D(x1, x2, x3)
+    p2 = Point3D(y1, y2, y3)
+```
+
+#### sympy/geometry/tests/test_util.py:9-15
+```python
+def test_idiff():
+    x = Symbol('x', real=True)
+    y = Symbol('y', real=True)
+    t = Symbol('t', real=True)
+    f = Function('f')
+    g = Function('g')
+    # the use of idiff in ellipse also provides coverage
+```
+
+#### sympy/geometry/tests/test_entity.py:70-76
+```python
+
+def test_reflect_entity_overrides():
+    x = Symbol('x', real=True)
+    y = Symbol('y', real=True)
+    b = Symbol('b')
+    m = Symbol('m')
+    l = Line((0, b), slope=m)
+```
+
+#### sympy/geometry/tests/test_curve.py:88-94
+```python
+
+
+def test_length():
+    t = Symbol('t', real=True)
+
+    c1 = Curve((t, 0), (t, 0, 1))
+    assert c1.length == 1
+```
+
+#### sympy/geometry/tests/test_plane.py:5-11
+```python
+
+
+def test_plane():
+    x, y, z, u, v = symbols('x y z u v', real=True)
+    p1 = Point3D(0, 0, 0)
+    p2 = Point3D(1, 1, 1)
+    p3 = Point3D(1, 2, 3)
+```
+
+#### sympy/geometry/tests/test_line.py:716-722
+```python
+
+
+def test_raises():
+    d, e = symbols('a,b', real=True)
+    s = Segment((d, 0), (e, 0))
+
+    raises(TypeError, lambda: Line((1, 1), 1))
+```
+
+#### sympy/vector/implicitregion.py:473-479
+```python
+            else:
+                r = _symbol('r', real=True)
+            s = _symbol(parameter2, real=True)
+            t = _symbol(parameter1, real=True)
+
+            hn = hn.subs({self.variables[0]: r, self.variables[1]: s, self.variables[2]: t})
+            hn_1 = hn_1.subs({self.variables[0]: r, self.variables[1]: s, self.variables[2]: t})
+```
+
+#### sympy/vector/parametricregion.py:180-186
+```python
+
+    for i in range(len(obj.variables) - 1):
+        # Each parameter is replaced by its tangent to simplify intergation
+        parameter = _symbol(parameters[i], real=True)
+        definition = [trigsimp(elem.subs(parameter, tan(parameter/2))) for elem in definition]
+        bounds.append((parameter, 0, 2*pi),)
+
+```
+
+#### sympy/functions/elementary/complexes.py:610-616
+```python
+            return
+        if arg != conj and arg != -conj:
+            ignore = arg.atoms(Abs)
+            abs_free_arg = arg.xreplace({i: Dummy(real=True) for i in ignore})
+            unk = [a for a in abs_free_arg.free_symbols if a.is_extended_real is None]
+            if not unk or not all(conj.has(conjugate(u)) for u in unk):
+                return sqrt(expand_mul(arg*conj))
+```
+
+#### sympy/functions/elementary/trigonometric.py:1571-1577
+```python
+            coeff, terms = arg.as_coeff_Mul(rational=True)
+            if coeff.is_Integer and coeff > 1:
+                I = S.ImaginaryUnit
+                z = Symbol('dummy', real=True)
+                P = ((z + I)**coeff).expand()
+                return (re(P)/im(P)).subs([(z, cot(terms))])
+        return cot(arg)
+```
+
+#### sympy/functions/elementary/integers.py:412-418
+```python
+    for complex arguments
+
+    >>> r = Symbol('r', real=True)
+    >>> t = Symbol('t', real=True)
+    >>> frac(t + I*r)
+    I*frac(r) + frac(t)
+
+```
+
+#### sympy/functions/elementary/tests/test_complexes.py:970-975
+```python
+@_both_exp_pow
+def test_issue_15893():
+    f = Function('f', real=True)
+    x = Symbol('x', real=True)
+    eq = Derivative(Abs(f(x)), f(x))
+    assert eq.doit() == sign(f(x))
+```
+
+#### sympy/functions/elementary/tests/test_miscellaneous.py:370-376
+```python
+
+def test_rewrite_MaxMin_as_Piecewise():
+    from sympy import symbols, Piecewise
+    x, y, z, a, b = symbols('x y z a b', real=True)
+    vx, vy, va = symbols('vx vy va')
+    assert Max(a, b).rewrite(Piecewise) == Piecewise((a, a >= b), (b, True))
+    assert Max(x, y, z).rewrite(Piecewise) == Piecewise((x, (x >= y) & (x >= z)), (y, y >= z), (z, True))
+```
+
+#### sympy/functions/elementary/tests/test_hyperbolic.py:1109-1115
+```python
+    assert cosh(3*I*pi/4, evaluate=False).is_positive is False
+
+def test_cosh_nonnegative():
+    k = symbols('k', real=True)
+    n = symbols('n', integer=True)
+
+    assert cosh(k, evaluate=False).is_nonnegative is True
+```
+
+#### sympy/functions/elementary/tests/test_integers.py:421-427
+```python
+    p_r = Symbol('p_r', real=True, positive=True)
+    n_r = Symbol('n_r', real=True, negative=True)
+    np_r = Symbol('np_r', real=True, nonpositive=True)
+    nn_r = Symbol('nn_r', real=True, nonnegative=True)
+
+    # Real frac argument, integer rhs
+    assert frac(r) <= p_i
+```
+
+#### sympy/functions/elementary/tests/test_trigonometric.py:1881-1887
+```python
+
+
+def test_issue_11864():
+    w, k = symbols('w, k', real=True)
+    F = Piecewise((1, Eq(2*pi*k, 0)), (sin(pi*k)/(pi*k), True))
+    soln = Piecewise((1, Eq(2*pi*k, 0)), (sinc(pi*k), True))
+    assert F.rewrite(sinc) == soln
+```
+
+#### sympy/functions/elementary/tests/test_exponential.py:650-656
+```python
+
+    i, j = symbols('i,j', positive=True, integer=True)
+    x, y = symbols('x,y', positive=True)
+    z = symbols('z', real=True)
+    w = symbols('w')
+
+    expr = log(Product(x**i, (i, 1, n)))
+```
+
+#### sympy/functions/elementary/tests/test_piecewise.py:1362-1368
+```python
+    raises(NotImplementedError, lambda: Piecewise((x, x<0), (0, y>1)).as_expr_set_pairs())
+
+def test_issue_20360():
+    t, tau = symbols("t tau", real=True)
+    n = symbols("n", integer=True)
+    lam = pi * (n - S.Half)
+    eq = integrate(exp(lam * tau), (tau, 0, t))
+```
+
+#### sympy/functions/special/delta_functions.py:611-617
+```python
+        ========
+
+        >>> from sympy import Heaviside, Symbol, sign, S
+        >>> x = Symbol('x', real=True)
+
+        >>> Heaviside(x, H0=S.Half).rewrite(sign)
+        sign(x)/2 + 1/2
+```
+
+#### sympy/functions/special/tests/test_error_functions.py:499-505
+```python
+
+def test_li():
+    z = Symbol("z")
+    zr = Symbol("z", real=True)
+    zp = Symbol("z", positive=True)
+    zn = Symbol("z", negative=True)
+
+```
+
+#### sympy/functions/special/tests/test_zeta_functions.py:228-234
+```python
+
+
+def test_issue_10475():
+    a = Symbol('a', extended_real=True)
+    b = Symbol('b', extended_positive=True)
+    s = Symbol('s', zero=False)
+
+```
+
+#### sympy/functions/special/tests/test_elliptic_integrals.py:139-145
+```python
+    assert P(ni, z, mi).conjugate() == \
+        P(ni.conjugate(), z.conjugate(), mi.conjugate())
+    nr, mr = Symbol('n', real=True, negative=True), \
+        Symbol('m', real=True, negative=True)
+    assert P(nr, z, mr).conjugate() == P(nr, z.conjugate(), mr)
+    assert P(n, m).conjugate() == P(n.conjugate(), m.conjugate())
+
+```
+
+#### sympy/functions/special/tests/test_delta_functions.py:156-162
+```python
+    assert Heaviside(0).rewrite(SingularityFunction) == SingularityFunction(0, 0, 0)
+
+def test_issue_15923():
+    x = Symbol('x', real=True)
+    assert Heaviside(x).rewrite(Piecewise, H0=0) == (
+        Piecewise((0, x <= 0), (1, True)))
+    assert Heaviside(x).rewrite(Piecewise, H0=1) == (
+```
+
+#### sympy/functions/special/tests/test_gamma_functions.py:584-590
+```python
+    assert loggamma(Symbol('v', nonpositive=True)).is_real is False
+    assert loggamma(Symbol('v', nonnegative=True)).is_real is None
+    assert loggamma(Symbol('v', imaginary=True)).is_real is None
+    assert loggamma(Symbol('v', real=True)).is_real is None
+    assert loggamma(Symbol('v')).is_real is None
+
+    assert loggamma(S.Half).is_real is True
+```
+
+#### sympy/functions/special/tests/test_spherical_harmonics.py:39-45
+```python
+
+def test_Znm():
+    # https://en.wikipedia.org/wiki/Solid_harmonics#List_of_lowest_functions
+    th, ph = Symbol("theta", real=True), Symbol("phi", real=True)
+
+    assert Znm(0, 0, th, ph) == Ynm(0, 0, th, ph)
+    assert Znm(1, -1, th, ph) == (-sqrt(2)*I*(Ynm(1, 1, th, ph)
+```
+
+#### sympy/functions/special/tests/test_bessel.py:484-490
+```python
+def test_airy_base():
+    z = Symbol('z')
+    x = Symbol('x', real=True)
+    y = Symbol('y', real=True)
+
+    assert conjugate(airyai(z)) == airyai(conjugate(z))
+    assert airyai(x).is_extended_real
+```
+
+#### sympy/functions/combinatorial/numbers.py:1005-1011
+```python
+                # Euler polynomial
+                else:
+                    from sympy.core.evalf import pure_complex
+                    reim = pure_complex(sym, or_real=True)
+                    # Evaluate polynomial numerically using mpmath
+                    if reim and all(a.is_Float or a.is_Integer for a in reim) \
+                            and any(a.is_Float for a in reim):
+```
+
+#### sympy/functions/combinatorial/tests/test_comb_numbers.py:445-451
+```python
+        assert partition(n) == p
+
+    x = Symbol('x')
+    y = Symbol('y', real=True)
+    m = Symbol('m', integer=True)
+    n = Symbol('n', integer=True, negative=True)
+    p = Symbol('p', integer=True, nonnegative=True)
+```
+
+#### sympy/printing/tests/test_mathml.py:1502-1508
+```python
+
+
+def test_print_AccumBounds():
+    a = Symbol('a', real=True)
+    assert mpp.doprint(AccumBounds(0, 1)) == '<mfenced close="&#10217;" open="&#10216;"><mn>0</mn><mn>1</mn></mfenced>'
+    assert mpp.doprint(AccumBounds(0, a)) == '<mfenced close="&#10217;" open="&#10216;"><mn>0</mn><mi>a</mi></mfenced>'
+    assert mpp.doprint(AccumBounds(a + 1, a + 2)) == '<mfenced close="&#10217;" open="&#10216;"><mrow><mi>a</mi><mo>+</mo><mn>1</mn></mrow><mrow><mi>a</mi><mo>+</mo><mn>2</mn></mrow></mfenced>'
+```
+
+#### sympy/printing/tests/test_str.py:1016-1022
+```python
+
+def test_diffgeom():
+    from sympy.diffgeom import Manifold, Patch, CoordSystem, BaseScalarField
+    x,y = symbols('x y', real=True)
+    m = Manifold('M', 2)
+    assert str(m) == "M"
+    p = Patch('P', m)
+```
+
+#### sympy/printing/tests/test_c.py:712-718
+```python
+    assert printer.doprint(dcl3) == 'bool y'
+    assert 'stdbool.h' in printer.headers
+
+    u = symbols('u', real=True)
+    ptr4 = Pointer.deduced(u, attrs={pointer_const, restrict})
+    dcl4 = Declaration(ptr4)
+    assert ccode(dcl4) == 'double * const restrict u'
+```
+
+#### sympy/printing/tests/test_latex.py:2582-2588
+```python
+def test_latex_diffgeom():
+    from sympy.diffgeom import Manifold, Patch, CoordSystem, BaseScalarField, Differential
+    from sympy.diffgeom.rn import R2
+    x,y = symbols('x y', real=True)
+    m = Manifold('M', 2)
+    assert latex(m) == r'\text{M}'
+    p = Patch('P', m)
+```
+
+#### sympy/printing/pretty/tests/test_pretty.py:7392-7398
+```python
+
+def test_diffgeom():
+    from sympy.diffgeom import Manifold, Patch, CoordSystem, BaseScalarField
+    x,y = symbols('x y', real=True)
+    m = Manifold('M', 2)
+    assert pretty(m) == 'M'
+    p = Patch('P', m)
+```
+
+#### sympy/assumptions/tests/test_query.py:2216-2222
+```python
+
+
+def test_check_old_assumption():
+    x = symbols('x', real=True)
+    assert ask(Q.real(x)) is True
+    assert ask(Q.imaginary(x)) is False
+    assert ask(Q.complex(x)) is True
+```
+
+#### sympy/assumptions/tests/test_wrapper.py:22-28
+```python
+
+
+def test_is_extended_real():
+    x = Symbol('x', extended_real=True)
+    y = Symbol('y', extended_real=False)
+    z = Symbol('z')
+    assert is_extended_real(x)
+```
+
+#### sympy/logic/boolalg.py:139-145
+```python
+        ========
+
+        >>> from sympy import Symbol, Eq, Or, And
+        >>> x = Symbol('x', real=True)
+        >>> Eq(x, 0).as_set()
+        FiniteSet(0)
+        >>> (x > 0).as_set()
+```
+
+#### sympy/logic/tests/test_boolalg.py:1101-1107
+```python
+                " simplified: {}\ndo not evaluate to the same value for {}"\
+                "".format(original, simplified, sublist)
+
+    w, x, y, z = symbols('w x y z', real=True)
+    d, e = symbols('d e', real=False)
+
+    expressions = (And(Eq(x, y), x >= y, w < y, y >= z, z < y),
+```
+
+#### sympy/ntheory/tests/test_generate.py:50-56
+```python
+    n = Symbol('n')
+    assert primepi(n).subs(n, 2) == 1
+
+    r = Symbol('r', real=True)
+    assert primepi(r).subs(r, 2) == 1
+
+    assert primepi(S.Infinity) is S.Infinity
+```
+
+#### sympy/sets/sets.py:896-902
+```python
+    >>> Interval.open(0, 1)
+    Interval.open(0, 1)
+
+    >>> a = Symbol('a', real=True)
+    >>> Interval(0, a)
+    Interval(0, a)
+
+```
+
+#### sympy/sets/tests/test_setexpr.py:17-23
+```python
+
+def test_scalar_funcs():
+    assert SetExpr(Interval(0, 1)).set == Interval(0, 1)
+    a, b = Symbol('a', real=True), Symbol('b', real=True)
+    a, b = 1, 2
+    # TODO: add support for more functions in the future:
+    for f in [exp, log]:
+```
+
+#### sympy/sets/tests/test_fancysets.py:779-785
+```python
+
+
+def test_ComplexRegion_contains():
+    r = Symbol('r', real=True)
+    # contains in ComplexRegion
+    a = Interval(2, 3)
+    b = Interval(4, 6)
+```
+
+#### sympy/sets/tests/test_sets.py:1404-1410
+```python
+
+def test_issue_2799():
+    U = S.UniversalSet
+    a = Symbol('a', real=True)
+    inf_interval = Interval(a, oo)
+    R = S.Reals
+
+```
+
+#### sympy/sets/handlers/intersection.py:283-289
+```python
+        f = self.lamda.expr
+        n = self.lamda.variables[0]
+
+        n_ = Dummy(n.name, real=True)
+        f_ = f.subs(n, n_)
+
+        re, im = f_.as_real_imag()
+```
+
+#### sympy/sets/handlers/functions.py:38-44
+```python
+        return
+    var = f.variables[0]
+    if not var.is_real:
+        if expr.subs(var, Dummy(real=True)).is_real is False:
+            return
+
+    if expr.is_Piecewise:
+```
+
+#### sympy/series/gruntz.py:529-535
+```python
+    # For limits of complex functions, the algorithm would have to be
+    # improved, or just find limits of Re and Im components separately.
+    #
+    w = Dummy("w", real=True, positive=True)
+    f, logw = rewrite(exps, Omega, x, w)
+    series = calculate_series(f, w, logx=logw)
+    return series.leadterm(w)
+```
+
+#### sympy/series/tests/test_limits.py:918-924
+```python
+    m = Symbol('m')
+    # the result is not 0 for non-real m
+    assert limit(cos(m*x)/x, x, oo) == Limit(cos(m*x)/x, x, oo, dir='-')
+    m = Symbol('m', real=True)
+    # can be improved to give the correct result 0
+    assert limit(cos(m*x)/x, x, oo) == Limit(cos(m*x)/x, x, oo, dir='-')
+    m = Symbol('m', nonzero=True)
+```
+
+#### sympy/series/tests/test_order.py:309-315
+```python
+
+
+def test_order_conjugate_transpose():
+    x = Symbol('x', real=True)
+    y = Symbol('y', imaginary=True)
+    assert conjugate(Order(x)) == Order(conjugate(x))
+    assert conjugate(Order(y)) == Order(conjugate(y))
+```
+
+#### sympy/series/tests/test_series.py:264-270
+```python
+
+
+def test_issue_19534():
+    dt = symbols('dt', real=True)
+    expr = 16*dt*(0.125*dt*(2.0*dt + 1.0) + 0.875*dt + 1.0)/45 + \
+            49*dt*(-0.049335189898860408029*dt*(2.0*dt + 1.0) + \
+            0.29601113939316244817*dt*(0.125*dt*(2.0*dt + 1.0) + 0.875*dt + 1.0) - \
+```
+
+#### sympy/series/tests/test_gruntz.py:16-22
+```python
+"""
+
+x = Symbol('x', real=True)
+m = Symbol('m', real=True)
+
+
+runslow = False
+```
+
+#### sympy/series/tests/test_nseries.py:374-380
+```python
+
+
+def test_series3():
+    w = Symbol("w", real=True)
+    e = w**(-6)*(w**3*tan(w) - w**3*sin(w))
+    assert e.nseries(w, n=8) == Integer(1)/2 + w**2/8 + 13*w**4/240 + 529*w**6/24192 + O(w**8)
+
+```
+
+#### sympy/polys/tests/test_polyroots.py:500-506
+```python
+    assert roots(x**4 - 1, x, filter='Z', multiple=True) == [-S.One, S.One]
+    assert roots(x**4 - 1, x, filter='I', multiple=True) == [I, -I]
+
+    ar, br = symbols('a, b', real=True)
+    p = x**2*(ar-br)**2 + 2*x*(br-ar) + 1
+    assert roots(p, x, filter='R') == {1/(ar - br): 2}
+
+```
+
+#### sympy/polys/tests/test_polytools.py:2445-2451
+```python
+
+    p = Symbol('p', positive=True)
+    i = Symbol('i', integer=True)
+    r = Symbol('r', real=True)
+
+    assert factor(sqrt(x*y)).is_Pow is True
+
+```
+
+#### sympy/integrals/integrals.py:521-527
+```python
+                (len(xab) == 3 and all(x.is_extended_real and not x.is_infinite for
+                 x in xab[1:]))):
+                    # some improper integrals are better off with Abs
+                    xr = Dummy("xr", real=True)
+                    function = (function.xreplace({xab[0]: xr})
+                        .rewrite(Piecewise).xreplace({xr: xab[0]}))
+            elif function.has(Min, Max):
+```
+
+#### sympy/integrals/transforms.py:1195-1201
+```python
+    # 1) Use inverse mellin transforms - related by a simple change of variables.
+    # 2) Use the inversion integral.
+
+    t = Dummy('t', real=True)
+
+    def pw_simp(*args):
+        """ Simplify a piecewise expression from hyperexpand. """
+```
+
+#### sympy/integrals/tests/test_transforms.py:836-842
+```python
+
+
+def test_issue_12591():
+    x, y = symbols("x y", real=True)
+    assert fourier_transform(exp(x), x, y) == FourierTransform(exp(x), x, y)
+
+
+```
+
+#### sympy/integrals/tests/test_manual.py:443-449
+```python
+    assert manualintegrate(sqrt(a*x + b) / x, x) == \
+        2*b*atan(sqrt(a*x + b)/sqrt(-b))/sqrt(-b) + 2*sqrt(a*x + b)
+    ra = Symbol('a', real=True)
+    rb = Symbol('b', real=True)
+    assert manualintegrate(sqrt(ra*x + rb) / x, x) == \
+        -2*rb*Piecewise((-atan(sqrt(ra*x + rb)/sqrt(-rb))/sqrt(-rb), -rb > 0),
+                        (acoth(sqrt(ra*x + rb)/sqrt(rb))/sqrt(rb), And(-rb < 0, ra*x + rb > rb)),
+```
+
+#### sympy/integrals/tests/test_integrals.py:1711-1717
+```python
+
+
+def test_issue_21034():
+    x = Symbol('x', real=True, nonzero=True)
+    f1 = x*(-x**4/asin(5)**4 - x*sinh(x + log(asin(5))) + 5)
+    f2 = (x + cosh(cos(4)))/(x*(x + 1/(12*x)))
+
+```
+
+#### sympy/integrals/tests/test_meijerint.py:713-719
+```python
+
+def test_issue_13536():
+    from sympy import Symbol
+    a = Symbol('a', real=True, positive=True)
+    assert integrate(1/x**2, (x, oo, a)) == -1/a
+
+
+```
+
+#### sympy/integrals/tests/test_rationaltools.py:147-153
+```python
+
+
+def test_issue_6308():
+    k, a0 = symbols('k a0', real=True)
+    assert integrate((x**2 + 1 - k**2)/(x**2 + 1 + a0**2), x) == \
+        x - (a0**2 + k**2)*atan(x/sqrt(a0**2 + 1))/sqrt(a0**2 + 1)
+
+```
+
+#### sympy/integrals/rubi/tests/test_rubi_integrate.py:18-24
+```python
+from sympy.integrals.rubi.utility_function import rubi_test
+from sympy.testing.pytest import SKIP
+
+a, b, c, d, e, f, x, m, n, p, k = symbols('a b c d e f x m n p k', real=True, imaginary=False)
+
+@SKIP
+def test_rubi_integrate():
+```
+
+#### sympy/integrals/rubi/tests/test_utility_function.py:116-122
+```python
+from sympy import (I, E, pi, hyper, Add, Wild, simplify, Symbol, exp, Pow, li, Ei, expint,
+    Si, Ci, Shi, Chi, loggamma, zeta, zoo, gamma, polylog, oo, polygamma)
+from sympy import Integral, nsimplify, Min
+A, B, a, b, c, d, e, f, g, h, y, z, m, n, p, q, u, v, w, F = symbols('A B a b c d e f g h y z m n p q u v w F', real=True, imaginary=False)
+x = Symbol('x')
+
+def test_ZeroQ():
+```
+
+#### sympy/integrals/rubi/rubi_tests/tests/test_trinomials.py:26-32
+```python
+from sympy.testing.pytest import SKIP
+
+a, b, c, d, e, f, m, n, x, u , k, p, j, l , i= symbols('a b c d e f m n x u k p j l i1')
+A, B, C, a, b, c, d, e, f, g, h, y, z, m, n, p, q, u, v, w, F = symbols('A B C a b c d e f g h y z m n p q u v w F', real=True, imaginary=False)
+
+
+def test_1():
+```
+
+#### sympy/integrals/rubi/rubi_tests/tests/test_1_3.py:22-28
+```python
+from sympy import S, hyper, I, simplify, exp_polar, symbols
+from sympy.testing.pytest import slow, skip, ON_TRAVIS
+
+A, B, C, D, a, b, c, d, e, f, m, n, p, x, u = symbols('A B C D a b c d e f m n p x u', real=True, imaginary=False)
+
+@slow
+def test_1():
+```
+
+#### sympy/matrices/eigen.py:1314-1320
+```python
+    ========
+
+    >>> from sympy import Matrix, Symbol
+    >>> x = Symbol('x', real=True)
+    >>> M = Matrix([[0, 1, 0], [0, x, 0], [-1, 0, 0]])
+    >>> M.singular_values()
+    [sqrt(x**2 + 1), 1, 0]
+```
+
+#### sympy/matrices/matrices.py:1899-1905
+```python
+        ========
+
+        >>> from sympy import Matrix, Symbol, trigsimp, cos, sin, oo
+        >>> x = Symbol('x', real=True)
+        >>> v = Matrix([cos(x), sin(x)])
+        >>> trigsimp( v.norm() )
+        1
+```
+
+#### sympy/matrices/dense.py:846-852
+```python
+
+    For setting assumptions of the underlying Symbols:
+
+    >>> [s.is_real for s in symarray('a', 2, real=True)]
+    [True, True]
+    """
+    from numpy import empty, ndindex
+```
+
+#### sympy/matrices/tests/test_eigen.py:467-473
+```python
+
+
+def test_singular_values():
+    x = Symbol('x', real=True)
+
+    A = Matrix([[0, 1*I], [2, 0]])
+    # if singular values can be sorted, they should be in decreasing order
+```
+
+#### sympy/matrices/tests/test_matrices.py:2403-2409
+```python
+
+def test_dual():
+    B_x, B_y, B_z, E_x, E_y, E_z = symbols(
+        'B_x B_y B_z E_x E_y E_z', real=True)
+    F = Matrix((
+        (   0,  E_x,  E_y,  E_z),
+        (-E_x,    0,  B_z, -B_y),
+```
+
+#### sympy/matrices/tests/test_commonmatrix.py:501-507
+```python
+    assert m1 == Matrix(
+        [[x*y + x**2, 2], [x*y**2 + y*x**2, x*y + y*x**2 + x**3]])
+
+    a = Symbol('a', real=True)
+
+    assert OperationsOnlyMatrix(1, 1, [exp(I*a)]).expand(complex=True) == \
+           Matrix([cos(a) + I*sin(a)])
+```
+
+#### sympy/codegen/ast.py:1784-1790
+```python
+    >>> from sympy import symbols
+    >>> from sympy.codegen.ast import real, FunctionPrototype
+    >>> from sympy.printing import ccode
+    >>> x, y = symbols('x y', real=True)
+    >>> fp = FunctionPrototype(real, 'foo', [x, y])
+    >>> ccode(fp)
+    'double foo(double x, double y)'
+```
+
+#### sympy/codegen/fnodes.py:516-522
+```python
+    >>> from sympy.printing import fcode
+    >>> from sympy.codegen.ast import FunctionDefinition, real, Return
+    >>> from sympy.codegen.fnodes import array, sum_, bind_C
+    >>> a = Symbol('a', real=True)
+    >>> s = Symbol('s', integer=True)
+    >>> arr = array(a, dim=[s], intent='in')
+    >>> body = [Return((sum_(a**2)/s)**.5)]
+```
+
+#### sympy/codegen/tests/test_cfunctions.py:85-91
+```python
+    assert log2(8) == 3
+    assert log2(pi) != log(pi)/log(2)  # log2 should *save* (CPU) instructions
+
+    x = Symbol('x', real=True, finite=True)
+    assert log2(x) != log(x)/log(2)
+    assert log2(2**x) == x
+
+```
+
+#### sympy/codegen/tests/test_fnodes.py:193-199
+```python
+    if not np:
+        skip("NumPy not found.")
+
+    a = Symbol('a', real=True)
+    s = Symbol('s', integer=True)
+    body = [Return((sum_(a**2)/s)**.5)]
+    arr = array(a, dim=[s], intent='in')
+```
+
+#### sympy/codegen/tests/test_ast.py:404-410
+```python
+
+
+def test_Declaration():
+    u = symbols('u', real=True)
+    vu = Variable(u, type=Type.from_expr(u))
+    assert Declaration(vu).variable.type == real
+    vn = Variable(n, type=Type.from_expr(n))
+```
+
+#### sympy/codegen/tests/test_algorithms.py:69-75
+```python
+
+
+def test_newtons_method_function__pycode():
+    x = sp.Symbol('x', real=True)
+    expr = sp.cos(x) - x**3
+    func = newtons_method_function(expr, x)
+    py_mod = py_module(func)
+```
+
+#### sympy/simplify/simplify.py:998-1004
+```python
+    >>> logcombine(a*log(x) + log(y) - log(z), force=True)
+    log(x**a*y/z)
+    >>> x,y,z = symbols('x,y,z', positive=True)
+    >>> a = Symbol('a', real=True)
+    >>> logcombine(a*log(x) + log(y) - log(z))
+    log(x**a*y/z)
+
+```
+
+#### sympy/simplify/tests/test_powsimp.py:326-331
+```python
+
+
+def test_issue_17524():
+    a = symbols("a", real=True)
+    e = (-1 - a**2)*sqrt(1 + a**2)
+    assert signsimp(powsimp(e)) == signsimp(e) == -(a**2 + 1)**(S(3)/2)
+```
+
+#### sympy/simplify/tests/test_simplify.py:451-457
+```python
+    x, y = symbols("x,y")
+    a = Symbol("a")
+    z, w = symbols("z,w", positive=True)
+    b = Symbol("b", real=True)
+    assert logcombine(log(x) + 2*log(y)) == log(x) + 2*log(y)
+    assert logcombine(log(x) + 2*log(y), force=True) == log(x*y**2)
+    assert logcombine(a*log(w) + log(z)) == a*log(w) + log(z)
+```
+
+#### sympy/calculus/singularities.py:68-74
+```python
+
+    >>> from sympy.calculus.singularities import singularities
+    >>> from sympy import Symbol, log
+    >>> x = Symbol('x', real=True)
+    >>> y = Symbol('y', real=False)
+    >>> singularities(x**2 + x + 1, x)
+    EmptySet
+```
+
+#### sympy/calculus/util.py:1010-1016
+```python
+        min = _sympify(min)
+        max = _sympify(max)
+
+        # Only allow real intervals (use symbols with 'is_extended_real=True').
+        if not min.is_extended_real or not max.is_extended_real:
+            raise ValueError("Only real AccumulationBounds are supported")
+
+```
+
+#### sympy/calculus/tests/test_singularities.py:22-28
+```python
+    assert singularities(1/(y**2 + 2*I*y + 1), y) == \
+        FiniteSet(-I + sqrt(2)*I, -I - sqrt(2)*I)
+
+    x = Symbol('x', real=True)
+    assert singularities(1/(x**2 + 1), x) == S.EmptySet
+    assert singularities(exp(1/x), x, S.Reals) == FiniteSet(0)
+    assert singularities(exp(1/x), x, Interval(1, 2)) == S.EmptySet
+```
+
+#### sympy/calculus/tests/test_util.py:560-566
+```python
+
+
+def test_issue_16469():
+    x = Symbol("x", real=True)
+    f = abs(x)
+    assert function_range(f, x, S.Reals) == Interval(0, oo, False, True)
+
+```
+
+#### sympy/stats/crv_types.py:3665-3671
+```python
+    >>> from sympy.stats import RaisedCosine, density
+    >>> from sympy import Symbol, pprint
+
+    >>> mu = Symbol("mu", real=True)
+    >>> s = Symbol("s", positive=True)
+    >>> z = Symbol("z")
+
+```
+
+#### sympy/stats/rv.py:1609-1615
+```python
+
+    In this case the condition is False so an error is raised:
+
+    >>> r = Dummy(real=True)
+    >>> _value_check(r < r - 1, 'condition is not true')
+    Traceback (most recent call last):
+    ...
+```
+
+#### sympy/stats/drv.py:331-337
+```python
+
+    def compute_quantile(self, expr, **kwargs):
+        if expr == self.value:
+            p = Dummy("p", real=True)
+            return Lambda(p, self.distribution.quantile(p, **kwargs))
+        else:
+            raise NotImplementedError()
+```
+
+#### sympy/stats/frv.py:394-400
+```python
+    def compute_moment_generating_function(self, expr):
+        if self._is_symbolic:
+            d = self.compute_density(expr)
+            t = Dummy('t', real=True)
+            ki = Dummy('ki')
+            return Lambda(t, Sum(d(ki)*exp(ki*t), (ki, self.args[1].low, self.args[1].high)))
+        expr = rv_subs(expr, self.values)
+```
+
+#### sympy/stats/crv.py:532-538
+```python
+    def compute_quantile(self, expr, **kwargs):
+
+        if expr == self.value:
+            p = Dummy("p", real=True)
+            return Lambda(p, self.distribution.quantile(p, **kwargs))
+        else:
+            return ContinuousPSpace.compute_quantile(self, expr, **kwargs)
+```
+
+#### sympy/stats/rv_interface.py:328-334
+```python
+    >>> kurtosis(X, X > 0) # find kurtosis given X > 0
+    (-4/pi - 12/pi**2 + 3)/(1 - 2/pi)**2
+
+    >>> rate = Symbol('lamda', positive=True, real=True, finite=True)
+    >>> Y = Exponential('Y', rate)
+    >>> kurtosis(Y)
+    9
+```
+
+#### sympy/stats/joint_rv.py:360-366
+```python
+        marginalise_out = [i for i in random_symbols(expr) if i not in rvs]
+        if isinstance(expr, JointDistribution):
+            count = len(expr.domain.args)
+            x = Dummy('x', real=True, finite=True)
+            syms = tuple(Indexed(x, i) for i in count)
+            expr = expr.pdf(syms)
+        else:
+```
+
+#### sympy/stats/symbolic_probability.py:631-637
+```python
+    >>> from sympy import Symbol, Integral
+    >>> from sympy.stats import Normal, Expectation, Probability, CentralMoment
+    >>> mu = Symbol('mu', real=True)
+    >>> sigma = Symbol('sigma', real=True, positive=True)
+    >>> X = Normal('X', mu, sigma)
+    >>> CM = CentralMoment(X, 4)
+
+```
+
+#### sympy/stats/tests/test_compound_rv.py:105-111
+```python
+    assert C.pdf(y, evaluate=True) == Piecewise((S(1)/(30*beta(2, 4)), Eq(y, 0)),
+                (S(1)/(60*beta(2, 4)), Eq(y, 1)), (0, True))
+
+    k, t, z = symbols('k t z', positive=True, real=True)
+    G = Gamma('G', k, t)
+    X = PoissonDistribution(G)
+    C = CompoundDistribution(X)
+```
+
+#### sympy/stats/tests/test_stochastic_process.py:45-51
+```python
+    # pass name and state_space
+    # any hashable object should be a valid state
+    # states should be valid as a tuple/set/list/Tuple/Range
+    sym, rainy, cloudy, sunny = symbols('a Rainy Cloudy Sunny', real=True)
+    state_spaces = [(1, 2, 3), [Str('Hello'), sym, DiscreteMarkovChain],
+                    Tuple(1, exp(sym), Str('World'), sympify=False), Range(-1, 5, 2),
+                    [rainy, cloudy, sunny]]
+```
+
+#### sympy/stats/tests/test_symbolic_probability.py:150-156
+```python
+
+def test_symbolic_CentralMoment():
+    mu = symbols('mu', real=True)
+    sigma = symbols('sigma', real=True, positive=True)
+    x = symbols('x')
+    X = Normal('X', mu, sigma)
+    CM = CentralMoment(X, 6)
+```
+
+#### sympy/stats/tests/test_rv.py:274-280
+```python
+def test_normality():
+    X, Y = Normal('X', 0, 1), Normal('Y', 0, 1)
+    x = Symbol('x', real=True, finite=True)
+    z = Symbol('z', real=True, finite=True)
+    dens = density(X - Y, Eq(X + Y, z))
+
+    assert integrate(dens(x), (x, -oo, oo)) == 1
+```
+
+#### sympy/stats/tests/test_joint_rv.py:137-143
+```python
+
+def test_MultivariateBeta():
+    a1, a2 = symbols('a1, a2', positive=True)
+    a1_f, a2_f = symbols('a1, a2', positive=False, real=True)
+    mb = MultivariateBeta('B', [a1, a2])
+    mb_c = MultivariateBeta('C', a1, a2)
+    assert density(mb)(1, 2) == S(2)**(a2 - 1)*gamma(a1 + a2)/\
+```
+
+#### sympy/stats/tests/test_continuous_rv.py:1450-1456
+```python
+
+
+def test_long_precomputed_cdf():
+    x = symbols("x", real=True)
+    distribs = [
+            Arcsin("A", -5, 9),
+            Dagum("D", 4, 10, 3),
+```
+
+#### sympy/algebras/tests/test_quaternion.py:168-174
+```python
+
+    z = symbols('z', complex=True)
+    z_quat = Quaternion(re(z), im(z), 0, 0)
+    q = Quaternion(*symbols('q:4', real=True))
+
+    assert z * q == z_quat * q
+    assert q * z == q * z_quat
+```
+
+#### sympy/parsing/tests/test_sympy_parser.py:122-128
+```python
+
+def test_local_dict_split_implmult():
+    t = standard_transformations + (split_symbols, implicit_multiplication,)
+    w = Symbol('w', real=True)
+    y = Symbol('y')
+    assert parse_expr('yx', local_dict={'x':w}, transformations=t) == y*w
+
+```
+
+#### sympy/parsing/autolev/_listener_autolev_antlr.py:247-253
+```python
+        elif self.settings["complex"] == "off":
+            real = ""
+    except Exception:
+        real = ", real=True"
+
+    if l1:
+        a = ", ".join(l1) + " = " + "_sm.symbols(" + "'" +\
+```
+
+#### sympy/parsing/autolev/__init__.py:54-60
+```python
+    <BLANKLINE>
+    q1, q2, u1, u2 = _me.dynamicsymbols('q1 q2 u1 u2')
+    q1_d, q2_d, u1_d, u2_d = _me.dynamicsymbols('q1_ q2_ u1_ u2_', 1)
+    l, m, g = _sm.symbols('l m g', real=True)
+    frame_n = _me.ReferenceFrame('n')
+    frame_a = _me.ReferenceFrame('a')
+    frame_b = _me.ReferenceFrame('b')
+```
+
+#### sympy/parsing/autolev/test-examples/ruletest8.py:4-10
+```python
+import numpy as _np
+
+frame_a = _me.ReferenceFrame('a')
+c1, c2, c3 = _sm.symbols('c1 c2 c3', real=True)
+a = _me.inertia(frame_a, 1, 1, 1)
+particle_p1 = _me.Particle('p1', _me.Point('p1_pt'), _sm.Symbol('m'))
+particle_p2 = _me.Particle('p2', _me.Point('p2_pt'), _sm.Symbol('m'))
+```
+
+#### sympy/parsing/autolev/test-examples/ruletest10.py:50-56
+```python
+body_b2_cm.set_vel(frame_n, 0)
+body_b2_f = _me.ReferenceFrame('b2_f')
+body_b2 = _me.RigidBody('b2', body_b2_cm, body_b2_f, _sm.symbols('m'), (_me.outer(body_b2_f.x,body_b2_f.x),body_b2_cm))
+g = _sm.symbols('g', real=True)
+force_p1 = particle_p1.mass*(g*frame_n.x)
+force_p2 = particle_p2.mass*(g*frame_n.x)
+force_b1 = body_b1.mass*(g*frame_n.x)
+```
+
+#### sympy/parsing/autolev/test-examples/ruletest12.py:4-10
+```python
+import numpy as _np
+
+x, y = _me.dynamicsymbols('x y')
+a, b, r = _sm.symbols('a b r', real=True)
+eqn = _sm.Matrix([[0]])
+eqn[0] = a*x**3+b*y**2-r
+eqn = eqn.row_insert(eqn.shape[0], _sm.Matrix([[0]]))
+```
+
+#### sympy/parsing/autolev/test-examples/ruletest6.py:16-22
+```python
+bm = _sm.Matrix([i.subs({x:1,y:z}) for i in _sm.Matrix([e,2*e]).reshape(2, 1)]).reshape((_sm.Matrix([e,2*e]).reshape(2, 1)).shape[0], (_sm.Matrix([e,2*e]).reshape(2, 1)).shape[1])
+e = q1+q2
+a = (e).subs({q1:x**2+y**2,q2:x-y}).subs({x:2,y:z**2})
+j, k, l = _sm.symbols('j k l', real=True)
+p1 = _sm.Poly(_sm.Matrix([j,k,l]).reshape(1, 3), x)
+p2 = _sm.Poly(j*x+k, x)
+root1 = [i.evalf() for i in _sm.solve(p1, x)]
+```
+
+#### sympy/parsing/autolev/test-examples/ruletest11.py:4-10
+```python
+import numpy as _np
+
+x, y = _me.dynamicsymbols('x y')
+a11, a12, a21, a22, b1, b2 = _sm.symbols('a11 a12 a21 a22 b1 b2', real=True)
+eqn = _sm.Matrix([[0]])
+eqn[0] = a11*x+a12*y-b1
+eqn = eqn.row_insert(eqn.shape[0], _sm.Matrix([[0]]))
+```
+
+#### sympy/parsing/autolev/test-examples/ruletest3.py:7-13
+```python
+frame_b = _me.ReferenceFrame('b')
+frame_n = _me.ReferenceFrame('n')
+x1, x2, x3 = _me.dynamicsymbols('x1 x2 x3')
+l = _sm.symbols('l', real=True)
+v1 = x1*frame_a.x+x2*frame_a.y+x3*frame_a.z
+v2 = x1*frame_b.x+x2*frame_b.y+x3*frame_b.z
+v3 = x1*frame_n.x+x2*frame_n.y+x3*frame_n.z
+```
+
+#### sympy/parsing/autolev/test-examples/ruletest1.py:10-15
+```python
+s2, s3 = _sm.symbols('s2 s3', real=True, nonnegative=True)
+s4 = _sm.symbols('s4', real=True, nonpositive=True)
+k1, k2, k3, k4, l1, l2, l3, p11, p12, p13, p21, p22, p23 = _sm.symbols('k1 k2 k3 k4 l1 l2 l3 p11 p12 p13 p21 p22 p23', real=True)
+c11, c12, c13, c21, c22, c23 = _sm.symbols('c11 c12 c13 c21 c22 c23', real=True)
+e1 = a*f+s2-g
+e2 = f**2+k3*k2*g
+```
+
+#### sympy/parsing/autolev/test-examples/pydy-example-repo/mass_spring_damper.py:3-9
+```python
+import math as m
+import numpy as _np
+
+m, k, b, g = _sm.symbols('m k b g', real=True)
+position, speed = _me.dynamicsymbols('position speed')
+position_d, speed_d = _me.dynamicsymbols('position_ speed_', 1)
+o = _me.dynamicsymbols('o')
+```
+
+#### sympy/parsing/autolev/test-examples/pydy-example-repo/non_min_pendulum.py:6-12
+```python
+q1, q2 = _me.dynamicsymbols('q1 q2')
+q1_d, q2_d = _me.dynamicsymbols('q1_ q2_', 1)
+q1_dd, q2_dd = _me.dynamicsymbols('q1_ q2_', 2)
+l, m, g = _sm.symbols('l m g', real=True)
+frame_n = _me.ReferenceFrame('n')
+point_pn = _me.Point('pn')
+point_pn.set_vel(frame_n, 0)
+```
+
+#### sympy/parsing/autolev/test-examples/pydy-example-repo/chaos_pendulum.py:3-9
+```python
+import math as m
+import numpy as _np
+
+g, lb, w, h = _sm.symbols('g lb w h', real=True)
+theta, phi, omega, alpha = _me.dynamicsymbols('theta phi omega alpha')
+theta_d, phi_d, omega_d, alpha_d = _me.dynamicsymbols('theta_ phi_ omega_ alpha_', 1)
+theta_dd, phi_dd = _me.dynamicsymbols('theta_ phi_', 2)
+```
+
+#### sympy/parsing/autolev/test-examples/pydy-example-repo/double_pendulum.py:5-11
+```python
+
+q1, q2, u1, u2 = _me.dynamicsymbols('q1 q2 u1 u2')
+q1_d, q2_d, u1_d, u2_d = _me.dynamicsymbols('q1_ q2_ u1_ u2_', 1)
+l, m, g = _sm.symbols('l m g', real=True)
+frame_n = _me.ReferenceFrame('n')
+frame_a = _me.ReferenceFrame('a')
+frame_b = _me.ReferenceFrame('b')
+```
+
+#### sympy/benchmarks/bench_meijerint.py:43-49
+```python
+nupos, sigmapos = symbols('nu sigma', positive=True)
+rice = x/sigmapos**2*exp(-(x**2 + nupos**2)/2/sigmapos**2)*besseli(0, x*
+                         nupos/sigmapos**2)
+mu = Symbol('mu', real=True)
+laplace = exp(-abs(x - mu)/bpos)/2/bpos
+
+u = Symbol('u', polar=True)
+```
+
+#### examples/advanced/qft.py:118-124
+```python
+    if not isinstance(M, Basic):
+        raise TypeError("Invalid type of variable")
+
+    d = Symbol("d", real=True)  # d=E+m
+
+    xprint('M', M)
+    print("-"*40)
+```
+
+#### examples/advanced/gibbs_phenomenon.py:68-74
+```python
+    >>> from sympy import Symbol
+    >>> from gibbs_phenomenon import l2_gram_schmidt
+
+    >>> x = Symbol('x', real=True)    # perform computations over reals to save time
+    >>> l2_gram_schmidt([1, x, x**2], (x, -1, 1))
+    [sqrt(2)/2, sqrt(6)*x/2, 3*sqrt(10)*(x**2 - 1/3)/4]
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

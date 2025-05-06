@@ -1,0 +1,153 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Unnecessary joins in admin changelist query
+Description
+	
+Django 1.2.5
+Models:
+class Client(models.Model):
+	name = models.CharField(_('name'), max_length=256)
+	name2 = models.CharField(_('unofficial or obsolete name'), max_length=256, blank=True, null=True)
+	contact_person = models.CharField(_('contact person'), max_length=256, blank=True, null=True)
+	...
+class ClientOffice(models.Model):
+	name = models.CharField(_('name'), max_length=256)
+	name2 = models.CharField(_('unofficial or obsolete name'), max_length=256, blank=True, null=True)
+	...
+	client = models.ForeignKey(Client, verbose_name=_('client'))
+	...
+and admin options like these:
+class ClientAdmin(admin.ModelAdmin):
+	search_fields = ('name', 'name2', 'contact_person', 'clientoffice__name', 'clientoffice__name2')
+	...
+Numbers:
+>>> Client.objects.count()
+10907
+>>> ClientOffice.objects.count()
+16952
+Now, if we try searching for clients in admin by a search query containig several words (>3), got django/admin stalled.
+The problem is going to be that each word in the search query leads to additional JOIN in final SQL query beacause of qs = qs.filter(...) pattern. The attached patch is for Django 1.2.5, but adopting for the current SVN trunk is trivial.
+
+</ISSUE>
+
+
+A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is its debugging history:
+
+==================================================
+The error message "Apps aren't loaded yet" is a typical indication that Django's application registry isn't ready when you try to perform an operation like migration or database query. This usually happens because Django expects certain initial setup operations to be completed before interacting with the database or accessing models.
+
+The script attempts to test a Django project by setting up configuration settings manually and then running migrations. The issue arises because Django apps haven't been fully initialized before executing `call_command('migrate', verbosity=0)`. This initialization process normally occurs during the standard Django startup procedure when you run the server or tests via the command line, which sufficiently sets up the application registry.
+
+To solve the problem in the context of this script, we need to ensure that the Django apps are completely initialized before calling migration commands.
+
+Let's trace the problematic step, which involves preparing the Django application state correctly before performing the migration:
+
+Observed method: `django/apps/registry.py:Apps.check_apps_ready`
+==================================================
+The error "Apps aren't loaded yet" occurs because the Django app registry has not been fully initialized before attempting to run the migration command with `call_command('migrate', verbosity=0)`. This initialization is typically managed by Django when using standard tools like the manage.py script, server, or tests.
+
+Here is what we observe:
+
+- The error occurs inside the `check_apps_ready` method of the `Apps` class located in `django/apps/registry.py`.
+- The crucial point of failure is when `self.check_apps_ready()` gets called, and it determines that `self.apps_ready` is `False`, leading to an `AppRegistryNotReady` exception being raised.
+  
+This suggests that the Django application has not yet been fully initialized, and settings have not been properly configured or populated.
+
+To address this, more groundwork is necessary to properly initialize the Django application before executing database operations, especially within the context of a script run outside the Django management tools.
+
+The issue is not directly with this method but with how we have set up the testing environment. The missing initialization steps prior to the migration command need to be identified.
+
+Given that analysis, I need to examine the section in the testing script where the Django environment and the settings configuration occur. Here is the primary scope to observe:
+
+Observed scope: `django/core/management/__init__.py:65-105`
+==================================================
+Based on the runtime information provided and the error logs, we have identified that the problem of "Apps aren't loaded yet" is happening because Django's application registry isn't initialized before the `call_command('migrate', verbosity=0)` is executed. This situation typically arises when Django hasn't completed the necessary setup required for interacting with the database or other application components, often because key initialization steps were omitted in the script's setup phase.
+
+**Current Analysis:**
+1. The error originates from the `get_app_configs` method, which calls `check_apps_ready()`.
+2. `check_apps_ready()` verifies if `self.apps_ready` is `False`. If it is, it raises an `AppRegistryNotReady` exception. This suggests that some prerequisite initialization operations have not occurred before attempting to interact with the application registry.
+
+**Key Steps Missing:**
+The essential missing step here seems to be the full initialization of Django applications in the script which might involve appropriate application setup that's normally executed at the start when using Django's built-in management tools.
+
+As the flow proceeds towards `get_app_configs()` and hits the `check_apps_ready()`, the step leading up to this should correctly initialize the Django applications before issuing any commands associated with migrations or database interactions.
+
+The commonly overlooked aspect is making sure the Django setup (`django.setup()`) is called right after configuring the settings manually in standalone scripts.
+
+Therefore, the missing piece would be to include `django.setup()` in our script to ensure proper initialization of the Django environment.
+
+**Next Step:**
+Given this context, I will trace further into the `django.apps.registry.Apps.get_app_configs` method to confirm if additional missing steps contribute to initializing and ensuring Django applications are fully ready.
+
+Observed method: `django/apps/registry.py:Apps.get_app_configs`
+==================================================
+**Analysis of the Current Observed Code and Abnormal Program Behavior:**
+
+The observed code in the `get_app_configs` method:
+
+```python
+143	    def get_app_configs(self):
+144	        """Import applications and return an iterable of app configs."""
+145	        self.check_apps_ready()
+146	        return self.app_configs.values()
+```
+
+The method `get_app_configs` is supposed to return app configurations when the applications are fully initialized and ready. However, the behavior we're observing is that it raises an `AppRegistryNotReady` exception at line 145, indicating the app registry is not yet prepared. This exception originates from the fact that `self.check_apps_ready()` is called and determines `self.apps_ready` as `False`.
+
+The runtime information confirms the exception is triggered because Django apps haven't been fully initialized. This occurs when `call_command('migrate', verbosity=0)` is executed without suitable Django environment setup, particularly the absence of `django.setup()` before executing database operations in the script.
+
+**Tracing for Root Cause:**
+The root of the problem lies in the script's setup phase—specifically, the failure to properly initialize the Django environment before executing migration commands. 
+
+To resolve this, I need to ensure the Django environment setup through the `django.setup()` method is incorporated after manual configuration of Django settings but before any interaction with the database.
+
+**Since I have already identified the issue and proposed a likely solution, I will proceed to locate the buggy method needing modification:**
+
+Buggy method: `django/core/management/__init__.py:call_command`
+
+This method indirectly invokes `get_app_configs`, and we need to ensure correct initialization prior to executing this method in standalone scripts. Adding `django.setup()` in the script where `call_command` is used will likely resolve the "Apps aren't loaded yet" error.
+==================================================
+
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+## IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+## IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

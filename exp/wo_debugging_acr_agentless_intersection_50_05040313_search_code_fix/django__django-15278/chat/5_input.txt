@@ -1,0 +1,339 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+To address the issue, we need to understand how Django's SQLite backend handles migrations, specifically when adding fields like OneToOneField with UNIQUE constraints. The error message indicates that there's an issue with adding UNIQUE columns in SQLite using an `ALTER TABLE` statement.
+
+It's likely that resolving this requires altering how migrations interact with SQLite for such operations. To generate a patch, reviewing the implementation of migration operations in the SQLite backend of Django will be necessary.
+
+Let's start by searching for relevant code, such as SQLite backend operations or migration operations.
+
+```python
+search_method_in_codebase("execute")
+search_method_in_codebase("add_field")
+search_code_in_codebase("ALTER TABLE")
+search_class_in_codebase("SQLiteCursorWrapper")
+search_class_in_codebase("Operation")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("execute")
+RESULT:
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor.execute
+```python
+    def execute(self, sql, params=()):
+        """Execute the given SQL statement, with optional parameters."""
+        # Don't perform the transactional DDL check if SQL is being collected
+        # as it's not going to be executed anyway.
+        if not self.collect_sql and self.connection.in_atomic_block and not self.connection.features.can_rollback_ddl:
+            raise TransactionManagementError(
+                "Executing DDL statements while in a transaction on databases "
+                "that can't perform a rollback is prohibited."
+            )
+        # Account for non-string statement objects.
+        sql = str(sql)
+        # Log the command we're running, then run it
+        logger.debug("%s; (params %r)", sql, params, extra={'params': params, 'sql': sql})
+        if self.collect_sql:
+            ending = "" if sql.rstrip().endswith(";") else ";"
+            if params is not None:
+                self.collected_sql.append((sql % tuple(map(self.quote_value, params))) + ending)
+            else:
+                self.collected_sql.append(sql + ending)
+        else:
+            with self.connection.cursor() as cursor:
+                cursor.execute(sql, params)
+
+```
+
+#### django/db/backends/sqlite3/base.py:SQLiteCursorWrapper.execute
+```python
+    def execute(self, query, params=None):
+        if params is None:
+            return Database.Cursor.execute(self, query)
+        query = self.convert_query(query)
+        return Database.Cursor.execute(self, query, params)
+
+```
+
+
+### API INVOKE: search_method_in_codebase("add_field")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """Create a field on a model."""
+        # Fields with default values cannot by handled by ALTER TABLE ADD
+        # COLUMN statement because DROP DEFAULT is not supported in
+        # ALTER TABLE.
+        if not field.null or self.effective_default(field) is not None:
+            self._remake_table(model, create_field=field)
+        else:
+            super().add_field(model, field)
+
+```
+
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """
+        Create a field on a model. Usually involves adding a column, but may
+        involve adding a table instead (for M2M fields).
+        """
+        # Special-case implicit M2M tables
+        if field.many_to_many and field.remote_field.through._meta.auto_created:
+            return self.create_model(field.remote_field.through)
+        # Get the column's definition
+        definition, params = self.column_sql(model, field, include_default=True)
+        # It might not actually have a column behind it
+        if definition is None:
+            return
+        # Check constraints can go on the column SQL here
+        db_params = field.db_parameters(connection=self.connection)
+        if db_params['check']:
+            definition += " " + self.sql_check_constraint % db_params
+        if field.remote_field and self.connection.features.supports_foreign_keys and field.db_constraint:
+            constraint_suffix = '_fk_%(to_table)s_%(to_column)s'
+            # Add FK constraint inline, if supported.
+            if self.sql_create_column_inline_fk:
+                to_table = field.remote_field.model._meta.db_table
+                to_column = field.remote_field.model._meta.get_field(field.remote_field.field_name).column
+                namespace, _ = split_identifier(model._meta.db_table)
+                definition += " " + self.sql_create_column_inline_fk % {
+                    'name': self._fk_constraint_name(model, field, constraint_suffix),
+                    'namespace': '%s.' % self.quote_name(namespace) if namespace else '',
+                    'column': self.quote_name(field.column),
+                    'to_table': self.quote_name(to_table),
+                    'to_column': self.quote_name(to_column),
+                    'deferrable': self.connection.ops.deferrable_sql()
+                }
+            # Otherwise, add FK constraints later.
+            else:
+                self.deferred_sql.append(self._create_fk_sql(model, field, constraint_suffix))
+        # Build the SQL and run it
+        sql = self.sql_create_column % {
+            "table": self.quote_name(model._meta.db_table),
+            "column": self.quote_name(field.column),
+            "definition": definition,
+        }
+        self.execute(sql, params)
+        # Drop the default if we need to
+        # (Django usually does not use in-database defaults)
+        if not self.skip_default_on_alter(field) and self.effective_default(field) is not None:
+            changes_sql, params = self._alter_column_default_sql(model, None, field, drop=True)
+            sql = self.sql_alter_column % {
+                "table": self.quote_name(model._meta.db_table),
+                "changes": changes_sql,
+            }
+            self.execute(sql, params)
+        # Add an index, if required
+        self.deferred_sql.extend(self._field_indexes_sql(model, field))
+        # Reset connection if required
+        if self.connection.features.connection_persists_old_columns:
+            self.connection.close()
+
+```
+
+
+### API INVOKE: search_code_in_codebase("ALTER TABLE")
+RESULT:
+#### django/db/backends/base/schema.py:941-947
+```python
+        (e.g. SERIAL in PostgreSQL, PostGIS fields).
+
+        Return a two-tuple of: an SQL fragment of (sql, params) to insert into
+        an ALTER TABLE statement and a list of extra (sql, params) tuples to
+        run once the field is altered.
+        """
+        return (
+```
+
+#### django/db/backends/sqlite3/schema.py:353-359
+```python
+    def _alter_field(self, model, old_field, new_field, old_type, new_type,
+                     old_db_params, new_db_params, strict=False):
+        """Perform a "physical" (non-ManyToMany) field update."""
+        # Use "ALTER TABLE ... RENAME COLUMN" if only the column name
+        # changed and there aren't any constraints.
+        if (self.connection.features.can_alter_table_rename_column and
+            old_field.column != new_field.column and
+```
+
+#### django/db/backends/sqlite3/features.py:26-32
+```python
+    time_cast_precision = 3
+    can_release_savepoints = True
+    has_case_insensitive_like = True
+    # Is "ALTER TABLE ... RENAME COLUMN" supported?
+    can_alter_table_rename_column = Database.sqlite_version_info >= (3, 25, 0)
+    supports_parentheses_in_compound = False
+    # Deferred constraint checks can be emulated on SQLite < 3.20 but not in a
+```
+
+
+### API INVOKE: search_class_in_codebase("SQLiteCursorWrapper")
+RESULT:
+#### django/db/backends/sqlite3/base.py:SQLiteCursorWrapper
+```python
+class SQLiteCursorWrapper(Database.Cursor):
+    """
+    Django uses "format" style placeholders, but pysqlite2 uses "qmark" style.
+    This fixes it -- but note that if you want to use a literal "%s" in a query,
+    you'll need to use "%%s".
+    """
+    def execute(self, query, params=None):
+        ...
+
+    def executemany(self, query, param_list):
+        ...
+
+    def convert_query(self, query):
+        ...
+```
+
+
+### API INVOKE: search_class_in_codebase("Operation")
+RESULT:
+#### django/db/migrations/operations/base.py:Operation
+```python
+class Operation:
+    """
+    Base class for migration operations.
+
+    It's responsible for both mutating the in-memory model state
+    (see db/migrations/state.py) to represent what it performs, as well
+    as actually performing it against a live database.
+
+    Note that some operations won't modify memory state at all (e.g. data
+    copying operations), and some will need their modifications to be
+    optionally specified by the user (e.g. custom Python code snippets)
+
+    Due to the way this class deals with deconstruction, it should be
+    considered immutable.
+    """
+
+    # If this migration can be run in reverse.
+    # Some operations are impossible to reverse, like deleting data.
+    reversible = True
+
+    # Can this migration be represented as SQL? (things like RunPython cannot)
+    reduces_to_sql = True
+
+    # Should this operation be forced as atomic even on backends with no
+    # DDL transaction support (i.e., does it have no DDL, like RunPython)
+    atomic = False
+
+    # Should this operation be considered safe to elide and optimize across?
+    elidable = False
+
+    serialization_expand_args = []
+
+    def __new__(cls, *args, **kwargs):
+        ...
+
+    def deconstruct(self):
+        ...
+
+    def state_forwards(self, app_label, state):
+        ...
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        ...
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        ...
+
+    def describe(self):
+        ...
+
+    @property
+    def migration_name_fragment(self):
+        ...
+
+    def references_model(self, name, app_label):
+        ...
+
+    def references_field(self, model_name, name, app_label):
+        ...
+
+    def allow_migrate_model(self, connection_alias, model):
+        ...
+
+    def reduce(self, operation, app_label):
+        ...
+
+    def __repr__(self):
+        ...
+```
+
+
+==================================================
+
+Based on these information, you need to think about how to resolve the issue and fix the bug.
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then you have two options. (Choose only one of them):
+
+## IF GENERATE PATCH
+If you've gathered enough code to generate the patch, stop invoking the search APIs.
+At this point, instead of invoking function call, please reply with:
+Ready generation: `True` 
+
+## IF YOU NEED TO RETRIEVE SOURCE CODE
+If you need to know any more source code to help you generate the patch, use the search APIs to retrieve code.
+You can use the following APIs to search source code.
+1. `search_method_in_file(file_path: str, method_name: str)`: Search for the method in the specified file.
+2. `search_method_in_codebase(method_name: str)`: Search for the method in the whole project codebase. Only if you don't know the file path of the method, this API should be used. Otherwise, you should use the `search_method_in_file` API.
+3. `search_class_in_file(file_path: str, class_name: str)`: Search for the class code in the specified file.
+4. `search_class_in_codebase(class_name: str)`: Search for the class code in the whole project codebase. Only if you don't know the file path of the class, this API should be used. Otherwise, you should use the `search_class_in_file` API.
+5. `search_code_in_file(file_path: str, code: str)`: Search for a code snippet in the specified file, return its surrounding code.
+6. `search_code_in_codebase(code: str)`: Search for a code snippet in the whole project codebase. Only if you don't know the file path of the code, this API should be used. Otherwise, you should use the `search_code_in_file` API.
+
+
+You should finally reply in the following format:
+```python
+search_method_in_file("FILE_PATH", "METHOD_NAME")
+search_class_in_file("FILE_PATH", "CLASS_NAME")
+search_code_in_file("FILE_PATH", "SOME_CODE")
+search_method_in_codebase("METHOD_NAME")
+...
+```
+Note the format should obeys the following rules:
+1. Enclose all API calls in a single python code block (i.e., start with ```python, followed by the API calls, then close the block with ```).
+2. You may invoke any of these APIs as many times as needed, including not at all.
+3. The file path is relative to the repository.
+4. All arguments must be enclosed in double quotes and the number of arguments must be correct.
+5. If the method you want to search belongs to a class, it is recommended specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME. Otherwise multiple methods with the same name (but in different classes) may be returned.
+
+
+Now, please first analyze whether you need to retrieve any source code or if you're ready to generate the patch. Note that before generating a patch for a method, you must first obtain its source code.
+Then choose one of the two options above and follow the format to reply.
+

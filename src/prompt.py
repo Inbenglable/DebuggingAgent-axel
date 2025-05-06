@@ -18,11 +18,12 @@ This is the corresponding output and runtime information:
 '''
 
 # Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
+#  (Note: In some cases, there may not be an existing buggy method — for example, if the fix involves modifying a class definition or adding a new method. In these cases, as long as you have identified and located the root cause, simply select the closest related method and report it as the buggy method)
 CHOOSE_METHOD_INSTRUCT = '''
 You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
 Now, please first analyze the current observed code and the abnormal program behavior. 
 
-Then, if you can already locate the buggy method and buggy code, reply with:  
+Then, if you can already locate the buggy method and buggy code, reply with:
 Buggy method: `{FILE_PATH}:{METHOD_NAME}`
 Otherwise, continue tracing by selecting the next method to observe. Reply with: 
 Observed method: `{FILE_PATH}:{METHOD_NAME}`
@@ -35,11 +36,13 @@ Note that {FILE_PATH} refers to the path relative to the repository. And if you 
 # Now, please first analyze the current observed code and the abnormal program behavior. 
 
 # Note that a method showing abnormal program behavior may not be the buggy method since it could be an upstream method that caling the buggy method. Buggy method is the method that contains the buggy code needed to be fixed.
+# (Note: In some cases, there may not be an existing buggy method — for example, if the fix involves modifying a class definition or adding a new method. In these cases, as long as you have identified and located the root cause, simply select the closest related method and report it as the buggy method)
+
 CHOOSE_SCOPE_INSTRUCT = '''
 You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
 Now, please first analyze the current observed code and the abnormal program behavior. 
 
-Then, if you can already locate the buggy method and buggy code, reply with:  
+Then, if you can already locate the buggy method and buggy code, reply with:
 Buggy method: `{FILE_PATH}:{METHOD_NAME}`
 Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
 Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
@@ -309,16 +312,28 @@ This is the bug issue, which is in the **{project}** project:
 
 
 Based on this issue, the testing agent has generated a reproducible test:
+## REPRODUCE TEST
+```
 {test_code}
+```
 
 And this is the original output when running the test (before applying the patch):
+## ORIGINAL OUTPUT
+```
 {original_output}
+```
 
 The repair agent has tried to generate a patch to fix the issue:
+## PATCH CONTEXT
+<PATCH_CONTEXT>
 {patch_context}
+</PATCH_CONTEXT>
 
 After applying the patch, the output of the test is:
+## PATCHED OUTPUT
+```
 {patched_output}
+```
 
 Now, please first review the patch and analyse the test output before and after the patch, to determine whether the issue is fixed or not.
 
@@ -375,18 +390,58 @@ A final json reply example:
 '''
 
 REGENERATION_INSTRUCT = '''
-In the previous rounds, you have tried to generate patches to resolve the issue.
-This is your generating patch history:
-{history}
+In the last round, you have tried to generate a patch to resolve the issue.
+This is the last round output:
 
-Oops! It seems that your latest patch did not resolve the issue successfully.
+## LAST ROUND OUTPUT
+<LAST_ROUND_OUTPUT>
+{history}
+</LAST_ROUND_OUTPUT>
+
+
+
+Oops! It looks like the reviewer had some concerns about your latest patch.
 This is the program output after applying your latest patch:
+## PATCHED OUTPUT
+```
 {patched_output}
+```
+
 
 A reviewer has provided the following feedback:
+
+## REVIEWER FEEDBACK
+<REVIEWER_FEEDBACK>
 {reviewer_feedback}
+</REVIEWER_FEEDBACK>
 
-Now, please first think about what went wrong with your previous patch.
+
+
+Now, please first think about whether there might be an issue with your previous patch — or if perhaps the reviewer misunderstood something
 Then, regenerate the patch to fix the issue, following the same format as before.
+'''
 
+
+PATCH_SELECTION_AGENT_SYSTEM_MSG = 'You are a pull request reviewer. You need to choose the one PR from multiple that actually will resolve the given issue.'
+
+PATCH_SELECTION_HEAD = '''
+Here is the issue in the **{project}** project:
+## ISSUE
+<ISSUE>
+{issue}
+</ISSUE>
+
+To resolve the issue, several repair agents have generated their patches.
+Your task is to determine which patch is the best one to fix the issue.
+
+The following are the patch outputs for each repair agent:
+{patches}
+
+'''
+
+PATCH_SELECTION_INSTRUCT = '''
+Now, please first analyse the issue as well as its root cause, and think about which patch is the best one to fix the issue.
+
+Then, please provide the patch you think is the best by providing its patch ID in the following format:
+Best Patch: `{PATCH_ID}`
 '''

@@ -1,0 +1,157 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To resolve the issue with adding a nullable OneToOneField crashing on SQLite, we need to understand how Django performs migrations involving `OneToOneField` and SQLite's handling of such schema changes. The error arises from SQLite's inability to add a unique column in the way Django's migration is attempting. To address this, a patch will likely involve updating how Django performs this type of migration specifically for SQLite.
+
+Before generating any patch, it's necessary to review Django's code involved in handling database schema migrations, focusing specifically on how it generates SQL for adding fields of type `OneToOneField`.
+
+I will retrieve the source code involved in the Django migration system, focusing on SQLite-specific backend implementations and alterations related to database schema. Typically, this would include classes and methods that are part of the migration framework, such as `SchemaEditor` or related components.
+
+Let's start by retrieving relevant code.
+
+```python
+search_class_in_codebase("SchemaEditor")
+search_method_in_codebase("add_field")
+search_method_in_codebase("create_model")
+search_class_in_codebase("SQLiteSchemaEditor")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("create_model")
+RESULT:
+#### tests/migrations/test_state.py:RelatedModelsTests.create_model
+```python
+    def create_model(self, name, foreign_keys=[], bases=(), abstract=False, proxy=False):
+        test_name = 'related_models_app'
+        assert not (abstract and proxy)
+        meta_contents = {
+            'abstract': abstract,
+            'app_label': test_name,
+            'apps': self.apps,
+            'proxy': proxy,
+        }
+        meta = type("Meta", (), meta_contents)
+        if not bases:
+            bases = (models.Model,)
+        body = {
+            'Meta': meta,
+            '__module__': "__fake__",
+        }
+        fname_base = fname = '%s_%%d' % name.lower()
+        for i, fk in enumerate(foreign_keys, 1):
+            fname = fname_base % i
+            body[fname] = fk
+        return type(name, bases, body)
+
+```
+
+#### tests/db_functions/datetime/test_extract_trunc.py:DateFunctionTests.create_model
+```python
+    def create_model(self, start_datetime, end_datetime):
+        return DTModel.objects.create(
+            name=start_datetime.isoformat() if start_datetime else 'None',
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            start_date=start_datetime.date() if start_datetime else None,
+            end_date=end_datetime.date() if end_datetime else None,
+            start_time=start_datetime.time() if start_datetime else None,
+            end_time=end_datetime.time() if end_datetime else None,
+            duration=(end_datetime - start_datetime) if start_datetime and end_datetime else None,
+        )
+
+```
+
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor.create_model
+```python
+    def create_model(self, model):
+        """
+        Create a table and any accompanying indexes or unique constraints for
+        the given `model`.
+        """
+        sql, params = self.table_sql(model)
+        # Prevent using [] as params, in the case a literal '%' is used in the definition
+        self.execute(sql, params or None)
+
+        # Add any field index and index_together's (deferred as SQLite _remake_table needs it)
+        self.deferred_sql.extend(self._model_indexes_sql(model))
+
+        # Make M2M tables
+        for field in model._meta.local_many_to_many:
+            if field.remote_field.through._meta.auto_created:
+                self.create_model(field.remote_field.through)
+
+```
+
+#### django/contrib/gis/db/backends/oracle/schema.py:OracleGISSchemaEditor.create_model
+```python
+    def create_model(self, model):
+        super().create_model(model)
+        self.run_geometry_sql()
+
+```
+
+#### django/contrib/gis/db/backends/spatialite/schema.py:SpatialiteSchemaEditor.create_model
+```python
+    def create_model(self, model):
+        super().create_model(model)
+        # Create geometry columns
+        for sql in self.geometry_sql:
+            self.execute(sql)
+        self.geometry_sql = []
+
+```
+
+#### django/contrib/gis/db/backends/mysql/schema.py:MySQLGISSchemaEditor.create_model
+```python
+    def create_model(self, model):
+        super().create_model(model)
+        self.create_spatial_indexes()
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

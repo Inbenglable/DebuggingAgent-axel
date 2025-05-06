@@ -1,0 +1,239 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **scikit-learn** project:
+## ISSUE
+<ISSUE>
+ZeroDivisionError in _sparse_fit for SVM with empty support_vectors_
+#### Description
+When using sparse data, in the case where the support_vectors_ attribute is be empty, _fit_sparse gives a ZeroDivisionError
+
+#### Steps/Code to Reproduce
+```
+import numpy as np
+import scipy
+import sklearn
+from sklearn.svm import SVR
+x_train = np.array([[0, 1, 0, 0],
+[0, 0, 0, 1],
+[0, 0, 1, 0],
+[0, 0, 0, 1]])
+y_train = np.array([0.04, 0.04, 0.10, 0.16])
+model = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3, epsilon=0.1,
+  	    gamma=1.0, kernel='linear', max_iter=15000,
+  	    shrinking=True, tol=0.001, verbose=False)
+# dense x_train has no error
+model.fit(x_train, y_train)
+
+# convert to sparse
+xtrain= scipy.sparse.csr_matrix(x_train)
+model.fit(xtrain, y_train)
+
+```
+#### Expected Results
+No error is thrown and  `self.dual_coef_ = sp.csr_matrix([])`
+
+#### Actual Results
+```
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "/usr/local/lib/python3.5/dist-packages/sklearn/svm/base.py", line 209, in fit
+    fit(X, y, sample_weight, solver_type, kernel, random_seed=seed)
+  File "/usr/local/lib/python3.5/dist-packages/sklearn/svm/base.py", line 302, in _sparse_fit
+    dual_coef_indices.size / n_class)
+ZeroDivisionError: float division by zero
+```
+
+#### Versions
+```
+>>> sklearn.show_versions() 
+
+System:
+executable: /usr/bin/python3
+    python: 3.5.2 (default, Nov 12 2018, 13:43:14)  [GCC 5.4.0 20160609]
+   machine: Linux-4.15.0-58-generic-x86_64-with-Ubuntu-16.04-xenial
+
+Python deps:
+     numpy: 1.17.0
+    Cython: None
+       pip: 19.2.1
+    pandas: 0.22.0
+   sklearn: 0.21.3
+     scipy: 1.3.0
+setuptools: 40.4.3
+```
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import numpy as np
+import scipy
+from sklearn.svm import SVR
+
+x_train = np.array([[0, 1, 0, 0],
+                    [0, 0, 0, 1],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1]])
+y_train = np.array([0.04, 0.04, 0.10, 0.16])
+
+model = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3, epsilon=0.1,
+           gamma=1.0, kernel='linear', max_iter=15000,
+           shrinking=True, tol=0.001, verbose=False)
+
+# Convert to sparse
+xtrain = scipy.sparse.csr_matrix(x_train)
+model.fit(xtrain, y_train)
+
+
+This is the tracing and analysis history:
+
+==================================================
+To analyze the abnormal program behavior, we can infer:
+
+1. The script is encountering a `ZeroDivisionError` when attempting to fit a Support Vector Regression (SVR) model using sparse matrix input.
+2. The error occurs within the `_sparse_fit` method of the SVM base class, specifically at the line: `dual_coef_indices.size / n_class`.
+3. There's a division operation, with `n_class` likely being 0, given the `ZeroDivisionError`.
+4. This indicates that `n_class` is calculated based on some property of the data which results in 0 when the sparse input is used, particularly when no support vectors are found.
+
+The issue may be with how the class count (`n_class`) is determined, especially when there are no support vectors (`support_vectors_` is empty). 
+
+This points us towards a possible issue in how sparse inputs are handled within `_sparse_fit`, specifically with variable initialization or conditional logic handling empty or zero scenarios.
+
+To identify the exact location of the error, we need to observe the `_sparse_fit` method in depth.
+
+Observed method: `sklearn/svm/base.py:BaseLibSVM._sparse_fit`
+==================================================
+
+
+Now you choose downstream method BaseLibSVM._sparse_fit to further observe, tracing the abnormal program behavior.
+This is the method code:
+   261	    def _sparse_fit(self, X, y, sample_weight, solver_type, kernel,
+   262	                    random_seed):
+   263	        X.data = np.asarray(X.data, dtype=np.float64, order='C')
+   264	        X.sort_indices()
+   265	
+   266	        kernel_type = self._sparse_kernels.index(kernel)
+   267	
+   268	        libsvm_sparse.set_verbosity_wrap(self.verbose)
+   269	
+   270	        self.support_, self.support_vectors_, dual_coef_data, \
+   271	            self.intercept_, self._n_support, \
+   272	            self.probA_, self.probB_, self.fit_status_ = \
+   273	            libsvm_sparse.libsvm_sparse_train(
+   274	                X.shape[1], X.data, X.indices, X.indptr, y, solver_type,
+   275	                kernel_type, self.degree, self._gamma, self.coef0, self.tol,
+   276	                self.C, self.class_weight_,
+   277	                sample_weight, self.nu, self.cache_size, self.epsilon,
+   278	                int(self.shrinking), int(self.probability), self.max_iter,
+   279	                random_seed)
+   280	
+   281	        self._warn_from_fit_status()
+   282	
+   283	        if hasattr(self, "classes_"):
+   284	            n_class = len(self.classes_) - 1
+   285	        else:  # regression
+   286	            n_class = 1
+   287	        n_SV = self.support_vectors_.shape[0]
+   288	
+   289	        dual_coef_indices = np.tile(np.arange(n_SV), n_class)
+   290	        dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
+   291	                                     dual_coef_indices.size / n_class)
+   292	        self.dual_coef_ = sp.csr_matrix(
+   293	            (dual_coef_data, dual_coef_indices, dual_coef_indptr),
+   294	            (n_class, n_SV))
+
+
+This is the runtime information of BaseLibSVM._sparse_fit:
+
+Error occurred during script execution:float division by zero
+
+Source path:... /data/swe-fl/TMP/testbed/scikit-learn__scikit-learn-14894/sklearn/svm/base.py
+New var:....... __module__ = 'sklearn.svm.base'
+New var:....... __qualname__ = 'BaseLibSVM'
+New var:....... __doc__ = 'Base class for estimators that use libsvm as ba...cumentation is in the derived `SVC` class.\n    '
+New var:....... _sparse_kernels = ['linear', 'poly', 'rbf', 'sigmoid', 'precomputed']
+New var:....... __init__ = <function BaseLibSVM.__init__ at 0x7f6d2b821158>
+New var:....... _pairwise = <property object at 0x7f6d2b989d68>
+New var:....... fit = <function BaseLibSVM.fit at 0x7f6d2b821510>
+New var:....... _validate_targets = <function BaseLibSVM._validate_targets at 0x7f6d2b821598>
+New var:....... _warn_from_fit_status = <function BaseLibSVM._warn_from_fit_status at 0x7f6d2b821620>
+New var:....... _dense_fit = <function BaseLibSVM._dense_fit at 0x7f6d2b8216a8>
+ line       261     def _sparse_fit(self, X, y, sample_weight, solver_type, kernel,
+Starting var:.. self = SVR(C=316.227766017, cache_size=200, coef0=0.0, ...000, shrinking=True, tol=0.001,    verbose=False)
+Starting var:.. X = <4x4 sparse matrix of type '<class 'numpy.float6... stored elements in Compressed Sparse Row format>
+Starting var:.. y = array([0.04, 0.04, 0.1 , 0.16])
+Starting var:.. sample_weight = array([], dtype=float64)
+Starting var:.. solver_type = 3
+Starting var:.. kernel = 'linear'
+Starting var:.. random_seed = 1912985493
+ call       261     def _sparse_fit(self, X, y, sample_weight, solver_type, kernel,
+ line       263         X.data = np.asarray(X.data, dtype=np.float64, order='C')
+ line       264         X.sort_indices()
+ line       266         kernel_type = self._sparse_kernels.index(kernel)
+New var:....... kernel_type = 0
+ line       268         libsvm_sparse.set_verbosity_wrap(self.verbose)
+ line       273             libsvm_sparse.libsvm_sparse_train(
+ line       274                 X.shape[1], X.data, X.indices, X.indptr, y, solver_type,
+ line       275                 kernel_type, self.degree, self._gamma, self.coef0, self.tol,
+ line       276                 self.C, self.class_weight_,
+ line       277                 sample_weight, self.nu, self.cache_size, self.epsilon,
+ line       278                 int(self.shrinking), int(self.probability), self.max_iter,
+ line       279                 random_seed)
+New var:....... dual_coef_data = array([], dtype=float64)
+ line       281         self._warn_from_fit_status()
+ line       283         if hasattr(self, "classes_"):
+ line       286             n_class = 1
+New var:....... n_class = 1
+ line       287         n_SV = self.support_vectors_.shape[0]
+New var:....... n_SV = 0
+ line       289         dual_coef_indices = np.tile(np.arange(n_SV), n_class)
+New var:....... dual_coef_indices = array([], dtype=int64)
+ line       290         dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
+ line       291                                      dual_coef_indices.size / n_class)
+ exception  291                                      dual_coef_indices.size / n_class)
+Exception:..... ZeroDivisionError: float division by zero
+New var:....... self = SVR(C=316.227766017, cache_size=200, coef0=0.0, ...000, shrinking=True, tol=0.001,    verbose=False)
+New var:....... X = <4x4 sparse matrix of type '<class 'numpy.float6... stored elements in Compressed Sparse Row format>
+New var:....... y = array([0.04, 0.04, 0.1 , 0.16])
+New var:....... sample_weight = array([], dtype=float64)
+New var:....... solver_type = 3
+New var:....... kernel = 'linear'
+New var:....... random_seed = 1912985493
+New var:....... kernel_type = 0
+New var:....... dual_coef_data = array([], dtype=float64)
+New var:....... n_class = 1
+New var:....... n_SV = 0
+New var:....... dual_coef_indices = array([], dtype=int64)
+Call ended by exception
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 14, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 12, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/scikit-learn__scikit-learn__0.22/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/scikit-learn__scikit-learn__0.22/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/scikit-learn__scikit-learn__0.22/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/scikit-learn__scikit-learn-14894/reproduce.py", line 17, in <module>
+    model.fit(xtrain, y_train)
+  File "/data/swe-fl/TMP/testbed/scikit-learn__scikit-learn-14894/sklearn/svm/base.py", line 198, in fit
+    fit(X, y, sample_weight, solver_type, kernel, random_seed=seed)
+  File "/data/swe-fl/TMP/testbed/scikit-learn__scikit-learn-14894/sklearn/svm/base.py", line 291, in _sparse_fit
+    dual_coef_indices.size / n_class)
+ZeroDivisionError: float division by zero
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

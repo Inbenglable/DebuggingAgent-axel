@@ -1,0 +1,211 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **astropy** project:
+## ISSUE
+<ISSUE>
+In v5.3, NDDataRef mask propagation fails when one of the operand does not have a mask
+### Description
+
+This applies to v5.3. 
+
+It looks like when one of the operand does not have a mask, the mask propagation when doing arithmetic, in particular with `handle_mask=np.bitwise_or` fails.  This is not a problem in v5.2.
+
+I don't know enough about how all that works, but it seems from the error that the operand without a mask is set as a mask of None's and then the bitwise_or tries to operate on an integer and a None and fails.
+
+### Expected behavior
+
+When one of the operand does not have mask, the mask that exists should just be copied over to the output.  Or whatever was done in that situation in v5.2 where there's no problem.
+
+### How to Reproduce
+
+This is with v5.3.   With v5.2, there are no errors.
+
+```
+>>> import numpy as np
+>>> from astropy.nddata import NDDataRef
+
+>>> array = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
+>>> mask = np.array([[0, 1, 64], [8, 0, 1], [2, 1, 0]])
+
+>>> nref_nomask = NDDataRef(array)
+>>> nref_mask = NDDataRef(array, mask=mask)
+
+# multiply no mask by constant (no mask * no mask)
+>>> nref_nomask.multiply(1., handle_mask=np.bitwise_or).mask   # returns nothing, no mask,  OK
+
+# multiply no mask by itself (no mask * no mask)
+>>> nref_nomask.multiply(nref_nomask, handle_mask=np.bitwise_or).mask # return nothing, no mask, OK
+
+# multiply mask by constant (mask * no mask)
+>>> nref_mask.multiply(1., handle_mask=np.bitwise_or).mask
+...
+TypeError: unsupported operand type(s) for |: 'int' and 'NoneType'
+
+# multiply mask by itself (mask * mask)
+>>> nref_mask.multiply(nref_mask, handle_mask=np.bitwise_or).mask
+array([[ 0,  1, 64],
+       [ 8,  0,  1],
+       [ 2,  1,  0]])
+
+# multiply mask by no mask (mask * no mask)
+>>> nref_mask.multiply(nref_nomask, handle_mask=np.bitwise_or).mask
+...
+TypeError: unsupported operand type(s) for |: 'int' and 'NoneType'
+```
+
+
+### Versions
+
+>>> import sys; print("Python", sys.version)
+Python 3.10.11 | packaged by conda-forge | (main, May 10 2023, 19:07:22) [Clang 14.0.6 ]
+>>> import astropy; print("astropy", astropy.__version__)
+astropy 5.3
+>>> import numpy; print("Numpy", numpy.__version__)
+Numpy 1.24.3
+>>> import erfa; print("pyerfa", erfa.__version__)
+pyerfa 2.0.0.3
+>>> import scipy; print("Scipy", scipy.__version__)
+Scipy 1.10.1
+>>> import matplotlib; print("Matplotlib", matplotlib.__version__)
+Matplotlib 3.7.1
+
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import numpy as np
+from astropy.nddata import NDDataRef
+import traceback
+import sys
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+def main():
+    array = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
+    mask = np.array([[0, 1, 64], [8, 0, 1], [2, 1, 0]])
+
+    nref_nomask = NDDataRef(array)
+    nref_mask = NDDataRef(array, mask=mask)
+
+    # Test cases that should not raise an error
+    try:
+        assert nref_nomask.multiply(1., handle_mask=np.bitwise_or).mask is None
+        assert nref_nomask.multiply(nref_nomask, handle_mask=np.bitwise_or).mask is None
+        assert np.array_equal(nref_mask.multiply(nref_mask, handle_mask=np.bitwise_or).mask, mask)
+    except AssertionError as e:
+        print_stacktrace(e)
+        raise
+
+    # Test cases that should raise an error
+    try:
+        nref_mask.multiply(1., handle_mask=np.bitwise_or).mask
+    except TypeError as e:
+        print_stacktrace(e)
+        raise AssertionError("Test case 'multiply mask by constant (mask * no mask)' failed with TypeError") from e
+
+    try:
+        nref_mask.multiply(nref_nomask, handle_mask=np.bitwise_or).mask
+    except TypeError as e:
+        print_stacktrace(e)
+        raise AssertionError("Test case 'multiply mask by no mask (mask * no mask)' failed with TypeError") from e
+
+if __name__ == "__main__":
+    main()
+
+
+This is the tracing and analysis history:
+
+==================================================
+The error trace indicates that the issue lies in how masks are being handled when one operand lacks a mask. The problematic operation involves a `TypeError: unsupported operand type(s) for |: 'int' and 'NoneType'` which suggests an attempt to bitwise OR a mask containing `None` (no mask) with an integer.
+
+The relevant portion of the traceback is:
+- `File ".../astropy/nddata/mixins/ndarithmetic.py", line 527, in _arithmetic_mask`
+  - `return handle_mask(self.mask, operand.mask, **kwds)`
+
+This suggests that `self.mask` or `operand.mask` is `None`, and `np.bitwise_or`, which is used as the `handle_mask` function, cannot handle `None` as an input.
+
+In order to address this, let's focus on the `_arithmetic_mask` method, where the operation involving `handle_mask` is conducted. We need to verify how masks are being prepared when one operand lacks a mask, particularly in version 5.3.
+
+Observed method: `astropy/nddata/mixins/ndarithmetic.py:_arithmetic_mask`
+==================================================
+
+
+Now you choose downstream method NDArithmeticMixin._arithmetic_mask to further observe, tracing the abnormal program behavior.
+This is the method code:
+   485	    def _arithmetic_mask(self, operation, operand, handle_mask, axis=None, **kwds):
+   486	        """
+   487	        Calculate the resulting mask.
+   488	
+   489	        This is implemented as the piecewise ``or`` operation if both have a
+   490	        mask.
+   491	
+   492	        Parameters
+   493	        ----------
+   494	        operation : callable
+   495	            see :meth:`NDArithmeticMixin._arithmetic` parameter description.
+   496	            By default, the ``operation`` will be ignored.
+   497	
+   498	        operand : `NDData`-like instance
+   499	            The second operand wrapped in an instance of the same class as
+   500	            self.
+   501	
+   502	        handle_mask : callable
+   503	            see :meth:`NDArithmeticMixin.add`
+   504	
+   505	        kwds :
+   506	            Additional parameters given to ``handle_mask``.
+   507	
+   508	        Returns
+   509	        -------
+   510	        result_mask : any type
+   511	            If only one mask was present this mask is returned.
+   512	            If neither had a mask ``None`` is returned. Otherwise
+   513	            ``handle_mask`` must create (and copy) the returned mask.
+   514	        """
+   515	        # If only one mask is present we need not bother about any type checks
+   516	        if (
+   517	            self.mask is None and operand is not None and operand.mask is None
+   518	        ) or handle_mask is None:
+   519	            return None
+   520	        elif self.mask is None and operand is not None:
+   521	            # Make a copy so there is no reference in the result.
+   522	            return deepcopy(operand.mask)
+   523	        elif operand is None:
+   524	            return deepcopy(self.mask)
+   525	        else:
+   526	            # Now lets calculate the resulting mask (operation enforces copy)
+   527	            return handle_mask(self.mask, operand.mask, **kwds)
+
+
+This is the runtime information of NDArithmeticMixin._arithmetic_mask:
+
+Traceback (most recent call last):
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 38, in <module>
+    debugging_test_execution_wrapper(args.test_path, file_scope_dict, args.depth, args.loop)
+  File "/data/swe-fl/SRC/DebuggingAgent/src/run_debugging_test.py", line 13, in debugging_test_execution_wrapper
+    @dbgsnooper.snoop(file_scope_dict=file_scope_dict, depth=depth, loop=loop)
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 249, in __init__
+    assert os.path.exists(file_path)
+AssertionError
+
+ERROR conda.cli.main_run:execute(125): `conda run python run_debugging_test.py --test-path /data/swe-fl/TMP/testbed/astropy__astropy-14995/reproduce.py --file-scope-dict {"/data/swe-fl/SRC/DebuggingAgent/src/astropy/nddata/mixins/ndarithmetic.py": [485, 527]} --depth 1` failed. (See above for error)
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

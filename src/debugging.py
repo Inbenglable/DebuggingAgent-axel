@@ -5,25 +5,33 @@ import json
 import time
 import shutil   
 import tiktoken
+import pprint
 import subprocess
 import ast
 import textwrap
+import argparse
 import inspect
 import traceback
+import signal
+from datetime import datetime
 from pathlib import Path
 # from datasets import load_dataset
 from swe_log import init_logger, log_msg, log_and_print, remove_ansi_escape_sequences
 from model import LLMModel
 from retrieve_src import retrieve_code_element, retrieve_code_element_in_database
 from run_report import get_eval_report_for_log
-from prompt import GEN_DEBUGGING_TEST, DEBUGGING_AGENT_SYSTEM_MSG, \
-    ANALYSE_TEST, MODIFY_SOURCE_CODE_HEAD, MODIFY_SOURCE_CODE_INSTRUCT, TOO_LONG_EXEC_RESULT, DEBUGGING_START_AFTER_TESTING, \
-    CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD, REPAIR_COLLECT_HEAD, \
-    COLLECT_INSTRUCT, REPAIR_INSTRUCT, FILTER_INSTRUCT, REVIEW_PATCH_INSTRUCT, REGENERATION_INSTRUCT
-
-sys.path.append(os.path.abspath('/data/swe-fl/SRC/SWE-Bench-Validation/src'))
-from utils import get_test_directives
 from constants import MAP_VERSION_TO_INSTALL
+from utils import get_test_directives, execute_command, backup_repo, restore_repo, count_lines, update_history
+from format import extract_json_instruction, extract_trace_reply, extract_function_call, \
+    extract_filter_reply, extract_review_reply, judge_review_reply, judge_ready_generation
+from prompt import GEN_DEBUGGING_TEST, DEBUGGING_AGENT_SYSTEM_MSG, \
+    ANALYSE_TEST, MODIFY_SOURCE_CODE_HEAD, MODIFY_SOURCE_CODE_INSTRUCT, TOO_LONG_EXEC_RESULT, \
+    DEBUGGING_START_AFTER_TESTING, CHOOSE_SCOPE_INSTRUCT, CHOOSE_METHOD_INSTRUCT, BEGIN_INTRO, \
+    DEBUGGING_CHOOSE_SCOPE, DEBUGGING_CHOOSE_METHOD, REPAIR_COLLECT_HEAD, COLLECT_INSTRUCT, \
+    REPAIR_INSTRUCT, FILTER_INSTRUCT, REVIEW_PATCH_INSTRUCT, REGENERATION_INSTRUCT
+
+# sys.path.append(os.path.abspath('/data/swe-fl/SRC/SWE-Bench-Validation/src'))
+
 
 MODEL_NAME = 'gpt-4o'
 # MODEL_NAME = 'qwen2.5:32b-instruct-fp8'
@@ -36,7 +44,7 @@ TESTBED_DIR = Path("/data/swe-fl/TMP/testbed/")
 DBGSNOOPER_DIR = Path("/data/swe-fl/SRC/pysnooper_axel/dbgsnooper")
 CHECKOUT_REPO_DIR = Path("/data/swe-fl/EXP/swe-evaluation/swe-verified-checkout/gold")
 
-EXP_DIR = "/data/swe-fl/SRC/DebuggingAgent/exp/exp_0423"
+EXP_DIR = "/data/swe-fl/SRC/DebuggingAgent/log"
 
 # os.environ['HF_DATASETS_CACHE'] = '~/.cache/huggingface/datasets/'
 
@@ -49,105 +57,6 @@ remove_timestamps = lambda s: re.sub(
     s
 )
 
-
-def extract_json_instruction(wrapped_json_str: str) -> str:
-    # ```json\nCONTENT\n```
-    match_json = re.search(r'```json\s*\n(.*?)\n```', wrapped_json_str, re.DOTALL)
-    # log_and_print(match_json)
-    if match_json:
-        try:
-            json_obj = json.loads(match_json.group(1).strip())
-            return json_obj
-        except json.JSONDecodeError as e:
-            log_msg(f"Error decoding JSON: {e}")
-            raise e
-    else:
-        raise ValueError("No JSON content found in the response.")
-
-
-def extract_trace_reply(response: str):
-
-    # 匹配 buggy/observed method，支持带反引号和加粗 Markdown **
-    method_pattern = r"\*{0,2}([Bb]uggy [Mm]ethod|[Oo]bserved [Mm]ethod)\*{0,2}:\s*`?([^:`\n]+):([^:`\n]+)`?"
-
-    # 匹配 observed scope，可以是单行或范围，也支持加粗 key
-    scope_pattern = r"\*{0,2}[Oo]bserved [Ss]cope\*{0,2}:\s*`?([^:`\n]+):(\d+)(?:-(\d+))?`?"
-
-    if match := re.search(method_pattern, response):
-        return {
-            "type": match.group(1),
-            "file": match.group(2).strip(),
-            "method": match.group(3).strip()
-        }
-    elif match := re.search(scope_pattern, response):
-        start_line = int(match.group(2))
-        end_line = int(match.group(3)) if match.group(3) else start_line
-        return {
-            "type": "Observed scope",
-            "file": match.group(1).strip(),
-            "start_line": start_line,
-            "end_line": end_line
-        }
-    else:
-        raise ValueError("Invalid trace reply format.")
-    
-    
-def execute_command(command: str) -> tuple:
-    log_and_print(command)
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            executable='/bin/bash'
-        )
-        stdout = result.stdout
-        stderr = result.stderr
-        return stdout, stderr
-    except subprocess.CalledProcessError as e:
-        log_msg("CMD exec failed:")
-        log_msg(e.stdout)
-        log_msg("STDERR:")
-        log_msg(e.stderr)
-        return e.stdout, e.stderr
-
-def extract_filter_reply(response: str):
-    code_block_pattern = r"```(.*?)```"
-    match = re.search(code_block_pattern, response, re.DOTALL)
-    if match:
-        text = match.group(1).strip()
-    else:
-        raise ValueError("No Python code block found in the response.")
-    
-    filter_reply_results = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        filter_reply_reulst = {}
-        line = line.strip()
-        if ':' not in line:
-            continue
-        file_path, name = line.split(':')
-        filter_reply_reulst['file_path'] = file_path.strip()
-        
-        line_range_match = re.match(r'^(\d+)-(\d+)$', name)
-        if line_range_match:
-            start = int(line_range_match.group(1))
-            end = int(line_range_match.group(2))
-            filter_reply_reulst['start_line'] = start
-            filter_reply_reulst['end_line'] = end
-        else:
-            filter_reply_reulst['name'] = name.strip()
-        filter_reply_results.append(filter_reply_reulst)
-    if len(filter_reply_results) == 0:
-        raise ValueError("No valid filter reply results found.")
-    
-    return filter_reply_results    
-        
-    
     
 
 def filter_and_choose_code_element(instance: dict, agent: LLMModel, retrieve_round_output: str, api_reply_dict):
@@ -166,7 +75,7 @@ def filter_and_choose_code_element(instance: dict, agent: LLMModel, retrieve_rou
     response = query_model_with_retry(agent, filter_prompt, extract_filter_reply, instance)
     extracted_reply = extract_filter_reply(response)
     
-    if api_reply_dict[key][0]['type'] == 'line_range':
+    if api_reply_dict[key][0]['type'] == 'code_snippet':
         for item in extracted_reply:
             for api_result in api_reply_dict[key]:
                 if api_result['path'] == item['file_path'] and api_result['start_line'] == item['start_line'] and api_result['end_line'] == item['end_line']:
@@ -182,9 +91,6 @@ def filter_and_choose_code_element(instance: dict, agent: LLMModel, retrieve_rou
         raise ValueError("No valid filter reply results found.")
     return filtered_result
                         
-    
-    
-        
 
 def init_instance_testbed(instance: dict):
     # Setup testbed for target instance
@@ -219,10 +125,9 @@ def init_instance_testbed(instance: dict):
            && cd {DBGSNOOPER_DIR} && {install_snooper_cmd} && cd {instance['testbed_src_path']}\
            && {instance['conda_env_install_cmd']} && echo SUCCESS"
 
-    log_msg(f"Setup testbed environment: {instance['instance_id']}")
-    log_msg(setup_repo_env_cmd)
+    log_and_print(f"Setup testbed environment: {instance['instance_id']}")
     
-    std_out, std_err = execute_command(setup_repo_env_cmd)
+    std_out, std_err = execute_command(setup_repo_env_cmd, 600, verbose=True)
 
     if 'SUCCESS' in std_out:
         log_msg('Setup testbed: Done')
@@ -230,7 +135,6 @@ def init_instance_testbed(instance: dict):
         log_msg(std_out)
         log_msg(std_err)
 
-    
 
 def load_instance_data(instance_id: str):
     # dataset = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")  
@@ -273,70 +177,11 @@ def load_instance_data(instance_id: str):
     return instance
 
 
-# def exec_debugging_test_with_limited_length(instance: dict, file_scope_dict=None, depth=2, loop=None):
-#     if loop:
-#         return exec_debugging_test(instance, file_line_dict, depth = 1)
-#     else:
-#         output = exec_debugging_test(instance, file_line_dict, depth = 1)
-#         encoding = tiktoken.get_encoding("cl100k_base")
-#         token_len =  len(encoding.encode(output))
-#         if token_len > 2000:
-            
-
-
-def gen_debugging_test(instance: dict, debugging_agent: LLMModel) -> str:
-    # reproduce_test_path = f'/data/swe-fl/SRC/DebuggingAgent/reproduce_tests.json'
-    # with open(reproduce_test_path, 'r') as f:
-    #     reproduce_tests = json.load(f)
-    # if instance['instance_id'] in reproduce_tests:
-    #     reproduce_test_code = reproduce_tests[instance['instance_id']]["test_code"]
-    # else:
-    reproduce_test_path = f'/data/swe-fl/DATA/reproduce_test/claude_reproduction_tests.json'
-    with open(reproduce_test_path, 'r') as f:
-        reproduce_test_code = json.load(f)[instance['instance_id']][0]
-
-    with open(instance['testbed_src_path'] / 'reproduce.py', 'w') as f:
-        f.write(reproduce_test_code)
-
-    exec_test_out, exec_test_err = execute_command(f"cd {instance['testbed_src_path']} && \
-                                {CONDA_ACTIVATE_PATH} {instance['conda_env_name']} && python reproduce.py")
-
-    # construct debugging test prompt
-    gen_debugging_test_prompt = GEN_DEBUGGING_TEST.format(
-        project=instance['repo'].split('/')[1],
-        issue=instance['problem_statement'],
-        reproduce_test_code=reproduce_test_code,
-        reproduce_result=exec_test_out + exec_test_err,
-    )
-
-    log_and_print('gen_debugging_test')
-
-    gen_debugging_test_response = query_model_with_retry(debugging_agent, gen_debugging_test_prompt, judge_response_with_json, instance)
-
-    debugging_test_instruction = extract_json_instruction(gen_debugging_test_response)
-    
-    return debugging_test_instruction
-
-
-
-def write_debugging_test(instance: dict, reproduce_test_code: str):
-    debugggin_file_path = instance['testbed_src_path'] / 'debugging_test.py'
-    with open(debugggin_file_path, 'w') as f:
-        f.write(reproduce_test_code)
-    return
-
-
-def count_lines(test_path: Path) -> int:
-    with test_path.open('r', encoding='utf-8') as file:
-        return sum(1 for _ in file)
-
-
 def exec_debugging_test(instance: dict, file_scope_dict=None, depth=2, loop=None) -> str:
-    test_path = instance['testbed_src_path'] / 'debugging_test.py'
-    
+    test_path = os.path.join(instance['testbed_src_path'], 'reproduce.py')
     if depth == -1:
         exec_test_out, exec_test_err = execute_command(f"cd {instance['testbed_src_path']} && \
-                                {CONDA_ACTIVATE_PATH} {instance['conda_env_name']} && python {test_path}")
+                                {CONDA_ACTIVATE_PATH} {instance['conda_env_name']} && python {test_path}", 300, verbose=True)
         return exec_test_out + exec_test_err
     # if file_scope_dict is None (Step 1), then just observe the whole test file
     file_scope_dict = file_scope_dict or {str(test_path): (0, count_lines(test_path))}
@@ -358,11 +203,12 @@ def exec_debugging_test(instance: dict, file_scope_dict=None, depth=2, loop=None
         "--file-scope-dict", dict_json
     ]
     
-    if depth is not None:
-        cmd += ["--depth", str(depth)]
+    cmd += ["--depth", str(depth)]
+    
     if loop is not None:
         cmd += ["--loop", str(loop)]
     
+    # stdout, stderr = execute_command(' '.join(cmd), 300, verbose=False)
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     result_clean = remove_timestamps(
@@ -382,25 +228,6 @@ def exec_debugging_test(instance: dict, file_scope_dict=None, depth=2, loop=None
         return '\n'.join(lines)  
 
 
-
-def extract_runtime_info(instance, debugging_instruction: list) -> dict:
-    runtime_info = {}
-    for target_src in debugging_instruction['runtime_info']:
-        file_path, observe_range = target_src.split(':')
-        # e.g., astropy/modeling/separable.py:66-102
-        if '-' in observe_range:
-            start_line, end_line = map(int, observe_range.split('-'))
-        # e.g., astropy/modeling/core.py:57
-        else:
-            start_line = end_line = int(observe_range)
-        
-        abs_file_path = str(instance['testbed_src_path'] / file_path)
-        runtime_info[abs_file_path] = (start_line, end_line)
-
-    log_and_print(runtime_info)
-    return runtime_info
-
-
 def analyse_debugging_test(instance: dict, debugging_agent: LLMModel, debugging_test_exec_result):
     start_debugging_prompt = ANALYSE_TEST.format(
         debugging_test_exec_result = debugging_test_exec_result
@@ -408,7 +235,7 @@ def analyse_debugging_test(instance: dict, debugging_agent: LLMModel, debugging_
 
     log_and_print('start_debugging')
 
-    start_debugging_response = query_model_with_retry(debugging_agent, start_debugging_prompt, judge_response_with_json, instance)
+    start_debugging_response = query_model_with_retry(debugging_agent, start_debugging_prompt, extract_json_instruction, instance)
 
     start_debugging_instruction = extract_json_instruction(start_debugging_response)
 
@@ -420,24 +247,15 @@ def analyse_debugging_test(instance: dict, debugging_agent: LLMModel, debugging_
 
     return start_debugging_instruction
 
-def update_history(history: str, new_entry: str) -> str:
-    new_history = history + new_entry + '\n' + '='*50 + '\n'
-    return new_history
 
 def get_element_from_name(instance: dict, file_name: str, element_name: str, element_type: str, enable_line_number: bool = False, relative_path: bool = True):
     if not os.path.exists(file_name):
         abs_file_path = os.path.join(instance['testbed_src_path'], file_name)
     else:
-        abs_file_path = file_name
+        abs_file_path = os.path.abspath(file_name)
     retrieve_result = retrieve_code_element(abs_file_path, element_name, element_type, enable_line_number, relative_path, instance)
     return retrieve_result
 
-def judge_response_with_json(response: str, instance) -> bool:
-    try:
-        extract_json_instruction(response)
-    except Exception as e:
-        raise Exception(f'Expected json format in response but ERROR occurs: {e}')
-    return True
 
 def judge_method_choose(response: str, instance) -> bool:
     try:
@@ -447,7 +265,7 @@ def judge_method_choose(response: str, instance) -> bool:
             if not os.path.exists(file_name):
                 abs_file_path = os.path.join(instance['testbed_src_path'], file_name)
             else:
-                abs_file_path = file_name
+                abs_file_path = os.path.abspath(file_name)
             if os.path.exists(abs_file_path):
                 retrieve_result = retrieve_code_element(abs_file_path, trace_reply['method'], 'method')
             else:
@@ -459,8 +277,8 @@ def judge_method_choose(response: str, instance) -> bool:
 
     return True
 
-    
-def judge_scope_choose(response: str, instance) -> bool:
+
+def judge_scope_or_method_choose(response: str, instance) -> bool:
     try:
         trace_reply = extract_trace_reply(response)
         if trace_reply['type'].lower() == 'observed scope':
@@ -468,7 +286,7 @@ def judge_scope_choose(response: str, instance) -> bool:
             if not os.path.exists(file_name):
                 abs_file_path = os.path.join(instance['testbed_src_path'], file_name)
             else:
-                abs_file_path = file_name
+                abs_file_path = os.path.abspath(file_name)
             if os.path.exists(abs_file_path):
                 observed_start_line = trace_reply['start_line']
                 observed_end_line = trace_reply['end_line']
@@ -481,11 +299,22 @@ def judge_scope_choose(response: str, instance) -> bool:
             if not os.path.exists(file_name):
                 abs_file_path = os.path.join(instance['testbed_src_path'], file_name)
             else:
-                abs_file_path = file_name
+                abs_file_path = os.path.abspath(file_name)
             if os.path.exists(abs_file_path):
                 retrieve_result = retrieve_code_element(abs_file_path, trace_reply['method'], 'method')
             else:
                 raise Exception(f'File {file_name} not found')
+        elif trace_reply['type'].lower() == 'observed method':
+            file_name = trace_reply['file']
+            if not os.path.exists(file_name):
+                abs_file_path = os.path.join(instance['testbed_src_path'], file_name)
+            else:
+                abs_file_path = os.path.abspath(file_name)
+            if os.path.exists(abs_file_path):
+                retrieve_result = retrieve_code_element(abs_file_path, trace_reply['method'], 'method')
+            else:
+                raise Exception(f'File {file_name} not found')
+            
         else:
             raise Exception(f'Expected observed scope or buggy method but got {trace_reply["type"]}')
                 
@@ -494,17 +323,6 @@ def judge_scope_choose(response: str, instance) -> bool:
 
     return True
     
-
-def judge_ready_generation(response: str):
-
-    pattern = r"\*{0,2}([Rr]eady [Gg]eneration)\*{0,2}:\s*`?([^:`\n]+)`?"
-
-    if match := re.search(pattern, response):
-        if match.group(2).strip().lower() == 'true':
-            return True
-
-    return False
-
 
 def judge_api_call(response: str, instance: dict, agent: LLMModel):
     function_calls = extract_function_call(response)
@@ -525,6 +343,7 @@ def judge_api_call(response: str, instance: dict, agent: LLMModel):
     else:
         raise ValueError("No API call or Ready Generation Signal found in the response.")
 
+
 def process_api_call(response: str, instance: dict, agent: LLMModel):
     function_calls = extract_function_call(response)
     if len(function_calls) > 0:
@@ -536,6 +355,7 @@ def process_api_call(response: str, instance: dict, agent: LLMModel):
                     results[function_call['source_line']] = api_response
             except Exception as e:
                 source_line = function_call['source_line']
+                traceback.print_exc()
                 log_and_print(f"Error occurred when invoking function call: {source_line}. Error: {str(e)}")
                 
         if len(results) == 0:
@@ -545,6 +365,7 @@ def process_api_call(response: str, instance: dict, agent: LLMModel):
         return 'ready'
     else:
         raise ValueError("No API call or Ready Generation Signal found in the response.")
+
 
 def build_api_call_reply_promopt(api_call_results) -> str:
     prompt = 'Your API invoke result:\n'
@@ -578,6 +399,7 @@ def save_chat(instance: dict, prompt: str, response: str):
         f.write(prompt + "\n")
     with open(detailed_chat_dir / f"{cur_index + 1}_output.txt", "w") as f:
         f.write(response + "\n")
+
 
 def query_model_with_retry(model: LLMModel, prompt: str, judge_function, instance, max_retries: int = 5, retry_msg: str = None):
     success = False
@@ -613,7 +435,29 @@ def query_model_with_retry(model: LLMModel, prompt: str, judge_function, instanc
         raise ValueError("Failed to get valid model response after multiple attempts.")
     
     return response
-    
+
+
+def choose_method_with_feedback_retry(instance: dict, model: LLMModel, prompt: str, max_retries: int = 4):
+    success = False
+    retries = 0
+    response = ''
+    while retries < max_retries:
+        retries += 1
+        try:
+            response = model.query_model(prompt)
+            save_chat(instance, prompt, response)
+            if judge_method_choose(response, instance):
+                success = True
+                break
+        except Exception as e:
+            prompt += '\n' + '=' * 50 + '## Your output:\n' + response + '=' * 50 + '\n\n## API Return result:\n' + str(e) +'\n\n\nPlease retry.'
+
+    if success:
+        return response
+    else:
+        raise ValueError(f'Failed to get valid Method Choose response after multiple attempts')
+
+
 def deep_dive_debugging(instance: dict, debugging_agent: LLMModel, debugging_test_exec_result: str, reproduce_test_code: str):
 
     debugging_agent.clear_memory()
@@ -624,6 +468,7 @@ def deep_dive_debugging(instance: dict, debugging_agent: LLMModel, debugging_tes
         terminal_output = debugging_test_exec_result
     ) + CHOOSE_METHOD_INSTRUCT
     model_response = query_model_with_retry(debugging_agent, initial_debugging_prompt, judge_method_choose, instance)
+    # model_response = choose_method_with_feedback_retry(instance, debugging_agent, initial_debugging_prompt)
     history = '\n' + '='*50 + '\n' + model_response + '\n' + '='*50 + '\n'
     debugging_depth = 1
     begin_prompt = BEGIN_INTRO.format(
@@ -657,12 +502,17 @@ def deep_dive_debugging(instance: dict, debugging_agent: LLMModel, debugging_tes
             method_code = observed_method_code,
             runtime_info = test_exec_result
         ) + CHOOSE_SCOPE_INSTRUCT
-        model_response = query_model_with_retry(debugging_agent, choose_scope_prompt, judge_scope_choose, instance)
+        model_response = query_model_with_retry(debugging_agent, choose_scope_prompt, judge_scope_or_method_choose, instance)
         history = update_history(history, model_response)
         trace_reply = extract_trace_reply(model_response)
+        
         if trace_reply['type'].lower() == 'buggy method':
             log_and_print(f'choose buggy method: {trace_reply["file"]}:{trace_reply["method"]}')
             return trace_reply['file'], trace_reply['method'], history
+        
+        elif trace_reply['type'].lower() == 'observed method':
+            debugging_depth += 1
+            continue
         
         ## chose method
         observed_file = trace_reply['file']
@@ -683,6 +533,7 @@ def deep_dive_debugging(instance: dict, debugging_agent: LLMModel, debugging_tes
             runtime_info = test_exec_result
         ) + CHOOSE_METHOD_INSTRUCT
         model_response = query_model_with_retry(debugging_agent, choose_method_prompt, judge_method_choose, instance)
+        # model_response = choose_method_with_feedback_retry(instance, debugging_agent, choose_method_prompt)
         history = update_history(history, model_response)
         debugging_depth += 1
         
@@ -827,16 +678,28 @@ def apply_patch(instance: dict, debugging_instruction: dict):
                 shutil.copy(backup_path, modified_file)
                 log_msg(f"Restored backup for {modified_file}")   
         raise
+    
     return list(modified_files)
 
 
 def gen_test_process(instance: dict):
-    agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
-    debugging_test_instruction = gen_debugging_test(instance, agent)
-    reproduce_test_code = debugging_test_instruction['debugging_test']
-    write_debugging_test(instance, reproduce_test_code)
-    debugging_test_exec_result = exec_debugging_test(instance)
-    return debugging_test_exec_result, reproduce_test_code
+    reproduce_test_path = f'/data/swe-fl/SRC/DebuggingAgent/data/reproduce_tests.json'
+    with open(reproduce_test_path, 'r') as f:
+        reproduce_tests = json.load(f)
+    if instance['instance_id'] in reproduce_tests:
+        reproduce_test_code = reproduce_tests[instance['instance_id']]["test_code"]
+    else:
+        reproduce_test_path = f'/data/swe-fl/DATA/reproduce_test/claude_reproduction_tests.json'
+        with open(reproduce_test_path, 'r') as f:
+            reproduce_test_code = json.load(f)[instance['instance_id']][0]
+
+    with open(instance['testbed_src_path'] / 'reproduce.py', 'w') as f:
+        f.write(reproduce_test_code)
+
+    original_test_output = exec_debugging_test(instance)
+    # original_test_output = exec_test_out + exec_test_err    
+    return original_test_output, reproduce_test_code
+
 
 def debugging_process(instance: dict, debugging_test_exec_result: str, reproduce_test_code: str):
     
@@ -850,71 +713,24 @@ def debugging_process(instance: dict, debugging_test_exec_result: str, reproduce
 
 
 def evaluation(instance: dict):
+    restore_repo(instance)
+    with open(f'{EXP_DIR}/{instance["instance_id"]}/patch.json', 'r') as f:
+        modify_src_instruction = json.load(f)
+    apply_patch(instance, modify_src_instruction)
+    
     cmd = f"cd {instance['testbed_src_path']} && conda run -n {instance['conda_env_name']} {instance['test_cmd']}"
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    std_out, std_err = execute_command(cmd, 1200, verbose=False)
     
     save_dir = f'{EXP_DIR}/{instance["instance_id"]}'
     eval_log_path = os.path.join(save_dir, 'evaluation.log')
     
     with open(eval_log_path, 'w') as f:
-        f.write(result.stdout + result.stderr)
+        f.write(std_out + std_err)
     
     report = get_eval_report_for_log(instance, eval_log_path)
     
     return report
-
- 
-def extract_function_call(text):
-    python_code_block_pattern = r"```python\n(.*?)```"
-    match = re.search(python_code_block_pattern, text, re.DOTALL)
-    if match:
-        text = match.group(1).strip()
-    else:
-        # log_and_print("No Python code block found in the response.")
-        return []
-    
-    function_names = {"search_method_in_file", "search_class_in_file", "search_code_in_file","search_method_in_codebase","search_class_in_codebase","search_code_in_codebase"}
-    results = []
-
-    # 保留行信息，为了后面能用 lineno 取出原始字符串
-    original_lines = [line for line in text.splitlines()]
-    stripped_lines = [line.strip() for line in original_lines if line.strip()]
-    text = '\n'.join(stripped_lines)
-
-    try:
-        # 包装为 dummy 函数使其可被解析
-        code = f"def _():\n{textwrap.indent(text, '    ')}"
-        tree = ast.parse(code)
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                func_name = node.func.id
-                if func_name in function_names:
-                    args = []
-                    for arg in node.args:
-                        if isinstance(arg, ast.Constant):  # Python 3.8+
-                            args.append(arg.value)
-                        elif isinstance(arg, ast.Str):  # Python <3.8
-                            args.append(arg.s)
-                        else:
-                            args.append(ast.unparse(arg))  # fallback
-
-                    # 获取原始调用行（注意 -1 是因为 lineno 从 1 开始，加了 dummy 函数所以是 node.lineno - 2）
-                    source_lineno = node.lineno - 2
-                    if 0 <= source_lineno < len(stripped_lines):
-                        source_line = stripped_lines[source_lineno]
-                    else:
-                        source_line = ""
-
-                    results.append({
-                        "function": func_name,
-                        "args": args,
-                        "source_line": source_line
-                    })
-
-        return results
-    except SyntaxError as e:
-        return []  # 解析错误，返回空列表
 
 
 
@@ -953,10 +769,11 @@ def function_invoke(previous_round_output, function_call_dict, instance, agent: 
         api_response[source_line] = result
         return filter_and_choose_code_element(instance, agent, previous_round_output, api_response)
     else:
-        raise ValueError(f"Unknown function call: {function_name}")
+        source_line = function_call_dict['source_line']
+        raise ValueError(f"Unknown function call: {source_line}")
 
 
-def collect_repair_code(instance: dict, debugging_history: str = None):
+def collect_repair_code(instance: dict, debugging_history: str = None, attempt_times: int = 2):
     repair_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
     repair_head_prompt = REPAIR_COLLECT_HEAD.format(
     project=instance['repo'].split('/')[1],
@@ -970,7 +787,7 @@ def collect_repair_code(instance: dict, debugging_history: str = None):
     
     collect_retries = 0
     
-    max_collect_times = 2
+    max_collect_times = attempt_times
     
     while collect_retries < max_collect_times:
         api_result = process_api_call(response, instance, repair_agent)
@@ -993,12 +810,14 @@ def generate_patch(instance: dict, repair_prompt: str):
     repair_agent = LLMModel(model_name=MODEL_NAME, system_message=DEBUGGING_AGENT_SYSTEM_MSG, instance = instance)
     success = False
     retries = 0
-    while retries < 3:
+    while retries < 4:
         try:
             modify_src_instruction = None
-            modify_src_response = query_model_with_retry(repair_agent, repair_prompt, judge_response_with_json, instance)
+            modify_src_response = query_model_with_retry(repair_agent, repair_prompt, extract_json_instruction, instance)
             modify_src_instruction = extract_json_instruction(modify_src_response)
             modified_files = apply_patch(instance, modify_src_instruction)
+            with open(f'{EXP_DIR}/{instance["instance_id"]}/patch.json', 'w') as f:
+                json.dump(modify_src_instruction, f, indent=4)
             success = True
             break
         except Exception as e:
@@ -1013,21 +832,6 @@ def generate_patch(instance: dict, repair_prompt: str):
         raise ValueError("Failed to apply patch after multiple attempts.")
 
     return modify_src_response
-    
-def extract_review_reply(response: str):
-    pattern = r"\*{0,2}([Ii]ssue [Rr]esolved)\*{0,2}:\s*`?([^:`\n\*]+)`?"
-    if match := re.search(pattern, response):
-        if match.group(2).strip().lower() == 'true':
-            return True
-    return False
-
-def judge_review_reply(response: str):
-    pattern = r"\*{0,2}([Ii]ssue [Rr]esolved)\*{0,2}:\s*`?([^:`\n\*]+)`?"
-    if match := re.search(pattern, response):
-        ans = match.group(2).strip().lower()
-        if ans == 'true' or ans == 'false':
-            return True
-    return False
     
     
 def review_patch(instance: dict, patched_output: str, original_output: str, test_code: str, patch_context: str):
@@ -1044,13 +848,13 @@ def review_patch(instance: dict, patched_output: str, original_output: str, test
     return response, extract_review_reply(response)
 
     
-def main():
+def debugging_agent(bug_list_path: str, mode: str = 'debugging'):
     start_time = time.time()
-    with open('/data/swe-fl/SRC/DebuggingAgent/bug_list.json','r') as f:
+    with open(bug_list_path,'r') as f:
         bug_list = json.load(f)
     for instance_id in bug_list:
-        if instance_id != 'django__django-12155':
-            continue
+        # if instance_id != 'sympy__sympy-20801':
+        #     continue
         evaluate_report_path = f'{EXP_DIR}/{instance_id}/evaluation_report.json'
         if os.path.exists(evaluate_report_path):
             with open(evaluate_report_path, 'r') as f:
@@ -1059,96 +863,119 @@ def main():
                 print(f'{instance_id} has been repaired')
                 continue
         try:
-
             log_path = Path(f"{EXP_DIR}/{instance_id}/{instance_id}.log")
             init_logger(log_path)
             
             print('start load_instance_data')
             instance = load_instance_data(instance_id)
             
+            
             print('start init_instance_testbed')
             init_instance_testbed(instance)
+            original_test_exec_result, reproduce_test_code = gen_test_process(instance)
+            original_test_exec_result_depth1 = exec_debugging_test(instance, depth = -1)
+            backup_repo(instance)
+            total_max_exception_retry_times = 4
             
-            total_max_exception_retry_times = 3
+            max_regenerate_times = 4
             cur_times = 0
             success = False
+            review_result = None
             while cur_times < total_max_exception_retry_times:
                 try:
-                    detailed_chat_dir = Path(f"{EXP_DIR}/{instance_id}/chat")
+                    restore_repo(instance)
+                    detailed_chat_dir = f"{EXP_DIR}/{instance_id}/chat"
                     if os.path.exists(detailed_chat_dir):
                         shutil.rmtree(detailed_chat_dir)
-                    print('start debugging_process')
-                    original_test_exec_result, reproduce_test_code = gen_test_process(instance)
-                    history = debugging_process(instance, original_test_exec_result, reproduce_test_code)
-        
-                    original_test_exec_result_depth1 = exec_debugging_test(instance, depth = -1)
-                    print('start repair_process')
-                    repair_prompt = collect_repair_code(instance, history)
-                    
-                    max_regenerate_times = 3
-                    curr_regenerate_times = 0
-                    modify_src_response = generate_patch(instance, repair_prompt)
-                    retry_history = '='*50 + '\n' + modify_src_response + '\n' + '='*50 + '\n'
-                    while curr_regenerate_times < max_regenerate_times:
-                        patched_test_exec_result = exec_debugging_test(instance, depth = -1)
-                        reviewer_feedback, review_result = review_patch(instance, patched_test_exec_result, original_test_exec_result_depth1, reproduce_test_code, modify_src_response)
-                        if review_result:
-                            success = True
-                            break
-                        if curr_regenerate_times == max_regenerate_times - 1:
-                            break
                         
-                        retry_prompt = repair_prompt + REGENERATION_INSTRUCT.format(
-                            history = retry_history,
-                            patched_output = patched_test_exec_result,
-                            reviewer_feedback = reviewer_feedback
-                        )
-                        modify_src_response = generate_patch(instance, retry_prompt)
-                        retry_history = update_history(retry_history, modify_src_response)
-                        log_and_print(f"Unable to pass patch LLM review. Retry...({curr_regenerate_times + 1}/{max_regenerate_times})")
+                    if mode == 'debugging':
+                        print('start debugging_process')
+                        history = debugging_process(instance, original_test_exec_result, reproduce_test_code)
+                        print('start repair_process')
+                        repair_prompt = collect_repair_code(instance, history, attempt_times = 2)
+                        curr_regenerate_times = 0
+                        modify_src_response = generate_patch(instance, repair_prompt)
+                        # retry_history = '='*50 + '\n' + modify_src_response + '\n' + '='*50 + '\n'
+                        while curr_regenerate_times <= max_regenerate_times:
+                            patched_test_exec_result = exec_debugging_test(instance, depth = -1)
+                            reviewer_feedback, review_result = review_patch(instance, patched_test_exec_result, original_test_exec_result_depth1, reproduce_test_code, modify_src_response)
+                            if review_result:
+                                success = True
+                                break
+                            if curr_regenerate_times == max_regenerate_times:
+                                break
+                            
+                            curr_regenerate_times += 1
+                            log_and_print(f"Unable to pass patch LLM review. Retry...({curr_regenerate_times}/{max_regenerate_times})")
+                            restore_repo(instance)
+                            # retry_prompt = repair_prompt + REGENERATION_INSTRUCT.format(
+                            #     history = modify_src_response,
+                            #     patched_output = patched_test_exec_result,
+                            #     reviewer_feedback = reviewer_feedback
+                            # )
+                            # modify_src_response = generate_patch(instance, retry_prompt)
+                            # retry_history = update_history(retry_history, modify_src_response)
+                            modify_src_response = generate_patch(instance, repair_prompt)
+                    
+                    elif mode == 'wo_debugging':
+                        repair_prompt = collect_repair_code(instance, attempt_times=4)
+                        modify_src_response = generate_patch(instance, repair_prompt)
+                        # success = True
+                        curr_regenerate_times = 0
+                        while curr_regenerate_times <= max_regenerate_times:
+                            patched_test_exec_result = exec_debugging_test(instance, depth = -1)
+                            reviewer_feedback, review_result = review_patch(instance, patched_test_exec_result, original_test_exec_result_depth1, reproduce_test_code, modify_src_response)
+                            if review_result:
+                                success = True
+                                break
+                            if curr_regenerate_times == max_regenerate_times:
+                                break
+                            
+                            curr_regenerate_times += 1
+                            log_and_print(f"Unable to pass patch LLM review. Retry...({curr_regenerate_times}/{max_regenerate_times})")
+                            restore_repo(instance)
+                            
+                            modify_src_response = generate_patch(instance, repair_prompt)
                     
                     if success:
                         break
                     else:
-                        raise ValueError("Unable to pass patch LLM review")
+                        log_and_print("Unable to pass reviewer")
                 except Exception as e:
-                    log_and_print(f"Whole Process crushed: {e}\nRestart..({cur_times}/{total_max_exception_retry_times})")
-                    traceback.print_exc()
+                    log_and_print(f"Whole Process crushed: {e}")
+                finally:
                     cur_times += 1
-                    if cur_times == total_max_exception_retry_times:
-                        raise ValueError("Debugging and repair process failed after multiple retries.")
-            
-            if success:
-                log_and_print('Debugging process completed successfully. Start evaluation')
-                report = evaluation(instance)
+                    if not success:
+                        log_and_print(f'\nRestart...({cur_times}/{total_max_exception_retry_times}')
+
+            log_and_print('Debugging process completed. Start evaluation')
+            report = evaluation(instance)
+            if review_result is not None:
                 report['llm_review'] =  review_result
-                eval_report_path = os.path.join(f'{EXP_DIR}/{instance["instance_id"]}', 'evaluation_report.json')
-                with open(eval_report_path, 'w') as f:
-                    json.dump(report, f, indent=4)
-            else:
-                log_and_print('Debugging process failed after multiple attempts. Please check the logs for more details.')
+            eval_report_path = os.path.join(f'{EXP_DIR}/{instance["instance_id"]}', 'evaluation_report.json')
+            with open(eval_report_path, 'w') as f:
+                json.dump(report, f, indent=4)
+
 
         except Exception as e:
             log_and_print(f"Crush in bug {instance_id}: {e}")
+            traceback.print_exc()
             continue
         
 
     end_time = time.time()
     print(f"Total time taken: {end_time - start_time} seconds")
 
-    # astropy__astropy-13579 
-    # astropy__astropy-14096
-    # astropy__astropy-8872
-    # astropy__astropy-13453 fail
-
 
 
 if __name__ == '__main__':
-    main()
-    # instance = load_instance_data('astropy__astropy-12907')
-    # with open('tmp.txt', 'r') as f:
-    #     modify_src_response = f.read()
-    # modify_src_instruction = extract_json_instruction(modify_src_response)
-    # modified_files = apply_patch(instance, modify_src_instruction)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bug_list_path", type=str, help="Path to the bug list JSON file")
+    parser.add_argument("--mode", type=str, default='debugging', help="Mode for the debugging agent")
+    args = parser.parse_args()
 
+    now = datetime.now().strftime("%m%d%H%M")
+    EXP_DIR = f'/data/swe-fl/SRC/DebuggingAgent/exp/{args.mode}_{args.bug_list_path.split("/")[-1].split(".")[0]}_{now}'
 
+    debugging_agent(args.bug_list_path, args.mode)
+    

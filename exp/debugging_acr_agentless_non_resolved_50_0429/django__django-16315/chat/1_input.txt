@@ -1,0 +1,588 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+QuerySet.bulk_create() crashes on mixed case columns in unique_fields/update_fields.
+Description
+	
+Not sure exactly how to phrase this, but when I I'm calling bulk_update on the manager for a class with db_column set on fields the SQL is invalid. Ellipses indicate other fields excluded for clarity.
+class ActivityBlackListed(models.Model):
+	"""
+	Originally sourced from Activity_BlackListed in /home/josh/PNDS_Interim_MIS-Data.accdb (13 records)
+	"""
+	class Meta:
+		db_table = "Activity_BlackListed"
+	blacklistid = models.IntegerField(primary_key=True, db_column="BlacklistID")
+	sectorid = models.IntegerField(null=True, blank=True, db_column="SectorID")
+	...
+qs.bulk_create(instances, update_conflicts=True, update_fields=["sectorid", ...], unique_fields=["blacklistid"])
+The "INSERT" code does take into account the db_columns
+INSERT INTO "Activity_BlackListed" ("BlacklistID",...) VALUES (%s, ...),
+The code which is generated for "ON CONFLICT" uses the field name and not the db_column which leads to a syntax error
+'ON CONFLICT("blacklistid") DO UPDATE SET "sectorid" = EXCLUDED."sectorid", ...
+PostgreSQL returns ERROR: column "blacklistid" does not exist at character 1508
+What should be generated is I think:
+'ON CONFLICT("BlacklistID") DO UPDATE SET "SectorID" = EXCLUDED."SectorID", ...
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+from django.conf import settings
+from django.db import models, connection
+from django.test.utils import override_settings
+
+settings.configure(
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': ':memory:',
+        }
+    },
+    INSTALLED_APPS=['django.contrib.contenttypes'],
+    DEFAULT_AUTO_FIELD='django.db.models.AutoField',
+)
+
+import django
+django.setup()
+
+class ActivityBlackListed(models.Model):
+    class Meta:
+        app_label = 'test'
+        db_table = "Activity_BlackListed"
+    blacklistid = models.IntegerField(primary_key=True, db_column="BlacklistID")
+    sectorid = models.IntegerField(null=True, blank=True, db_column="SectorID")
+
+# Create the table
+with connection.schema_editor() as schema_editor:
+    schema_editor.create_model(ActivityBlackListed)
+
+# Try to bulk_create with update_conflicts
+instances = [
+    ActivityBlackListed(blacklistid=1, sectorid=100),
+    ActivityBlackListed(blacklistid=2, sectorid=200),
+]
+
+qs = ActivityBlackListed.objects.bulk_create(
+    instances,
+    update_conflicts=True,
+    update_fields=["sectorid"],
+    unique_fields=["blacklistid"]
+)
+
+This is the corresponding output and runtime information:
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+    Starting var:.. __name__ = '__main__'
+    Starting var:.. __doc__ = None
+    Starting var:.. __package__ = ''
+    Starting var:.. __loader__ = None
+    Starting var:.. __spec__ = None
+    Starting var:.. __file__ = '/data/swe-fl/TMP/testbed/django__django-16315/reproduce.py'
+    Starting var:.. __cached__ = None
+    Starting var:.. __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+     call         1 from django.conf import settings
+     line         1 from django.conf import settings
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.conf'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f775bfb7060>
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-16315/django/conf/__init__.py'>
+        Starting var:.. module = <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-16315/django/conf/__init__.py'>
+        Starting var:.. fromlist = ('settings',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'settings'
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-16315/django/conf/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+    New var:....... settings = <LazySettings [Unevaluated]>
+     line         2 from django.db import models, connection
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.db'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f775bfb7060>
+        Return value:.. <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-16315/django/db/__init__.py'>
+        Starting var:.. module = <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-16315/django/db/__init__.py'>
+        Starting var:.. fromlist = ('models', 'connection')
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'models'
+        New var:....... from_name = 'django.db.models'
+        Modified var:.. x = 'connection'
+        Return value:.. <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-16315/django/db/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+    New var:....... models = <module 'django.db.models' from '/data/swe-fl/TM...ango__django-16315/django/db/models/__init__.py'>
+    New var:....... connection = <django.utils.connection.ConnectionProxy object at 0x7f775b0cb400>
+     line         3 from django.test.utils import override_settings
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.test.utils'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f775bfb7060>
+        Return value:.. <module 'django.test.utils' from '/data/swe-fl/T...stbed/django__django-16315/django/test/utils.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+    New var:....... override_settings = <class 'django.test.utils.override_settings'>
+     line         5 settings.configure(
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/utils/functional.py
+        Starting var:.. self = <LazySettings [Unevaluated]>
+        Starting var:.. name = 'configure'
+        Starting var:.. __class__ = <class 'django.utils.functional.LazyObject'>
+         call       291     def __getattribute__(self, name):
+         line       292         if name == "_wrapped":
+         line       295         value = super().__getattribute__(name)
+        New var:....... value = <bound method LazySettings.configure of <LazySettings [Unevaluated]>>
+         line       298         if not getattr(value, "_mask_wrapped", True):
+         line       300         return value
+         return     300         return value
+        Return value:.. <bound method LazySettings.configure of <LazySettings [Unevaluated]>>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+     line         7         'default': {
+     line         8             'ENGINE': 'django.db.backends.sqlite3',
+     line         9             'NAME': ':memory:',
+     line         7         'default': {
+     line         6     DATABASES={
+     line        12     INSTALLED_APPS=['django.contrib.contenttypes'],
+     line        13     DEFAULT_AUTO_FIELD='django.db.models.AutoField',
+     line         5 settings.configure(
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/conf/__init__.py
+        Starting var:.. self = <LazySettings [Unevaluated]>
+        Starting var:.. default_settings = <module 'django.conf.global_settings' from '/dat...go__django-16315/django/conf/global_settings.py'>
+        Starting var:.. options = {'DATABASES': {'default': {'ENGINE': 'django.db....EFAULT_AUTO_FIELD': 'django.db.models.AutoField'}
+         call       122     def configure(self, default_settings=global_settings, **options):
+         line       128         if self._wrapped is not empty:
+         line       130         holder = UserSettingsHolder(default_settings)
+        New var:....... holder = <UserSettingsHolder>
+         line       131         for name, value in options.items():
+        New var:....... name = 'DATABASES'
+        New var:....... value = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'}}
+         line       132             if not name.isupper():
+         line       134             setattr(holder, name, value)
+         line       131         for name, value in options.items():
+        Modified var:.. name = 'INSTALLED_APPS'
+        Modified var:.. value = ['django.contrib.contenttypes']
+         line       132             if not name.isupper():
+         line       134             setattr(holder, name, value)
+         line       131         for name, value in options.items():
+        Modified var:.. name = 'DEFAULT_AUTO_FIELD'
+        Modified var:.. value = 'django.db.models.AutoField'
+         line       132             if not name.isupper():
+         line       134             setattr(holder, name, value)
+         line       131         for name, value in options.items():
+         line       135         self._wrapped = holder
+        Modified var:.. self = <LazySettings "None">
+         return     135         self._wrapped = holder
+        Return value:.. None
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+    Modified var:.. settings = <LazySettings "None">
+     line        16 import django
+    New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-16315/django/__init__.py'>
+     line        17 django.setup()
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/__init__.py
+        Starting var:.. set_prefix = True
+         call         8 def setup(set_prefix=True):
+         line        14     from django.apps import apps
+        New var:....... apps = <django.apps.registry.Apps object at 0x7f775b075cd0>
+         line        15     from django.conf import settings
+        New var:....... settings = <LazySettings "None">
+         line        16     from django.urls import set_script_prefix
+        New var:....... set_script_prefix = <function set_script_prefix at 0x7f775a7e83a0>
+         line        17     from django.utils.log import configure_logging
+        New var:....... configure_logging = <function configure_logging at 0x7f775a7e8af0>
+         line        19     configure_logging(settings.LOGGING_CONFIG, settings.LOGGING)
+         line        20     if set_prefix:
+         line        21         set_script_prefix(
+         line        22             "/" if settings.FORCE_SCRIPT_NAME is None else settings.FORCE_SCRIPT_NAME
+         line        21         set_script_prefix(
+         line        24     apps.populate(settings.INSTALLED_APPS)
+         return      24     apps.populate(settings.INSTALLED_APPS)
+        Return value:.. None
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+     line        19 class ActivityBlackListed(models.Model):
+         call        19 class ActivityBlackListed(models.Model):
+         line        19 class ActivityBlackListed(models.Model):
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'ActivityBlackListed'
+         line        20     class Meta:
+             call        20     class Meta:
+             line        20     class Meta:
+            New var:....... __module__ = '__main__'
+            New var:....... __qualname__ = 'ActivityBlackListed.Meta'
+             line        21         app_label = 'test'
+            New var:....... app_label = 'test'
+             line        22         db_table = "Activity_BlackListed"
+            New var:....... db_table = 'Activity_BlackListed'
+             return      22         db_table = "Activity_BlackListed"
+            Return value:.. None
+                New var:....... Meta = <class '__main__.ActivityBlackListed.Meta'>
+         line        23     blacklistid = models.IntegerField(primary_key=True, db_column="BlacklistID")
+            Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/models/fields/__init__.py
+            Starting var:.. self = <django.db.models.fields.IntegerField>
+            Starting var:.. verbose_name = None
+            Starting var:.. name = None
+            Starting var:.. primary_key = True
+            Starting var:.. max_length = None
+            Starting var:.. unique = False
+            Starting var:.. blank = False
+            Starting var:.. null = False
+            Starting var:.. db_index = False
+            Starting var:.. rel = None
+            Starting var:.. default = <class 'django.db.models.fields.NOT_PROVIDED'>
+            Starting var:.. editable = True
+            Starting var:.. serialize = True
+            Starting var:.. unique_for_date = None
+            Starting var:.. unique_for_month = None
+            Starting var:.. unique_for_year = None
+            Starting var:.. choices = None
+            Starting var:.. help_text = ''
+            Starting var:.. db_column = 'BlacklistID'
+            Starting var:.. db_tablespace = None
+            Starting var:.. auto_created = False
+            Starting var:.. validators = ()
+            Starting var:.. error_messages = None
+             call       179     def __init__(
+             line       204         self.name = name
+             line       205         self.verbose_name = verbose_name  # May be set by set_attributes_from_name
+             line       206         self._verbose_name = verbose_name  # Store original for deconstruction
+             line       207         self.primary_key = primary_key
+             line       208         self.max_length, self._unique = max_length, unique
+             line       209         self.blank, self.null = blank, null
+             line       210         self.remote_field = rel
+             line       211         self.is_relation = self.remote_field is not None
+             line       212         self.default = default
+             line       213         self.editable = editable
+             line       214         self.serialize = serialize
+             line       215         self.unique_for_date = unique_for_date
+             line       216         self.unique_for_month = unique_for_month
+             line       217         self.unique_for_year = unique_for_year
+             line       218         if isinstance(choices, collections.abc.Iterator):
+             line       220         self.choices = choices
+             line       221         self.help_text = help_text
+             line       222         self.db_index = db_index
+             line       223         self.db_column = db_column
+             line       224         self._db_tablespace = db_tablespace
+             line       225         self.auto_created = auto_created
+             line       228         if auto_created:
+             line       232             self.creation_counter = Field.creation_counter
+             line       233             Field.creation_counter += 1
+             line       235         self._validators = list(validators)  # Store for deconstruction later
+             line       237         self._error_messages = error_messages  # Store for deconstruction later
+             return     237         self._error_messages = error_messages  # Store for deconstruction later
+            Return value:.. None
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+        New var:....... blacklistid = <django.db.models.fields.IntegerField>
+         line        24     sectorid = models.IntegerField(null=True, blank=True, db_column="SectorID")
+            Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/models/fields/__init__.py
+            Starting var:.. self = <django.db.models.fields.IntegerField>
+            Starting var:.. verbose_name = None
+            Starting var:.. name = None
+            Starting var:.. primary_key = False
+            Starting var:.. max_length = None
+            Starting var:.. unique = False
+            Starting var:.. blank = True
+            Starting var:.. null = True
+            Starting var:.. db_index = False
+            Starting var:.. rel = None
+            Starting var:.. default = <class 'django.db.models.fields.NOT_PROVIDED'>
+            Starting var:.. editable = True
+            Starting var:.. serialize = True
+            Starting var:.. unique_for_date = None
+            Starting var:.. unique_for_month = None
+            Starting var:.. unique_for_year = None
+            Starting var:.. choices = None
+            Starting var:.. help_text = ''
+            Starting var:.. db_column = 'SectorID'
+            Starting var:.. db_tablespace = None
+            Starting var:.. auto_created = False
+            Starting var:.. validators = ()
+            Starting var:.. error_messages = None
+             call       179     def __init__(
+             line       204         self.name = name
+             line       205         self.verbose_name = verbose_name  # May be set by set_attributes_from_name
+             line       206         self._verbose_name = verbose_name  # Store original for deconstruction
+             line       207         self.primary_key = primary_key
+             line       208         self.max_length, self._unique = max_length, unique
+             line       209         self.blank, self.null = blank, null
+             line       210         self.remote_field = rel
+             line       211         self.is_relation = self.remote_field is not None
+             line       212         self.default = default
+             line       213         self.editable = editable
+             line       214         self.serialize = serialize
+             line       215         self.unique_for_date = unique_for_date
+             line       216         self.unique_for_month = unique_for_month
+             line       217         self.unique_for_year = unique_for_year
+             line       218         if isinstance(choices, collections.abc.Iterator):
+             line       220         self.choices = choices
+             line       221         self.help_text = help_text
+             line       222         self.db_index = db_index
+             line       223         self.db_column = db_column
+             line       224         self._db_tablespace = db_tablespace
+             line       225         self.auto_created = auto_created
+             line       228         if auto_created:
+             line       232             self.creation_counter = Field.creation_counter
+             line       233             Field.creation_counter += 1
+             line       235         self._validators = list(validators)  # Store for deconstruction later
+             line       237         self._error_messages = error_messages  # Store for deconstruction later
+             return     237         self._error_messages = error_messages  # Store for deconstruction later
+            Return value:.. None
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+        New var:....... sectorid = <django.db.models.fields.IntegerField>
+         return      24     sectorid = models.IntegerField(null=True, blank=True, db_column="SectorID")
+        Return value:.. None
+            Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/models/base.py
+        Starting var:.. cls = <class 'django.db.models.base.ModelBase'>
+        Starting var:.. name = 'ActivityBlackListed'
+        Starting var:.. bases = (<class 'django.db.models.base.Model'>,)
+        Starting var:.. attrs = {'__module__': '__main__', '__qualname__': 'Acti...ectorid': <django.db.models.fields.IntegerField>}
+        Starting var:.. kwargs = {}
+        Starting var:.. __class__ = <class 'django.db.models.base.ModelBase'>
+         call        95     def __new__(cls, name, bases, attrs, **kwargs):
+         line        96         super_new = super().__new__
+        New var:....... super_new = <built-in method __new__ of type object at 0x556b5a6253e0>
+         line       100         parents = [b for b in bases if isinstance(b, ModelBase)]
+        New var:....... parents = [<class 'django.db.models.base.Model'>]
+         line       101         if not parents:
+         line       105         module = attrs.pop("__module__")
+        Modified var:.. attrs = {'__qualname__': 'ActivityBlackListed', 'Meta': ...ectorid': <django.db.models.fields.IntegerField>}
+        New var:....... module = '__main__'
+         line       106         new_attrs = {"__module__": module}
+        New var:....... new_attrs = {'__module__': '__main__'}
+         line       107         classcell = attrs.pop("__classcell__", None)
+        New var:....... classcell = None
+         line       108         if classcell is not None:
+         line       110         attr_meta = attrs.pop("Meta", None)
+        Modified var:.. attrs = {'__qualname__': 'ActivityBlackListed', 'blackli...ectorid': <django.db.models.fields.IntegerField>}
+        New var:....... attr_meta = <class '__main__.ActivityBlackListed.Meta'>
+         line       114         contributable_attrs = {}
+        New var:....... contributable_attrs = {}
+         line       115         for obj_name, obj in attrs.items():
+        New var:....... obj_name = '__qualname__'
+        New var:....... obj = 'ActivityBlackListed'
+         line       116             if _has_contribute_to_class(obj):
+         line       119                 new_attrs[obj_name] = obj
+        Modified var:.. new_attrs = {'__module__': '__main__', '__qualname__': 'ActivityBlackListed'}
+         line       115         for obj_name, obj in attrs.items():
+        Modified var:.. obj_name = 'blacklistid'
+        Modified var:.. obj = <django.db.models.fields.IntegerField>
+         line       116             if _has_contribute_to_class(obj):
+         line       117                 contributable_attrs[obj_name] = obj
+        Modified var:.. contributable_attrs = {'blacklistid': <django.db.models.fields.IntegerField>}
+         line       115         for obj_name, obj in attrs.items():
+        Modified var:.. obj_name = 'sectorid'
+         line       116             if _has_contribute_to_class(obj):
+         line       117                 contributable_attrs[obj_name] = obj
+        Modified var:.. contributable_attrs = {'blacklistid': <django.db.models.fields.Integer...ectorid': <django.db.models.fields.IntegerField>}
+         line       115         for obj_name, obj in attrs.items():
+         line       120         new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+        New var:....... new_class = <class '__main__.ActivityBlackListed'>
+         line       122         abstract = getattr(attr_meta, "abstract", False)
+        New var:....... abstract = False
+         line       123         meta = attr_meta or getattr(new_class, "Meta", None)
+        New var:....... meta = <class '__main__.ActivityBlackListed.Meta'>
+         line       124         base_meta = getattr(new_class, "_meta", None)
+        New var:....... base_meta = None
+         line       126         app_label = None
+        New var:....... app_label = None
+         line       129         app_config = apps.get_containing_app_config(module)
+        New var:....... app_config = None
+         line       131         if getattr(meta, "app_label", None) is None:
+         line       143         new_class.add_to_class("_meta", Options(meta, app_label))
+         line       144         if not abstract:
+         line       145             new_class.add_to_class(
+         line       146                 "DoesNotExist",
+         line       147                 subclass_exception(
+         line       148                     "DoesNotExist",
+         line       149                     tuple(
+         line       151                         for x in parents
+         line       149                     tuple(
+         line       154                     or (ObjectDoesNotExist,),
+         line       155                     module,
+         line       156                     attached_to=new_class,
+         line       147                 subclass_exception(
+         line       145             new_class.add_to_class(
+         line       159             new_class.add_to_class(
+         line       160                 "MultipleObjectsReturned",
+         line       161                 subclass_exception(
+         line       162                     "MultipleObjectsReturned",
+         line       163                     tuple(
+         line       165                         for x in parents
+         line       163                     tuple(
+         line       168                     or (MultipleObjectsReturned,),
+         line       169                     module,
+         line       170                     attached_to=new_class,
+         line       161                 subclass_exception(
+         line       159             new_class.add_to_class(
+         line       173             if base_meta and not base_meta.abstract:
+         line       182         is_proxy = new_class._meta.proxy
+        New var:....... is_proxy = False
+         line       186         if is_proxy and base_meta and base_meta.swapped:
+         line       193         for obj_name, obj in contributable_attrs.items():
+        Modified var:.. obj_name = 'blacklistid'
+         line       194             new_class.add_to_class(obj_name, obj)
+        Modified var:.. obj = <django.db.models.fields.IntegerField: blacklistid>
+         line       193         for obj_name, obj in contributable_attrs.items():
+        Modified var:.. obj_name = 'sectorid'
+        Modified var:.. obj = <django.db.models.fields.IntegerField>
+         line       194             new_class.add_to_class(obj_name, obj)
+        Modified var:.. attrs = {'__qualname__': 'ActivityBlackListed', 'blackli...<django.db.models.fields.IntegerField: sectorid>}
+        Modified var:.. contributable_attrs = {'blacklistid': <django.db.models.fields.Integer...<django.db.models.fields.IntegerField: sectorid>}
+        Modified var:.. obj = <django.db.models.fields.IntegerField: sectorid>
+         line       193         for obj_name, obj in contributable_attrs.items():
+         line       197         new_fields = chain(
+         line       198             new_class._meta.local_fields,
+         line       199             new_class._meta.local_many_to_many,
+         line       200             new_class._meta.private_fields,
+         line       197         new_fields = chain(
+        New var:....... new_fields = <itertools.chain object at 0x7f775a2dce20>
+         line       202         field_names = {f.name for f in new_fields}
+        New var:....... field_names = {'sectorid', 'blacklistid'}
+         line       205         if is_proxy:
+         line       230             new_class._meta.concrete_model = new_class
+         line       233         parent_links = {}
+        New var:....... parent_links = {}
+         line       234         for base in reversed([new_class] + parents):
+        New var:....... base = <class 'django.db.models.base.Model'>
+         line       236             if not hasattr(base, "_meta"):
+         line       237                 continue
+         line       234         for base in reversed([new_class] + parents):
+        Modified var:.. base = <class '__main__.ActivityBlackListed'>
+         line       236             if not hasattr(base, "_meta"):
+         line       239             if base != new_class and not base._meta.abstract:
+         line       242             for field in base._meta.local_fields:
+        New var:....... field = <django.db.models.fields.IntegerField: blacklistid>
+         line       243                 if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+         line       242             for field in base._meta.local_fields:
+        Modified var:.. field = <django.db.models.fields.IntegerField: sectorid>
+         line       243                 if isinstance(field, OneToOneField) and field.remote_field.parent_link:
+         line       242             for field in base._meta.local_fields:
+         line       234         for base in reversed([new_class] + parents):
+         line       248         inherited_attributes = set()
+        New var:....... inherited_attributes = set()
+         line       250         for base in new_class.mro():
+         line       251             if base not in parents or not hasattr(base, "_meta"):
+         line       254                 inherited_attributes.update(base.__dict__)
+        Modified var:.. inherited_attributes = {'__module__', 'blacklistid', 'sectorid', 'Multi...ctsReturned', 'DoesNotExist', '_meta', '__doc__'}
+         line       255                 continue
+         line       250         for base in new_class.mro():
+        Modified var:.. base = <class 'django.db.models.base.Model'>
+         line       251             if base not in parents or not hasattr(base, "_meta"):
+         line       254                 inherited_attributes.update(base.__dict__)
+        Modified var:.. inherited_attributes = {'_check_model_name_db_lookup_clashes', '_save_p...ts', '_perform_unique_checks', '_check_id_field'}
+         line       255                 continue
+         line       250         for base in new_class.mro():
+        Modified var:.. base = <class 'django.db.models.utils.AltersData'>
+         line       251             if base not in parents or not hasattr(base, "_meta"):
+         line       254                 inherited_attributes.update(base.__dict__)
+         line       255                 continue
+         line       250         for base in new_class.mro():
+        Modified var:.. base = <class 'object'>
+         line       251             if base not in parents or not hasattr(base, "_meta"):
+         line       254                 inherited_attributes.update(base.__dict__)
+        Modified var:.. inherited_attributes = {'DoesNotExist', '_perform_date_checks', '_check...essage', '__hash__', '__dict__', '_meta', 'save'}
+         line       255                 continue
+         line       250         for base in new_class.mro():
+         line       353         new_class._meta.indexes = [
+         line       354             copy.deepcopy(idx) for idx in new_class._meta.indexes
+         line       353         new_class._meta.indexes = [
+         line       357         if abstract:
+         line       365         new_class._prepare()
+         line       366         new_class._meta.apps.register_model(new_class._meta.app_label, new_class)
+         line       367         return new_class
+         return     367         return new_class
+        Return value:.. <class '__main__.ActivityBlackListed'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+    New var:....... ActivityBlackListed = <class '__main__.ActivityBlackListed'>
+     line        27 with connection.schema_editor() as schema_editor:
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/utils/connection.py
+        Starting var:.. self = <django.utils.connection.ConnectionProxy object at 0x7f775b0cb400>
+        Starting var:.. item = 'schema_editor'
+         call        14     def __getattr__(self, item):
+         line        15         return getattr(self._connections[self._alias], item)
+         return      15         return getattr(self._connections[self._alias], item)
+        Return value:.. <bound method BaseDatabaseWrapper.schema_editor ...DatabaseWrapper vendor='sqlite' alias='default'>>
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/backends/base/base.py
+        Starting var:.. self = <DatabaseWrapper vendor='sqlite' alias='default'>
+        Starting var:.. args = ()
+        Starting var:.. kwargs = {}
+         call       727     def schema_editor(self, *args, **kwargs):
+         line       731         if self.SchemaEditorClass is None:
+         line       735         return self.SchemaEditorClass(self, *args, **kwargs)
+         return     735         return self.SchemaEditorClass(self, *args, **kwargs)
+        Return value:.. <django.db.backends.sqlite3.schema.DatabaseSchemaEditor object at 0x7f7759feb160>
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/backends/sqlite3/schema.py
+        Starting var:.. self = <django.db.backends.sqlite3.schema.DatabaseSchemaEditor object at 0x7f7759feb160>
+        Starting var:.. __class__ = <class 'django.db.backends.sqlite3.schema.DatabaseSchemaEditor'>
+         call        25     def __enter__(self):
+         line        28         if not self.connection.disable_constraint_checking():
+         line        36         return super().__enter__()
+         return      36         return super().__enter__()
+        Return value:.. <django.db.backends.sqlite3.schema.DatabaseSchemaEditor object at 0x7f7759feb160>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+    New var:....... schema_editor = <django.db.backends.sqlite3.schema.DatabaseSchemaEditor object at 0x7f7759feb160>
+     line        28     schema_editor.create_model(ActivityBlackListed)
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/backends/base/schema.py
+        Starting var:.. self = <django.db.backends.sqlite3.schema.DatabaseSchemaEditor object at 0x7f7759feb160>
+        Starting var:.. model = <class '__main__.ActivityBlackListed'>
+         call       439     def create_model(self, model):
+         line       444         sql, params = self.table_sql(model)
+        New var:....... sql = 'CREATE TABLE "Activity_BlackListed" ("Blacklist...r NOT NULL PRIMARY KEY, "SectorID" integer NULL)'
+        New var:....... params = []
+         line       447         self.execute(sql, params or None)
+         line       451         self.deferred_sql.extend(self._model_indexes_sql(model))
+         line       454         for field in model._meta.local_many_to_many:
+         return     454         for field in model._meta.local_many_to_many:
+        Return value:.. None
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/backends/sqlite3/schema.py
+        Starting var:.. self = <django.db.backends.sqlite3.schema.DatabaseSchemaEditor object at 0x7f7759feb160>
+        Starting var:.. exc_type = None
+        Starting var:.. exc_value = None
+        Starting var:.. traceback = None
+        Starting var:.. __class__ = <class 'django.db.backends.sqlite3.schema.DatabaseSchemaEditor'>
+         call        38     def __exit__(self, exc_type, exc_value, traceback):
+         line        39         self.connection.check_constraints()
+         line        40         super().__exit__(exc_type, exc_value, traceback)
+         line        41         self.connection.enable_constraint_checking()
+         return      41         self.connection.enable_constraint_checking()
+        Return value:.. None
+    Source path:... /data/swe-fl/TMP/testbed/django__django-16315/reproduce.py
+     line        32     ActivityBlackListed(blacklistid=1, sectorid=100),
+        Source path:... /data/swe-fl/TMP/testbed/django__django-16315/django/db/models/base.py
+        Starting var:.. self = REPR FAILED
+        Starting var:.. args = ()
+        Starting var:.. kwargs = {'blacklistid': 1, 'sectorid': 100}
+        Starting var:.. __class__ = <class 'django.db.models.base.Model'>
+         call       460     def __init__(self, *args, **kwargs):
+         line       462         cls = self.__class__
+        New var:....... cls = <class '__main__.ActivityBlackListed'>
+         line       463         opts = self._meta
+        New var:....... opts = <Options for ActivityBlackListed>
+         line       464         _setattr = setattr
+        New var:....... _setattr = <built-in function setattr>
+         line       465         _DEFERRED = DEFERRED
+        New var:....... _DEFERRED = <Deferred field>
+         line       466         if opts.abstract:
+         line       469         pre_init.send(sender=cls, args=args, kwargs=kwargs)
+         line       472         self._state = ModelState()
+         line       478         if len(args) > len(opts.concrete_fields):
+         line       482         if not kwargs:
+         line       494             fields_iter = iter(opts.fields)
+        New var:....... fields_iter = <tuple_iterator object at 0x7f7759feb130>
+         line       495             for val, field in zip(args, fields_iter):
+         line       508         for field in fields_iter:
+        New var:....... field = <django.db.models.fields.IntegerField: blacklistid>
+         line       509             is_related_object = False
+        New var:....... is_related_object = False
+         line       511             if field.attname not in kwargs and field.column is None:
+         line       513             if kwargs:
+
+The debugging test execution result is too long to display here. Please re-select your `runtime_info` lists to narrow down the scope of your analysis.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

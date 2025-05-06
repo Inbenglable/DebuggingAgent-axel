@@ -1,0 +1,422 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+call_command fails when argument of required mutually exclusive group is passed in kwargs.
+Description
+	
+This error 
+django.core.management.base.CommandError: Error: one of the arguments --shop-id --shop is required
+is raised when I run 
+call_command('my_command', shop_id=1)
+the argument 'shop_id' is part of a required mutually exclusive group:
+shop = parser.add_mutually_exclusive_group(required=True)
+shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
+shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
+However, everything is fine when I call this command in this way:
+call_command('my_command, '--shop-id=1')
+In django sources I found that only those keyword arguments of call_command are passed to the parser that are defined as required:
+# Any required arguments which are passed in via '**options' must be passed
+# to parse_args().
+parse_args += [
+	'{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+	for opt in parser._actions if opt.required and opt.dest in options
+]
+but in this special case both of them individually are not required, they are actually part of a group that is required. And the code of call_command does nothing with groups defined in the parser.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+from django.core.management import call_command
+from django.core.management.base import BaseCommand, CommandError
+from django.conf import settings
+from django.core.management import ManagementUtility
+
+# Define a minimal Django settings module
+settings.configure(
+    DEBUG=True,
+    INSTALLED_APPS=[
+        'django.contrib.auth',
+        'django.contrib.contenttypes',
+        'django.contrib.sessions',
+        'django.contrib.messages',
+        'django.contrib.staticfiles',
+    ],
+    ROOT_URLCONF=__name__,
+    SECRET_KEY='fake-key',
+)
+
+# Define a custom management command
+class Command(BaseCommand):
+    help = 'Test mutually exclusive group'
+
+    def add_arguments(self, parser):
+        shop = parser.add_mutually_exclusive_group(required=True)
+        shop.add_argument('--shop-id', nargs='?', type=int, default=None, dest='shop_id')
+        shop.add_argument('--shop', nargs='?', type=str, default=None, dest='shop_name')
+
+    def handle(self, *args, **options):
+        if options['shop_id'] is not None:
+            self.stdout.write(f"Shop ID: {options['shop_id']}")
+        elif options['shop_name'] is not None:
+            self.stdout.write(f"Shop Name: {options['shop_name']}")
+
+# Function to print stack trace
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Main function to reproduce the issue
+def main():
+    # Add the current directory to the system path
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+    # Initialize Django
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', __name__)
+    ManagementUtility(['']).execute()
+
+    try:
+        # Call the command with kwargs
+        call_command('command', shop_id=1)
+    except CommandError as e:
+        print_stacktrace(e)
+        raise AssertionError("call_command fails when argument of required mutually exclusive group is passed in kwargs.")
+
+if __name__ == '__main__':
+    main()
+
+
+This is the tracing and analysis history:
+
+==================================================
+The issue seems to occur when executing a Django management command using the `call_command` function in a way that does not validate mutually exclusive group arguments correctly.
+
+### Analysis of the exception traceback:
+
+1. The test script defines a custom Django management command `Command` with mutually exclusive arguments `shop_id` and `shop_name`. 
+   
+2. The test attempts to call this custom command using `call_command('command', shop_id=1)`, which fails with the error: `CommandError: Unknown command: 'command'`.
+
+3. Examining the traceback:
+   - The error occurs because the custom command `Command` defined in the script is not recognized as a registered Django command. This is because it's not being loaded properly in the context where `call_command` is being executed.
+   - The `get_commands()` call in `call_command` tries to retrieve available commands and raises a `KeyError` when it doesn't find `command`.
+
+### Observations:
+- `call_command` is expecting a registered command, which usually resides within a Django app and is discoverable via the app's configuration.
+- The testing setup does not appear to properly register the custom command as a valid Django command.
+
+Since the custom command isn't being recognized, the problem doesn't directly lie within the handling of mutually exclusive groups yet.
+
+We should focus on understanding how commands are registered and discovered to solve this registration issue first. The observed method involved in this discovery and raising the KeyError is `get_commands()` in the following context:
+
+Observed method: `django/core/management/__init__.py:get_commands`
+==================================================
+### Analysis
+
+The issue arises from using the `call_command` function to invoke a Django management command without properly registering it as part of the Django command system. In the provided test setup, the custom command `Command` is defined locally but isn't exposed to `get_commands()` in a way that Django can discover and execute it.
+
+### Observations
+
+- The test code attempts to call a command named `'command'`, which is expected to be part of the registered Django commands. However, `get_commands()` currently retrieves only built-in or configured commands located in installed apps.
+
+- The function `get_commands()` scans registered Django applications for a `management.commands` package. Custom commands must reside in a Django app's `management.commands` directory to be detected by this mechanism.
+
+### Root Cause
+
+The failure stems from trying to call a command that isn't registered. The setup doesn't provide any mechanism for it to be registered or located correctly because it's defined locally within the test script, not as part of a formal Django application structure.
+
+### Next Steps
+
+The focus should first be on correcting the setup to ensure the custom command gets properly registered or loaded before narrowing down the issue related to handling mutually exclusive group arguments.
+
+Thus, I will trace further but with significant focus on resolving the registration issue. Let's specifically examine how the command location and discovery logic might be fixed or circumvented within the context of the test setup.
+
+To achieve this, I will deep dive into how `get_commands()` pulls application configurations and determines their command structure for proper registration. 
+
+### Observed Scope
+Given the missing registration, I'll need further insight into the command discovery mechanism, particularly around how app commands are identified. 
+
+Observed scope: `django/core/management/__init__.py:69-71`
+
+This scope involves iterating through app configurations to update the `commands` dictionary, important for identifying where custom/new commands would be added. The idea is to monitor how the discovered path is dynamically handled and updated on `commands`. Thus ensuring we deduce what's missed in our testing approach and ensure proper context.
+==================================================
+### Analysis of the Current Observed Code and Abnormal Program Behavior:
+
+The runtime information shows that the custom command `'command'` is not recognized by the `call_command` function, resulting in a `KeyError` which translates into a `CommandError`. The traceback points to the attempt to call the custom command directly within the `reproduce.py` script:
+
+- The command is expected to be part of the registered Django commands, however, it isn't found. This is because the command isn't structured in a way that allows Django's command discovery mechanism to register it. 
+
+- Specifically, `get_commands()` does not include `'command'` as it scans only through properly defined Django app configurations that reside in `management.commands` directories.
+
+### Root Cause:
+
+The main issue stems from improper registration of the custom command defined in the script. The command does not live within a Django app, which is a prerequisite for the `get_commands()` function to discover it.
+
+### Deduction:
+
+In order to resolve the current issue, the custom command needs to be properly registered in a Django app context. This setup should involve creating an app with a `management/commands` directory where the command can be properly placed and subsequently discovered by Django’s `get_commands`.
+
+### Conclusion:
+
+The immediate focus should be on correcting the way the Django management command is structured and registered. The issue is not directly about the `call_command` behavior regarding kwargs for mutually exclusive groups at this point, because the command isn't even being found.
+
+Since we have identified a pivotal point of incorrect behavior within the custom test setup, let's focus our attention next on `django/core/management/__init__.py` where `call_command` is responsible for interpreting and executing commands as intended. We should verify how commands are being executed after being identified.
+
+Observed Method: `django/core/management/__init__.py:call_command`
+==================================================
+
+
+Now you choose downstream method call_command to further observe, tracing the abnormal program behavior.
+This is the method code:
+    76	def call_command(command_name, *args, **options):
+    77	    """
+    78	    Call the given command, with the given options and args/kwargs.
+    79	
+    80	    This is the primary API you should use for calling specific commands.
+    81	
+    82	    `command_name` may be a string or a command object. Using a string is
+    83	    preferred unless the command object is required for further processing or
+    84	    testing.
+    85	
+    86	    Some examples:
+    87	        call_command('migrate')
+    88	        call_command('shell', plain=True)
+    89	        call_command('sqlmigrate', 'myapp')
+    90	
+    91	        from django.core.management.commands import flush
+    92	        cmd = flush.Command()
+    93	        call_command(cmd, verbosity=0, interactive=False)
+    94	        # Do something with cmd ...
+    95	    """
+    96	    if isinstance(command_name, BaseCommand):
+    97	        # Command object passed in.
+    98	        command = command_name
+    99	        command_name = command.__class__.__module__.split('.')[-1]
+   100	    else:
+   101	        # Load the command object by name.
+   102	        try:
+   103	            app_name = get_commands()[command_name]
+   104	        except KeyError:
+   105	            raise CommandError("Unknown command: %r" % command_name)
+   106	
+   107	        if isinstance(app_name, BaseCommand):
+   108	            # If the command is already loaded, use it directly.
+   109	            command = app_name
+   110	        else:
+   111	            command = load_command_class(app_name, command_name)
+   112	
+   113	    # Simulate argument parsing to get the option defaults (see #10080 for details).
+   114	    parser = command.create_parser('', command_name)
+   115	    # Use the `dest` option name from the parser option
+   116	    opt_mapping = {
+   117	        min(s_opt.option_strings).lstrip('-').replace('-', '_'): s_opt.dest
+   118	        for s_opt in parser._actions if s_opt.option_strings
+   119	    }
+   120	    arg_options = {opt_mapping.get(key, key): value for key, value in options.items()}
+   121	    parse_args = [str(a) for a in args]
+   122	
+   123	    def get_actions(parser):
+   124	        # Parser actions and actions from sub-parser choices.
+   125	        for opt in parser._actions:
+   126	            if isinstance(opt, _SubParsersAction):
+   127	                for sub_opt in opt.choices.values():
+   128	                    yield from get_actions(sub_opt)
+   129	            else:
+   130	                yield opt
+   131	
+   132	    parser_actions = list(get_actions(parser))
+   133	    # Any required arguments which are passed in via **options must be passed
+   134	    # to parse_args().
+   135	    parse_args += [
+   136	        '{}={}'.format(min(opt.option_strings), arg_options[opt.dest])
+   137	        for opt in parser_actions if opt.required and opt.dest in options
+   138	    ]
+   139	    defaults = parser.parse_args(args=parse_args)
+   140	    defaults = dict(defaults._get_kwargs(), **arg_options)
+   141	    # Raise an error if any unknown options were passed.
+   142	    stealth_options = set(command.base_stealth_options + command.stealth_options)
+   143	    dest_parameters = {action.dest for action in parser_actions}
+   144	    valid_options = (dest_parameters | stealth_options).union(opt_mapping)
+   145	    unknown_options = set(options) - valid_options
+   146	    if unknown_options:
+   147	        raise TypeError(
+   148	            "Unknown option(s) for %s command: %s. "
+   149	            "Valid options are: %s." % (
+   150	                command_name,
+   151	                ', '.join(sorted(unknown_options)),
+   152	                ', '.join(sorted(valid_options)),
+   153	            )
+   154	        )
+   155	    # Move positional args out of options to mimic legacy optparse
+   156	    args = defaults.pop('args', ())
+   157	    if 'skip_checks' not in options:
+   158	        defaults['skip_checks'] = True
+   159	
+   160	    return command.execute(*args, **defaults)
+
+
+This is the runtime information of call_command:
+
+
+Type ' help <subcommand>' for help on a specific subcommand.
+
+Available subcommands:
+
+[auth]
+    changepassword
+    createsuperuser
+
+[contenttypes]
+    remove_stale_contenttypes
+
+[django]
+    check
+    compilemessages
+    createcachetable
+    dbshell
+    diffsettings
+    dumpdata
+    flush
+    inspectdb
+    loaddata
+    makemessages
+    makemigrations
+    migrate
+    sendtestemail
+    shell
+    showmigrations
+    sqlflush
+    sqlmigrate
+    sqlsequencereset
+    squashmigrations
+    startapp
+    startproject
+    test
+    testserver
+
+[sessions]
+    clearsessions
+
+[staticfiles]
+    collectstatic
+    findstatic
+    runserver
+Error occurred during script execution:call_command fails when argument of required mutually exclusive group is passed in kwargs.
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py
+New var:....... __name__ = 'django.core.management'
+New var:....... __doc__ = None
+New var:....... __package__ = 'django.core.management'
+New var:....... __loader__ = <_frozen_importlib_external.SourceFileLoader object at 0x7feedf8634e0>
+New var:....... __spec__ = ModuleSpec(name='django.core.management', loader...ed/django__django-11749/django/core/management'])
+New var:....... __path__ = ['/data/swe-fl/TMP/testbed/django__django-11749/django/core/management']
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py'
+New var:....... __cached__ = '/data/swe-fl/TMP/testbed/django__django-11749/d...e/management/__pycache__/__init__.cpython-36.pyc'
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... functools = <module 'functools' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/functools.py'>
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/os.py'>
+New var:....... pkgutil = <module 'pkgutil' from '/root/miniforge3/envs/django__django__3.0/lib/python3.6/pkgutil.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... _SubParsersAction = <class 'argparse._SubParsersAction'>
+New var:....... defaultdict = <class 'collections.defaultdict'>
+New var:....... get_close_matches = <function get_close_matches at 0x7feedf7fe378>
+New var:....... import_module = <function import_module at 0x7feedfae9a60>
+New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-11749/django/__init__.py'>
+New var:....... apps = <django.apps.registry.Apps object at 0x7feedf8060f0>
+New var:....... settings = <LazySettings [Unevaluated]>
+New var:....... ImproperlyConfigured = <class 'django.core.exceptions.ImproperlyConfigured'>
+New var:....... color = <module 'django.core.management.color' from '/da...o__django-11749/django/core/management/color.py'>
+New var:....... base = <module 'django.core.management.base' from '/dat...go__django-11749/django/core/management/base.py'>
+New var:....... BaseCommand = <class 'django.core.management.base.BaseCommand'>
+New var:....... CommandError = <class 'django.core.management.base.CommandError'>
+New var:....... CommandParser = <class 'django.core.management.base.CommandParser'>
+New var:....... handle_default_options = <function handle_default_options at 0x7feedf768840>
+New var:....... color_style = <function color_style at 0x7feedf30c268>
+New var:....... autoreload = <module 'django.utils.autoreload' from '/data/sw...django__django-11749/django/utils/autoreload.py'>
+New var:....... find_commands = <function find_commands at 0x7feedf862d08>
+New var:....... load_command_class = <function load_command_class at 0x7feedf30c598>
+New var:....... get_commands = <functools._lru_cache_wrapper object at 0x7feedf311198>
+ line        76 def call_command(command_name, *args, **options):
+Starting var:.. command_name = 'command'
+Starting var:.. args = ()
+Starting var:.. options = {'shop_id': 1}
+ call        76 def call_command(command_name, *args, **options):
+ line        96     if isinstance(command_name, BaseCommand):
+ line       102         try:
+ line       103             app_name = get_commands()[command_name]
+ exception  103             app_name = get_commands()[command_name]
+Exception:..... KeyError: 'command'
+New var:....... command_name = 'command'
+New var:....... args = ()
+New var:....... options = {'shop_id': 1}
+ line       104         except KeyError:
+ line       105             raise CommandError("Unknown command: %r" % command_name)
+ exception  105             raise CommandError("Unknown command: %r" % command_name)
+Exception:..... django.core.management.base.CommandError: Unknown command: 'command'
+New var:....... command_name = 'command'
+New var:....... args = ()
+New var:....... options = {'shop_id': 1}
+Call ended by exception
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-11749/reproduce.py"
+    60: call_command('command', shop_id=1)
+  File "/data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py"
+    105: raise CommandError("Unknown command: %r" % command_name)
+CommandError: Unknown command: 'command'
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py", line 103, in call_command
+    app_name = get_commands()[command_name]
+KeyError: 'command'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data/swe-fl/TMP/testbed/django__django-11749/reproduce.py", line 60, in main
+    call_command('command', shop_id=1)
+  File "/data/swe-fl/TMP/testbed/django__django-11749/django/core/management/__init__.py", line 105, in call_command
+    raise CommandError("Unknown command: %r" % command_name)
+django.core.management.base.CommandError: Unknown command: 'command'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.0/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-11749/reproduce.py", line 66, in <module>
+    main()
+  File "/data/swe-fl/TMP/testbed/django__django-11749/reproduce.py", line 63, in main
+    raise AssertionError("call_command fails when argument of required mutually exclusive group is passed in kwargs.")
+AssertionError: call_command fails when argument of required mutually exclusive group is passed in kwargs.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

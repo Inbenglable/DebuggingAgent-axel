@@ -1,0 +1,324 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+loaddata crashes on SQLite when table names are SQL keywords.
+Description
+	
+Steps to reproduce:
+Create a Model called Order. (order is a SQL reserved word)
+Create fixtures for the model
+Use manage.py loaddata to load the fixture.
+Notice that it fails with the following error. This is because the table name order is not quoted properly
+(0.000) PRAGMA foreign_key_check(order); args=None
+Traceback (most recent call last):
+ File "python3.7/site-packages/django/db/backends/utils.py", line 82, in _execute
+	return self.cursor.execute(sql)
+ File "python3.7/site-packages/django/db/backends/sqlite3/base.py", line 411, in execute
+	return Database.Cursor.execute(self, query)
+sqlite3.OperationalError: near "order": syntax error
+Root Cause
+File: python3.7/site-packages/django/db/backends/sqlite3/base.py line 327
+Function: check_constraints
+Details: due to missing back ticks around %s in the SQL statement PRAGMA foreign_key_check(%s)
+Here in check_constraints line 327 in context
+				if table_names is None:
+					violations = cursor.execute('PRAGMA foreign_key_check').fetchall()
+				else:
+					violations = chain.from_iterable(
+						cursor.execute('PRAGMA foreign_key_check(%s)' % table_name).fetchall()
+						for table_name in table_names
+					)
+And here line 333
+				for table_name, rowid, referenced_table_name, foreign_key_index in violations:
+					foreign_key = cursor.execute(
+						'PRAGMA foreign_key_list(%s)' % table_name
+					).fetchall()[foreign_key_index]
+Issue confirmed in
+3.1.0
+3.1.2
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+import django
+from django.core.management import call_command
+from django.db import models
+from django.conf import settings
+from django.test.utils import setup_test_environment, teardown_test_environment
+
+# Define a minimal Django settings module
+settings.configure(
+    DEBUG=True,
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': 'test_db.sqlite3',
+        }
+    },
+    INSTALLED_APPS=[
+        'django.contrib.contenttypes',
+        'django.contrib.auth',
+        'test_app',
+    ],
+    SECRET_KEY='fake-key',
+)
+
+# Set up Django
+django.setup()
+setup_test_environment()
+
+# Define a test app with a model named Order
+class Order(models.Model):
+    name = models.CharField(max_length=100)
+
+# Create a test app configuration
+class TestAppConfig(models.AppConfig):
+    name = 'test_app'
+    models_module = sys.modules[__name__]
+
+# Register the test app
+apps = django.apps.apps
+apps.register_app_configs('test_app', TestAppConfig('test_app'))
+
+# Create the database tables
+call_command('migrate', verbosity=0)
+
+# Define the print_stacktrace function
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Create a fixture file for the Order model
+fixture_path = 'order_fixture.json'
+with open(fixture_path, 'w') as f:
+    f.write('['
+            '{"model": "test_app.order", "pk": 1, "fields": {"name": "Test Order"}}'
+            ']')
+
+# Try to load the fixture and catch the exception
+try:
+    call_command('loaddata', fixture_path, verbosity=0)
+    # If no exception is raised, the issue is fixed
+    print("The issue is fixed.")
+    sys.exit(0)
+except Exception as e:
+    # Print the stack trace and raise an AssertionError
+    print_stacktrace(e)
+    raise AssertionError("loaddata crashes on SQLite when table names are SQL keywords.")
+finally:
+    # Clean up
+    os.remove(fixture_path)
+    teardown_test_environment()
+
+This is the corresponding output and runtime information:
+Error occurred during script execution:No module named 'test_app'
+
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13807/reproduce.py
+    Starting var:.. __name__ = '__main__'
+    Starting var:.. __doc__ = None
+    Starting var:.. __package__ = ''
+    Starting var:.. __loader__ = None
+    Starting var:.. __spec__ = None
+    Starting var:.. __file__ = '/data/swe-fl/TMP/testbed/django__django-13807/reproduce.py'
+    Starting var:.. __cached__ = None
+    Starting var:.. __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+     call         1 import os
+     line         1 import os
+    New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/os.py'>
+     line         2 import sys
+    New var:....... sys = <module 'sys' (built-in)>
+     line         3 import traceback
+    New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py'>
+     line         4 import django
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f7be2cf5030>
+        Return value:.. <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13807/django/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13807/reproduce.py
+    New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13807/django/__init__.py'>
+     line         5 from django.core.management import call_command
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.core.management'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f7be2cf5030>
+        Return value:.. <module 'django.core.management' from '/data/swe...django-13807/django/core/management/__init__.py'>
+        Starting var:.. module = <module 'django.core.management' from '/data/swe...django-13807/django/core/management/__init__.py'>
+        Starting var:.. fromlist = ('call_command',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'call_command'
+        Return value:.. <module 'django.core.management' from '/data/swe...django-13807/django/core/management/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13807/reproduce.py
+    New var:....... call_command = <function call_command at 0x7f7be1ef2e18>
+     line         6 from django.db import models
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-13807/django/db/__init__.py'>
+        Starting var:.. fromlist = ('models',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'models'
+        New var:....... from_name = 'django.db.models'
+        Return value:.. <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-13807/django/db/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13807/reproduce.py
+    New var:....... models = <module 'django.db.models' from '/data/swe-fl/TM...ango__django-13807/django/db/models/__init__.py'>
+     line         7 from django.conf import settings
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-13807/django/conf/__init__.py'>
+        Starting var:.. fromlist = ('settings',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'settings'
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-13807/django/conf/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13807/reproduce.py
+    New var:....... settings = <LazySettings [Unevaluated]>
+     line         8 from django.test.utils import setup_test_environment, teardown_test_environment
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.test.utils'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7f7be2cf5030>
+        Return value:.. <module 'django.test.utils' from '/data/swe-fl/T...stbed/django__django-13807/django/test/utils.py'>
+        Starting var:.. module = <module 'django.test.utils' from '/data/swe-fl/T...stbed/django__django-13807/django/test/utils.py'>
+        Starting var:.. fromlist = ('setup_test_environment', 'teardown_test_environment')
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        Return value:.. <module 'django.test.utils' from '/data/swe-fl/T...stbed/django__django-13807/django/test/utils.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13807/reproduce.py
+    New var:....... setup_test_environment = <function setup_test_environment at 0x7f7be11ea9d8>
+    New var:....... teardown_test_environment = <function teardown_test_environment at 0x7f7be11eaa60>
+     line        11 settings.configure(
+     line        12     DEBUG=True,
+     line        14         'default': {
+     line        15             'ENGINE': 'django.db.backends.sqlite3',
+     line        16             'NAME': 'test_db.sqlite3',
+     line        20         'django.contrib.contenttypes',
+     line        21         'django.contrib.auth',
+     line        22         'test_app',
+     line        24     SECRET_KEY='fake-key',
+        Source path:... /data/swe-fl/TMP/testbed/django__django-13807/django/conf/__init__.py
+        Starting var:.. self = <LazySettings [Unevaluated]>
+        Starting var:.. default_settings = <module 'django.conf.global_settings' from '/dat...go__django-13807/django/conf/global_settings.py'>
+        Starting var:.. options = {'DEBUG': True, 'DATABASES': {'default': {'ENGIN...rib.auth', 'test_app'], 'SECRET_KEY': 'fake-key'}
+         call       112     def configure(self, default_settings=global_settings, **options):
+         line       118         if self._wrapped is not empty:
+         line       120         holder = UserSettingsHolder(default_settings)
+        New var:....... holder = <UserSettingsHolder>
+         line       121         for name, value in options.items():
+        New var:....... name = 'DEBUG'
+        New var:....... value = True
+         line       122             if not name.isupper():
+         line       124             setattr(holder, name, value)
+         line       121         for name, value in options.items():
+        Modified var:.. name = 'DATABASES'
+        Modified var:.. value = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': 'test_db.sqlite3'}}
+         line       122             if not name.isupper():
+         line       124             setattr(holder, name, value)
+         line       121         for name, value in options.items():
+        Modified var:.. name = 'INSTALLED_APPS'
+        Modified var:.. value = ['django.contrib.contenttypes', 'django.contrib.auth', 'test_app']
+         line       122             if not name.isupper():
+         line       124             setattr(holder, name, value)
+         line       121         for name, value in options.items():
+        Modified var:.. name = 'SECRET_KEY'
+        Modified var:.. value = 'fake-key'
+         line       122             if not name.isupper():
+         line       124             setattr(holder, name, value)
+         line       121         for name, value in options.items():
+         line       125         self._wrapped = holder
+        Modified var:.. self = <LazySettings "None">
+         return     125         self._wrapped = holder
+        Return value:.. None
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13807/reproduce.py
+    Modified var:.. settings = <LazySettings "None">
+     line        28 django.setup()
+        Source path:... /data/swe-fl/TMP/testbed/django__django-13807/django/__init__.py
+        Starting var:.. set_prefix = True
+         call         8 def setup(set_prefix=True):
+         line        14     from django.apps import apps
+        New var:....... apps = <django.apps.registry.Apps object at 0x7f7be20a5a20>
+         line        15     from django.conf import settings
+        New var:....... settings = <LazySettings "None">
+         line        16     from django.urls import set_script_prefix
+        New var:....... set_script_prefix = <function set_script_prefix at 0x7f7be19d80d0>
+         line        17     from django.utils.log import configure_logging
+        New var:....... configure_logging = <function configure_logging at 0x7f7be16c7b70>
+         line        19     configure_logging(settings.LOGGING_CONFIG, settings.LOGGING)
+         line        20     if set_prefix:
+         line        21         set_script_prefix(
+         line        22             '/' if settings.FORCE_SCRIPT_NAME is None else settings.FORCE_SCRIPT_NAME
+         line        24     apps.populate(settings.INSTALLED_APPS)
+         exception   24     apps.populate(settings.INSTALLED_APPS)
+        Exception:..... ModuleNotFoundError: No module named 'test_app'
+    Call ended by exception
+Source path:... /data/swe-fl/TMP/testbed/django__django-13807/reproduce.py
+ exception   28 django.setup()
+Exception:..... ModuleNotFoundError: No module named 'test_app'
+New var:....... __name__ = '__main__'
+New var:....... __doc__ = None
+New var:....... __package__ = ''
+New var:....... __loader__ = None
+New var:....... __spec__ = None
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-13807/reproduce.py'
+New var:....... __cached__ = None
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/os.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py'>
+New var:....... django = <module 'django' from '/data/swe-fl/TMP/testbed/django__django-13807/django/__init__.py'>
+New var:....... call_command = <function call_command at 0x7f7be1ef2e18>
+New var:....... models = <module 'django.db.models' from '/data/swe-fl/TM...ango__django-13807/django/db/models/__init__.py'>
+New var:....... settings = <LazySettings "None">
+New var:....... setup_test_environment = <function setup_test_environment at 0x7f7be11ea9d8>
+New var:....... teardown_test_environment = <function teardown_test_environment at 0x7f7be11eaa60>
+Call ended by exception
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-13807/reproduce.py", line 28, in <module>
+    django.setup()
+  File "/data/swe-fl/TMP/testbed/django__django-13807/django/__init__.py", line 24, in setup
+    apps.populate(settings.INSTALLED_APPS)
+  File "/data/swe-fl/TMP/testbed/django__django-13807/django/apps/registry.py", line 91, in populate
+    app_config = AppConfig.create(entry)
+  File "/data/swe-fl/TMP/testbed/django__django-13807/django/apps/config.py", line 224, in create
+    import_module(entry)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/importlib/__init__.py", line 126, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+  File "<frozen importlib._bootstrap>", line 994, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 971, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 953, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'test_app'
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:  
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

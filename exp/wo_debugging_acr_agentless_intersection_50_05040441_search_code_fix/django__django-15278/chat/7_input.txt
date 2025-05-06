@@ -1,0 +1,248 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+To start resolving the issue, I need to understand how `OneToOneField` is implemented in Django's codebase, especially in the context of handling SQLite databases since the error is SQLite-specific.
+
+Considering this, I need to search for the implementation of the `OneToOneField` in Django's codebase to understand how it's handled. Specifically, I want to review how Django's migration framework handles alter table commands on SQLite to add unique constraints.
+
+I'll start by looking into the `OneToOneField` implementation and its related logic in Django.
+
+```python
+search_method_in_codebase("OneToOneField.__init__")
+search_class_in_codebase("OneToOneField")
+```
+
+Following this, if needed, I might need to investigate Django's SQLite3 backend to see if there are specific logic paths dealing with field additions in migrations that translate to SQLite syntax, but for now, I'll focus on `OneToOneField`.
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("OneToOneField.__init__")
+RESULT:
+#### django/db/models/fields/related.py:OneToOneField.__init__
+```python
+    def __init__(self, to, on_delete, to_field=None, **kwargs):
+        kwargs['unique'] = True
+        super().__init__(to, on_delete, to_field=to_field, **kwargs)
+
+```
+
+
+### API INVOKE: search_class_in_codebase("OneToOneField")
+RESULT:
+#### django/db/models/fields/related.py:OneToOneField
+```python
+class OneToOneField(ForeignKey):
+    """
+    A OneToOneField is essentially the same as a ForeignKey, with the exception
+    that it always carries a "unique" constraint with it and the reverse
+    relation always returns the object pointed to (since there will only ever
+    be one), rather than returning a list.
+    """
+
+    # Field flags
+    many_to_many = False
+    many_to_one = False
+    one_to_many = False
+    one_to_one = True
+
+    related_accessor_class = ReverseOneToOneDescriptor
+    forward_related_accessor_class = ForwardOneToOneDescriptor
+    rel_class = OneToOneRel
+
+    description = _("One-to-one relationship")
+
+    def __init__(self, to, on_delete, to_field=None, **kwargs):
+        ...
+
+    def deconstruct(self):
+        ...
+
+    def formfield(self, **kwargs):
+        ...
+
+    def save_form_data(self, instance, data):
+        ...
+
+    def _check_unique(self, **kwargs):
+        ...
+```
+
+
+==================================================
+
+Your Output:
+```python
+search_method_in_file("django/db/backends/sqlite3/schema.py", "add_field")
+search_method_in_file("django/db/backends/sqlite3/schema.py", "alter_field")
+search_class_in_file("django/db/backends/sqlite3/schema.py", "SQLiteSchemaEditor")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("django/db/backends/sqlite3/schema.py", "add_field")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """Create a field on a model."""
+        # Fields with default values cannot by handled by ALTER TABLE ADD
+        # COLUMN statement because DROP DEFAULT is not supported in
+        # ALTER TABLE.
+        if not field.null or self.effective_default(field) is not None:
+            self._remake_table(model, create_field=field)
+        else:
+            super().add_field(model, field)
+
+```
+
+
+### API INVOKE: search_method_in_file("django/db/backends/sqlite3/schema.py", "alter_field")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.alter_field
+```python
+    def alter_field(self, model, old_field, new_field, strict=False):
+        if not self._field_should_be_altered(old_field, new_field):
+            return
+        old_field_name = old_field.name
+        table_name = model._meta.db_table
+        _, old_column_name = old_field.get_attname_column()
+        if (new_field.name != old_field_name and
+                not self.connection.features.supports_atomic_references_rename and
+                self._is_referenced_by_fk_constraint(table_name, old_column_name, ignore_self=True)):
+            if self.connection.in_atomic_block:
+                raise NotSupportedError((
+                    'Renaming the %r.%r column while in a transaction is not '
+                    'supported on SQLite < 3.26 because it would break referential '
+                    'integrity. Try adding `atomic = False` to the Migration class.'
+                ) % (model._meta.db_table, old_field_name))
+            with atomic(self.connection.alias):
+                super().alter_field(model, old_field, new_field, strict=strict)
+                # Follow SQLite's documented procedure for performing changes
+                # that don't affect the on-disk content.
+                # https://sqlite.org/lang_altertable.html#otheralter
+                with self.connection.cursor() as cursor:
+                    schema_version = cursor.execute('PRAGMA schema_version').fetchone()[0]
+                    cursor.execute('PRAGMA writable_schema = 1')
+                    references_template = ' REFERENCES "%s" ("%%s") ' % table_name
+                    new_column_name = new_field.get_attname_column()[1]
+                    search = references_template % old_column_name
+                    replacement = references_template % new_column_name
+                    cursor.execute('UPDATE sqlite_master SET sql = replace(sql, %s, %s)', (search, replacement))
+                    cursor.execute('PRAGMA schema_version = %d' % (schema_version + 1))
+                    cursor.execute('PRAGMA writable_schema = 0')
+                    # The integrity check will raise an exception and rollback
+                    # the transaction if the sqlite_master updates corrupt the
+                    # database.
+                    cursor.execute('PRAGMA integrity_check')
+            # Perform a VACUUM to refresh the database representation from
+            # the sqlite_master table.
+            with self.connection.cursor() as cursor:
+                cursor.execute('VACUUM')
+        else:
+            super().alter_field(model, old_field, new_field, strict=strict)
+
+```
+
+
+==================================================
+
+Your Output:
+To resolve the issue, we need to address the problem of adding a nullable `OneToOneField` to an existing table in SQLite, which currently crashes due to the attempt to add a UNIQUE column using the `ALTER TABLE ADD COLUMN` statement. 
+
+The code from `DatabaseSchemaEditor.add_field` shows that when a field with a non-null default value is added, the table is remade entirely to accommodate it. This remake involves creating a new table with the desired schema and migrating data over, rather than attempting an `ALTER TABLE` operation.
+
+To fix the issue, we need to modify the `add_field` method to handle nullable `OneToOneField` operations similarly—by remaking the table rather than adding a column directly, thus bypassing the SQLite restriction on adding unique columns in place.
+
+I will retrieve the source code of `DatabaseSchemaEditor.add_field` method to proceed with generating the patch to fix this issue.
+
+```python
+search_method_in_file("django/db/backends/sqlite3/schema.py", "add_field")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("django/db/backends/sqlite3/schema.py", "add_field")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """Create a field on a model."""
+        # Fields with default values cannot by handled by ALTER TABLE ADD
+        # COLUMN statement because DROP DEFAULT is not supported in
+        # ALTER TABLE.
+        if not field.null or self.effective_default(field) is not None:
+            self._remake_table(model, create_field=field)
+        else:
+            super().add_field(model, field)
+
+```
+
+
+==================================================
+
+Your Output:
+Ready generation: `True`
+==================================================
+
+Now, you need to generate patches to resolve the issue. Please ensure that your patch does not disrupt the original functionality of the code.
+You should generate *SEARCH/REPLACE* format patches to fix the issue.
+Every *SEARCH/REPLACE* edit must use this format:
+```pythony
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+
+A final json reply example:
+```json
+{
+  "search_replace_edits": [
+    "### A/B.py\n<<<<<<< SEARCH
+       def foo():\n=======\n    def bar():\n>>>>>>> REPLACE\n",
+    "### A/B.py\n<<<<<<< SEARCH
+       x = x + 1\n=======\n    x = x - 1\n>>>>>>> REPLACE\n",
+}
+```
+
+

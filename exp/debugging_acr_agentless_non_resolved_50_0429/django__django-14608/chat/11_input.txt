@@ -1,0 +1,326 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Add `nonform` CSS class for non form errors in FormSets
+Description
+	 
+		(last modified by Ties Jan Hefting)
+	 
+Forms add the nonfield CSS class for non field errors in ErrorList instances. This is documented in a section on ​rendering form error messages. Similarly, in FormSets I'd expect to see the nonform CSS class added for non form errors. This would allow a custom ErrorList to make a distinction in form field errors, non field errors (forms) and non form errors (FormSets) when rendering error messages. Therefore I'd suggest to add this nonform CSS class and document it for developers to use.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import traceback
+import sys
+import django
+from django import forms
+from django.forms.formsets import formset_factory, BaseFormSet
+from django.forms.utils import ErrorList
+from django.conf import settings
+
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Configure minimal Django settings
+settings.configure(
+    DEBUG=True,
+    USE_I18N=True,
+    INSTALLED_APPS=[
+        'django.forms',
+    ],
+)
+
+# Initialize Django
+django.setup()
+
+class MyForm(forms.Form):
+    name = forms.CharField()
+
+class BaseMyFormSet(BaseFormSet):
+    def clean(self):
+        super().clean()
+        if any(self.errors):
+            return
+        raise forms.ValidationError("Non-form error")
+
+MyFormSet = formset_factory(MyForm, formset=BaseMyFormSet, extra=1)
+
+def main():
+    formset = MyFormSet(data={})
+    if formset.is_valid():
+        print("FormSet is valid, no errors to check.")
+        return
+
+    # Check if non-form errors have the 'nonform' CSS class
+    non_form_errors = formset.non_form_errors()
+    if not non_form_errors:
+        print("No non-form errors found.")
+        return
+
+    # Check if the ErrorList has the 'nonform' CSS class
+    if not isinstance(non_form_errors, ErrorList) or 'nonform' not in non_form_errors.as_ul():
+        e = AssertionError("Non-form errors do not have the 'nonform' CSS class.")
+        print_stacktrace(e)
+        raise e
+
+    print("Issue is fixed: Non-form errors have the 'nonform' CSS class.")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+This is the tracing and analysis history:
+
+==================================================
+Based on the provided test code, we know the issue is related to handling non-form errors within a `FormSet` in Django. The Django framework attaches a specific CSS class for non-field errors inside a form, but it appears not to do the same for non-form errors in a formset as expected. 
+
+Here's what we're seeing in the test setup:
+
+1. A minimal Django settings configuration is made, focusing on the forms app.
+2. `django.setup()` is called to initialize Django.
+3. A custom form and formset are created. The formset is designed to raise a non-form error.
+4. The test checks if the non-form errors have a 'nonform' CSS class and this leads to a failure, indicating the missing functionality.
+
+From this analysis, the issue likely lies within the Django formset error handling logic, specifically how it attaches CSS classes to non-form errors.
+
+Next, I will observe the creation of the formset, as this will give us insight into where errors are being processed.
+
+Observed method: `django/forms/formsets.py:formset_factory`
+==================================================
+The current analysis suggests that the issue lies within the handling of non-form errors in FormSets, specifically their CSS class decoration. In Django's `formset_factory`, a formset class is dynamically created with the given parameters and attributes. This part of the code is responsible for configuring the FormSet's behavior and attributes but does not deal directly with error handling or CSS class assignment.
+
+To locate the specific method where the 'nonform' CSS class should be applied to non-form errors, it would be useful to trace further into how non-form errors are generated and processed in the formset.
+
+Since the current information points to the main issue existing beyond merely setting up the FormSet, I am interested in further exploring the error handling specifically for FormSets.
+
+Therefore, the next step is to examine the methods responsible for error processing in FormSets. A likely candidate for this deeper observation would be the methods dealing with the cleaning process and error assignment in FormSets (possibly within the BaseFormSet class).
+
+Observed scope: `django/forms/formsets.py:BaseFormSet:Lin121-Lin191` (illustrative reference for accessing error handling in the BaseFormSet class)
+==================================================
+## Analysis of Current Observed Code and Abnormal Behavior
+
+The current trace indicates that the issue lies within the `BaseFormSet` class, specifically in the process of handling non-form errors. The `full_clean()` method is responsible for collecting errors, both related and non-related to individual forms.
+
+The trace shows the following steps:
+
+- In `full_clean()`, when the `ValidationError` is raised (either by `management_form` errors or manual checks in `clean()`), it appends errors to the `_non_form_errors` list using the given ErrorList class.
+- However, this ErrorList doesn't have the specific 'nonform' CSS class.
+- When accessing `self._non_form_errors`, it doesn’t apply or check any CSS class, causing the `AssertionError` in the reproducible test script.
+
+The defect appears to be in `full_clean()` when it initializes the `_non_form_errors`. It uses the `error_class`, which is intended for appending errors but doesn't add a specific 'nonform' CSS class.
+
+## Root Cause Indication
+
+The problem seems to stem from the part where the non-form errors are appended to `_non_form_errors` in `full_clean()`. The initialization or appending method doesn't ensure the 'nonform' CSS class is assigned.
+
+## Next Steps
+
+We need to examine the part of `full_clean()` where `_non_form_errors` is assigned and modified, to ensure that it appropriately applies the 'nonform' CSS class to the errors.
+
+Therefore, the run-time information of the scope that handles the population of non-form errors should be observed deeper, to understand precisely why the CSS class isn't being added.
+
+---
+
+Observed scope: `django/forms/formsets.py:full_clean:Lin333-Lin384`
+==================================================
+
+
+Now you choose downstream method BaseFormSet.full_clean to further observe, tracing the abnormal program behavior.
+This is the method code:
+   330	    def full_clean(self):
+   331	        """
+   332	        Clean all of self.data and populate self._errors and
+   333	        self._non_form_errors.
+   334	        """
+   335	        self._errors = []
+   336	        self._non_form_errors = self.error_class()
+   337	        empty_forms_count = 0
+   338	
+   339	        if not self.is_bound:  # Stop further processing.
+   340	            return
+   341	
+   342	        if not self.management_form.is_valid():
+   343	            error = ValidationError(
+   344	                self.error_messages['missing_management_form'],
+   345	                params={
+   346	                    'field_names': ', '.join(
+   347	                        self.management_form.add_prefix(field_name)
+   348	                        for field_name in self.management_form.errors
+   349	                    ),
+   350	                },
+   351	                code='missing_management_form',
+   352	            )
+   353	            self._non_form_errors.append(error)
+   354	
+   355	        for i, form in enumerate(self.forms):
+   356	            # Empty forms are unchanged forms beyond those with initial data.
+   357	            if not form.has_changed() and i >= self.initial_form_count():
+   358	                empty_forms_count += 1
+   359	            # Accessing errors calls full_clean() if necessary.
+   360	            # _should_delete_form() requires cleaned_data.
+   361	            form_errors = form.errors
+   362	            if self.can_delete and self._should_delete_form(form):
+   363	                continue
+   364	            self._errors.append(form_errors)
+   365	        try:
+   366	            if (self.validate_max and
+   367	                    self.total_form_count() - len(self.deleted_forms) > self.max_num) or \
+   368	                    self.management_form.cleaned_data[TOTAL_FORM_COUNT] > self.absolute_max:
+   369	                raise ValidationError(ngettext(
+   370	                    "Please submit at most %d form.",
+   371	                    "Please submit at most %d forms.", self.max_num) % self.max_num,
+   372	                    code='too_many_forms',
+   373	                )
+   374	            if (self.validate_min and
+   375	                    self.total_form_count() - len(self.deleted_forms) - empty_forms_count < self.min_num):
+   376	                raise ValidationError(ngettext(
+   377	                    "Please submit at least %d form.",
+   378	                    "Please submit at least %d forms.", self.min_num) % self.min_num,
+   379	                    code='too_few_forms')
+   380	            # Give self.clean() a chance to do cross-form validation.
+   381	            self.clean()
+   382	        except ValidationError as e:
+   383	            self._non_form_errors = self.error_class(e.error_list)
+
+
+This is the runtime information of BaseFormSet.full_clean:
+
+Error occurred during script execution:Non-form errors do not have the 'nonform' CSS class.
+
+Source path:... /data/swe-fl/TMP/testbed/django__django-14608/django/forms/formsets.py
+New var:....... __module__ = 'django.forms.formsets'
+New var:....... __qualname__ = 'BaseFormSet'
+New var:....... __doc__ = '\n    A collection of instances of the same Form class.\n    '
+New var:....... ordering_widget = <class 'django.forms.widgets.NumberInput'>
+New var:....... default_error_messages = REPR FAILED
+New var:....... __init__ = <function BaseFormSet.__init__ at 0x7fb21e55c820>
+New var:....... __str__ = <function BaseFormSet.__str__ at 0x7fb21e55c8b0>
+New var:....... __iter__ = <function BaseFormSet.__iter__ at 0x7fb21e55c940>
+New var:....... __getitem__ = <function BaseFormSet.__getitem__ at 0x7fb21e55c9d0>
+New var:....... __len__ = <function BaseFormSet.__len__ at 0x7fb21e55ca60>
+New var:....... __bool__ = <function BaseFormSet.__bool__ at 0x7fb21e55caf0>
+New var:....... management_form = <django.utils.functional.cached_property object at 0x7fb21e560f10>
+New var:....... total_form_count = <function BaseFormSet.total_form_count at 0x7fb21e55cc10>
+New var:....... initial_form_count = <function BaseFormSet.initial_form_count at 0x7fb21e55cca0>
+New var:....... forms = <django.utils.functional.cached_property object at 0x7fb21e560f70>
+New var:....... get_form_kwargs = <function BaseFormSet.get_form_kwargs at 0x7fb21e55cdc0>
+New var:....... _construct_form = <function BaseFormSet._construct_form at 0x7fb21e55ce50>
+New var:....... initial_forms = <property object at 0x7fb21e4e3d10>
+New var:....... extra_forms = <property object at 0x7fb21e4e3d60>
+New var:....... empty_form = <property object at 0x7fb21e4e3db0>
+New var:....... cleaned_data = <property object at 0x7fb21e4e3e00>
+New var:....... deleted_forms = <property object at 0x7fb21e4e3e50>
+New var:....... ordered_forms = <property object at 0x7fb21e4e3ea0>
+New var:....... get_default_prefix = <classmethod object at 0x7fb21e560fd0>
+New var:....... get_ordering_widget = <classmethod object at 0x7fb21e4e9040>
+New var:....... non_form_errors = <function BaseFormSet.non_form_errors at 0x7fb21e4e83a0>
+New var:....... errors = <property object at 0x7fb21e4e3ef0>
+New var:....... total_error_count = <function BaseFormSet.total_error_count at 0x7fb21e4e84c0>
+New var:....... _should_delete_form = <function BaseFormSet._should_delete_form at 0x7fb21e4e8550>
+New var:....... is_valid = <function BaseFormSet.is_valid at 0x7fb21e4e85e0>
+ line       330     def full_clean(self):
+Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7fb21e010dc0>
+ call       330     def full_clean(self):
+ line       335         self._errors = []
+ line       336         self._non_form_errors = self.error_class()
+ line       337         empty_forms_count = 0
+New var:....... empty_forms_count = 0
+ line       339         if not self.is_bound:  # Stop further processing.
+ line       342         if not self.management_form.is_valid():
+ line       343             error = ValidationError(
+ line       344                 self.error_messages['missing_management_form'],
+ line       346                     'field_names': ', '.join(
+ line       348                         for field_name in self.management_form.errors
+ line       346                     'field_names': ', '.join(
+    Starting var:.. .0 = <dict_keyiterator object at 0x7fb21df65ea0>
+    Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7fb21e010dc0>
+     call       346                     'field_names': ', '.join(
+     line       346                     'field_names': ', '.join(
+     line       348                         for field_name in self.management_form.errors
+    New var:....... field_name = 'TOTAL_FORMS'
+     line       347                         self.management_form.add_prefix(field_name)
+     return     347                         self.management_form.add_prefix(field_name)
+    Return value:.. 'form-TOTAL_FORMS'
+    Starting var:.. .0 = <dict_keyiterator object at 0x7fb21df65ea0>
+    Starting var:.. field_name = 'TOTAL_FORMS'
+    Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7fb21e010dc0>
+     call       347                         self.management_form.add_prefix(field_name)
+     line       346                     'field_names': ', '.join(
+     line       348                         for field_name in self.management_form.errors
+    Modified var:.. field_name = 'INITIAL_FORMS'
+     line       347                         self.management_form.add_prefix(field_name)
+     return     347                         self.management_form.add_prefix(field_name)
+    Return value:.. 'form-INITIAL_FORMS'
+    Starting var:.. .0 = <dict_keyiterator object at 0x7fb21df65ea0>
+    Starting var:.. field_name = 'INITIAL_FORMS'
+    Starting var:.. self = <django.forms.formsets.MyFormFormSet object at 0x7fb21e010dc0>
+     call       347                         self.management_form.add_prefix(field_name)
+     line       346                     'field_names': ', '.join(
+     return     346                     'field_names': ', '.join(
+    Return value:.. None
+ line       345                 params={
+ line       351                 code='missing_management_form',
+ line       343             error = ValidationError(
+New var:....... error = ValidationError(['ManagementForm data is missing...ed to file a bug report if the issue persists.'])
+ line       353             self._non_form_errors.append(error)
+ line       355         for i, form in enumerate(self.forms):
+ line       365         try:
+ line       366             if (self.validate_max and
+ line       368                     self.management_form.cleaned_data[TOTAL_FORM_COUNT] > self.absolute_max:
+ line       366             if (self.validate_max and
+ line       374             if (self.validate_min and
+ line       381             self.clean()
+ exception  381             self.clean()
+Exception:..... django.core.exceptions.ValidationError: ['Non-form error']
+New var:....... self = <django.forms.formsets.MyFormFormSet object at 0x7fb21e010dc0>
+New var:....... empty_forms_count = 0
+New var:....... error = ValidationError(['ManagementForm data is missing...ed to file a bug report if the issue persists.'])
+ line       382         except ValidationError as e:
+New var:....... e = ValidationError(['Non-form error'])
+ line       383             self._non_form_errors = self.error_class(e.error_list)
+ return     383             self._non_form_errors = self.error_class(e.error_list)
+Return value:.. None
+Traceback (most recent call last):
+AssertionError: Non-form errors do not have the 'nonform' CSS class.
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__4.0/lib/python3.8/runpy.py", line 265, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/root/miniforge3/envs/django__django__4.0/lib/python3.8/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/root/miniforge3/envs/django__django__4.0/lib/python3.8/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-14608/reproduce.py", line 65, in <module>
+    sys.exit(main())
+  File "/data/swe-fl/TMP/testbed/django__django-14608/reproduce.py", line 59, in main
+    raise e
+AssertionError: Non-form errors do not have the 'nonform' CSS class.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by telling me the code line scope that you want to deeper observe, we will show you the deeper downstream run-time information of the scope you select. Please reply with:
+Observed scope: `{FILE_PATH}:{START_LOC}-{END_LOC}`
+Note that {FILE_PATH} refers to the path relative to the repository.
+

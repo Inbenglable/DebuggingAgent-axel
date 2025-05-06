@@ -1,0 +1,245 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+Adding nullable OneToOneField crashes on SQLite.
+Description
+	
+This new sqlite3 error has cropped up between building django-oauth-toolkit between Django 4.0 and main branch for migrations.AddField of a OneToOneField (see ​https://github.com/jazzband/django-oauth-toolkit/issues/1064):
+self = <django.db.backends.sqlite3.base.SQLiteCursorWrapper object at 0x10b8038b0>
+query = 'ALTER TABLE "oauth2_provider_accesstoken" ADD COLUMN "source_refresh_token_id" bigint NULL UNIQUE REFERENCES "oauth2_provider_refreshtoken" ("id") DEFERRABLE INITIALLY DEFERRED'
+params = []
+	def execute(self, query, params=None):
+		if params is None:
+			return Database.Cursor.execute(self, query)
+		query = self.convert_query(query)
+>	 return Database.Cursor.execute(self, query, params)
+E	 django.db.utils.OperationalError: Cannot add a UNIQUE column
+Here's the relevant migration snippet: 
+		migrations.AddField(
+			model_name='AccessToken',
+			name='source_refresh_token',
+			field=models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, to=oauth2_settings.REFRESH_TOKEN_MODEL, related_name="refreshed_access_token"),
+		),
+I see there have been a lot of sqlite3 changes in #33355 since the 4.0 release....
+
+</ISSUE>
+
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+To resolve the issue of the `OperationalError` when adding a nullable `OneToOneField` with a unique constraint in SQLite, we typically need to handle the migration differently. SQLite has limitations regarding altering tables to add unique constraints directly through the `ALTER TABLE` statement.
+
+To proceed with generating a patch, I need to check the implementation details of how Django handles migrations and SQLite interactions, especially related to the addition of `OneToOneField` fields in the migration operations.
+
+I will retrieve relevant code from the Django project to gather the necessary information for implementing a workaround or a fix for this issue.
+
+Let's start by examining the classes and methods involved in altering tables and handling migrations for SQLite. We can look into the migration framework and database operations in Django.
+
+Here's what I plan to search for:
+
+1. The class or method responsible for handling AddField operations in Django migrations for SQLite.
+2. Any SQLite-specific handling of unique constraints during migrations.
+
+```python
+search_method_in_codebase("AddField")
+search_class_in_codebase("SQLiteSchemaEditor")
+```
+This will help gather the necessary source code to understand how Django handles alterations in SQLite, particularly related to unique constraints, and how we might adjust this process. After examining these, we can generate an appropriate patch to resolve this bug.
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("AddField")
+RESULT:
+#### django/db/migrations/operations/fields.py:AddField
+```python
+class AddField(FieldOperation):
+    """Add a field to a model."""
+
+    def __init__(self, model_name, name, field, preserve_default=True):
+        self.preserve_default = preserve_default
+        super().__init__(model_name, name, field)
+
+    def deconstruct(self):
+        kwargs = {
+            'model_name': self.model_name,
+            'name': self.name,
+            'field': self.field,
+        }
+        if self.preserve_default is not True:
+            kwargs['preserve_default'] = self.preserve_default
+        return (
+            self.__class__.__name__,
+            [],
+            kwargs
+        )
+
+    def state_forwards(self, app_label, state):
+        state.add_field(
+            app_label,
+            self.model_name_lower,
+            self.name,
+            self.field,
+            self.preserve_default,
+        )
+
+    def database_forwards(self, app_label, schema_editor, from_state, to_state):
+        to_model = to_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, to_model):
+            from_model = from_state.apps.get_model(app_label, self.model_name)
+            field = to_model._meta.get_field(self.name)
+            if not self.preserve_default:
+                field.default = self.field.default
+            schema_editor.add_field(
+                from_model,
+                field,
+            )
+            if not self.preserve_default:
+                field.default = NOT_PROVIDED
+
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        from_model = from_state.apps.get_model(app_label, self.model_name)
+        if self.allow_migrate_model(schema_editor.connection.alias, from_model):
+            schema_editor.remove_field(from_model, from_model._meta.get_field(self.name))
+
+    def describe(self):
+        return "Add field %s to %s" % (self.name, self.model_name)
+
+    @property
+    def migration_name_fragment(self):
+        return '%s_%s' % (self.model_name_lower, self.name_lower)
+
+    def reduce(self, operation, app_label):
+        if isinstance(operation, FieldOperation) and self.is_same_field_operation(operation):
+            if isinstance(operation, AlterField):
+                return [
+                    AddField(
+                        model_name=self.model_name,
+                        name=operation.name,
+                        field=operation.field,
+                    ),
+                ]
+            elif isinstance(operation, RemoveField):
+                return []
+            elif isinstance(operation, RenameField):
+                return [
+                    AddField(
+                        model_name=self.model_name,
+                        name=operation.new_name,
+                        field=self.field,
+                    ),
+                ]
+        return super().reduce(operation, app_label)
+
+```
+
+
+==================================================
+
+Your Output:
+To resolve the issue, I need to understand how the `SQLiteSchemaEditor` class handles the addition of fields and unique constraints specifically for the SQLite database in Django migrations. The `AddField` operation relies on the schema editor to perform these database changes, so I need to explore the `SQLiteSchemaEditor` class and its methods.
+
+Given that I've already located the `AddField` class, the next step involves examining the specific methods in `SQLiteSchemaEditor` that deal with adding fields, such as the `add_field` method, or any related method that handles unique constraints during field addition.
+
+Therefore, I need to retrieve the source code for the `SQLiteSchemaEditor` class and specifically look for methods that manage field injection and unique constraints.
+
+```python
+search_class_in_codebase("SQLiteSchemaEditor")
+search_method_in_file("django/db/backends/sqlite3/schema.py", "SQLiteSchemaEditor.add_field")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("django/db/backends/sqlite3/schema.py", "SQLiteSchemaEditor.add_field")
+RESULT:
+#### django/db/backends/sqlite3/schema.py:DatabaseSchemaEditor.add_field
+```python
+    def add_field(self, model, field):
+        """Create a field on a model."""
+        # Fields with default values cannot by handled by ALTER TABLE ADD
+        # COLUMN statement because DROP DEFAULT is not supported in
+        # ALTER TABLE.
+        if not field.null or self.effective_default(field) is not None:
+            self._remake_table(model, create_field=field)
+        else:
+            super().add_field(model, field)
+
+```
+
+
+==================================================
+
+Your Output:
+Ready generation: `True`
+==================================================
+
+Now, you need to generate patches to resolve the issue. Please ensure that your patch does not disrupt the original functionality of the code.
+You should generate *SEARCH/REPLACE* format patches to fix the issue.
+Every *SEARCH/REPLACE* edit must use this format:
+```pythony
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+
+A final json reply example:
+```json
+{
+  "search_replace_edits": [
+    "### A/B.py\n<<<<<<< SEARCH
+       def foo():\n=======\n    def bar():\n>>>>>>> REPLACE\n",
+    "### A/B.py\n<<<<<<< SEARCH
+       x = x + 1\n=======\n    x = x - 1\n>>>>>>> REPLACE\n",
+}
+```
+
+
+ERROR! Your Reponse: {'search_replace_edits': ['### django/db/backends/sqlite3/schema.py\n<<<<<<< SEARCH\n    def add_field(self, model, field):\n        # Fields with default values cannot by handled by ALTER TABLE ADD\n        # COLUMN statement because DROP DEFAULT is not supported in\n        # ALTER TABLE.\n        if not field.null or self.effective_default(field) is not None:\n            self._remake_table(model, create_field=field)\n        else:\n            super().add_field(model, field)\n=======\n    def add_field(self, model, field):\n        # Fields with default values and unique constraints need a table rewrite on SQLite.\n        if field.unique or not field.null or self.effective_default(field) is not None:\n            self._remake_table(model, create_field=field)\n        else:\n            super().add_field(model, field)\n>>>>>>> REPLACE\n']}.
+Your response format is invalid: Search pattern not found in file.
+Please try again.
+
+Please ensure that your patch does not disrupt the original functionality of the code.
+Generate *SEARCH/REPLACE* patches to fix the issue.
+
+Every *SEARCH/REPLACE* edit must use this format:
+1. The file path
+2. The start of search block: <<<<<<< SEARCH
+3. A contiguous chunk of lines to search for in the existing source code
+4. The dividing line: =======
+5. The lines to replace into the source code
+6. The end of the replace block: >>>>>>> REPLACE
+
+Here is an example of a *SEARCH/REPLACE* edit:
+
+```python
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+At the end of your analysis, provide edit result in the following JSON format:
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+

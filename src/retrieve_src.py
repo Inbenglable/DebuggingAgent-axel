@@ -242,7 +242,6 @@ def retrieve_code_element_in_database(instance: dict, name: str, element_type: s
 def retrieve_code_element(file: str, name: str, element_type : str, enable_line_number: bool = False, relative_path: bool = False, instance: dict = None) -> list:
     root_dir = instance['testbed_src_path'] if instance else None
     result = []
-    retrieved_elements = {}
     try:
         with open(file, 'r') as f:
             lines = f.readlines()
@@ -269,7 +268,7 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
             numbered_code_lines = [
                 f"{i:6}\t{line}" for i, line in enumerate(selected_lines, start=start)
             ]
-            
+            retrieved_elements = {}
             retrieved_elements['name'] = f"Lines {start}-{end}"
             if relative_path:
                 retrieved_elements['path'] = os.path.relpath(file, root_dir)
@@ -303,7 +302,7 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
 
             start = element_info['start_line']
             end = element_info['end_line']
-
+            retrieved_elements = {}
             retrieved_elements['name'] = name
 
             if element_type == 'class':
@@ -337,7 +336,7 @@ def retrieve_code_element(file: str, name: str, element_type : str, enable_line_
             code = retrieve_result[0]
             start_line = retrieve_result[1]
             end_line = retrieve_result[2]
-             
+            retrieved_elements = {}
             retrieved_elements['name'] = 'code_snippet'
             if relative_path:
                 retrieved_elements['path'] = os.path.relpath(file, root_dir)

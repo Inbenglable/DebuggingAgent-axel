@@ -1,0 +1,616 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Set default FILE_UPLOAD_PERMISSION to 0o644.
+Description
+	
+Hello,
+As far as I can see, the ​File Uploads documentation page does not mention any permission issues.
+What I would like to see is a warning that in absence of explicitly configured FILE_UPLOAD_PERMISSIONS, the permissions for a file uploaded to FileSystemStorage might not be consistent depending on whether a MemoryUploadedFile or a TemporaryUploadedFile was used for temporary storage of the uploaded data (which, with the default FILE_UPLOAD_HANDLERS, in turn depends on the uploaded data size).
+The tempfile.NamedTemporaryFile + os.rename sequence causes the resulting file permissions to be 0o0600 on some systems (I experience it here on CentOS 7.4.1708 and Python 3.6.5). In all probability, the implementation of Python's built-in tempfile module explicitly sets such permissions for temporary files due to security considerations.
+I found mentions of this issue ​on GitHub, but did not manage to find any existing bug report in Django's bug tracker.
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+In order to address the issue regarding the `FILE_UPLOAD_PERMISSIONS` setting in Django and ensure a consistent file permission of `0o644`, we need to inspect the implementation where file uploads are handled—specifically, how permissions are set or defaulted during the file upload process. 
+
+A potential focus area is within the `FileSystemStorage` class in Django, where the `save()` method is responsible for storing files. Furthermore, examining the handler configuration might also be insightful since the default behavior of these handlers (such as `TemporaryUploadedFile` and `MemoryUploadedFile`) can result in different file permissions.
+
+Therefore, to generate a proper patch, we need to gather source code from the methods handling file uploads, especially within `FileSystemStorage` and related file handling methods.
+
+```python
+search_class_in_codebase("FileSystemStorage")
+search_method_in_codebase("save")
+```
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("save")
+RESULT:
+#### tests/model_forms/models.py:Photo.save
+```python
+    def save(self, force_insert=False, force_update=False):
+        super().save(force_insert, force_update)
+        self._savecount += 1
+
+```
+
+#### tests/extra_regress/models.py:RevisionableModel.save
+```python
+    def save(self, *args, force_insert=None, force_update=None, **kwargs):
+        super().save(*args, force_insert=force_insert, force_update=force_update, **kwargs)
+        if not self.base:
+            self.base = self
+            super().save(*args, **kwargs)
+
+```
+
+#### tests/test_client_regress/session.py:SessionStore.save
+```python
+    def save(self, must_create=False):
+        self._session_key = self.encode(self._session)
+
+```
+
+#### tests/serializers/models/data.py:ModifyingSaveData.save
+```python
+    def save(self, *args, **kwargs):
+        """
+        A save method that modifies the data in the object.
+        A user-defined save() method isn't called when objects are deserialized
+        (#4459).
+        """
+        self.data = 666
+        super().save(*args, **kwargs)
+
+```
+
+#### tests/save_delete_hooks/models.py:Person.save
+```python
+    def save(self, *args, **kwargs):
+        self.data.append("Before save")
+        # Call the "real" save() method
+        super().save(*args, **kwargs)
+        self.data.append("After save")
+
+```
+
+#### tests/admin_inlines/models.py:NonAutoPKBook.save
+```python
+    def save(self, *args, **kwargs):
+        while not self.rand_pk:
+            test_pk = random.randint(1, 99999)
+            if not NonAutoPKBook.objects.filter(rand_pk=test_pk).exists():
+                self.rand_pk = test_pk
+        super().save(*args, **kwargs)
+
+```
+
+#### django/db/models/base.py:Model.save
+```python
+    def save(self, force_insert=False, force_update=False, using=None,
+             update_fields=None):
+        """
+        Save the current instance. Override this in a subclass if you want to
+        control the saving process.
+
+        The 'force_insert' and 'force_update' parameters can be used to insist
+        that the "save" must be an SQL insert or update (or equivalent for
+        non-SQL backends), respectively. Normally, they should not be set.
+        """
+        # Ensure that a model instance without a PK hasn't been assigned to
+        # a ForeignKey or OneToOneField on this model. If the field is
+        # nullable, allowing the save() would result in silent data loss.
+        for field in self._meta.concrete_fields:
+            # If the related field isn't cached, then an instance hasn't
+            # been assigned and there's no need to worry about this check.
+            if field.is_relation and field.is_cached(self):
+                obj = getattr(self, field.name, None)
+                # A pk may have been assigned manually to a model instance not
+                # saved to the database (or auto-generated in a case like
+                # UUIDField), but we allow the save to proceed and rely on the
+                # database to raise an IntegrityError if applicable. If
+                # constraints aren't supported by the database, there's the
+                # unavoidable risk of data corruption.
+                if obj and obj.pk is None:
+                    # Remove the object from a related instance cache.
+                    if not field.remote_field.multiple:
+                        field.remote_field.delete_cached_value(obj)
+                    raise ValueError(
+                        "save() prohibited to prevent data loss due to "
+                        "unsaved related object '%s'." % field.name
+                    )
+                # If the relationship's pk/to_field was changed, clear the
+                # cached relationship.
+                if obj and getattr(obj, field.target_field.attname) != getattr(self, field.attname):
+                    field.delete_cached_value(self)
+
+        using = using or router.db_for_write(self.__class__, instance=self)
+        if force_insert and (force_update or update_fields):
+            raise ValueError("Cannot force both insert and updating in model saving.")
+
+        deferred_fields = self.get_deferred_fields()
+        if update_fields is not None:
+            # If update_fields is empty, skip the save. We do also check for
+            # no-op saves later on for inheritance cases. This bailout is
+            # still needed for skipping signal sending.
+            if not update_fields:
+                return
+
+            update_fields = frozenset(update_fields)
+            field_names = set()
+
+            for field in self._meta.fields:
+                if not field.primary_key:
+                    field_names.add(field.name)
+
+                    if field.name != field.attname:
+                        field_names.add(field.attname)
+
+            non_model_fields = update_fields.difference(field_names)
+
+            if non_model_fields:
+                raise ValueError("The following fields do not exist in this "
+                                 "model or are m2m fields: %s"
+                                 % ', '.join(non_model_fields))
+
+        # If saving to the same database, and this model is deferred, then
+        # automatically do a "update_fields" save on the loaded fields.
+        elif not force_insert and deferred_fields and using == self._state.db:
+            field_names = set()
+            for field in self._meta.concrete_fields:
+                if not field.primary_key and not hasattr(field, 'through'):
+                    field_names.add(field.attname)
+            loaded_fields = field_names.difference(deferred_fields)
+            if loaded_fields:
+                update_fields = frozenset(loaded_fields)
+
+        self.save_base(using=using, force_insert=force_insert,
+                       force_update=force_update, update_fields=update_fields)
+
+```
+
+#### django/db/models/fields/files.py:FieldFile.save
+```python
+    def save(self, name, content, save=True):
+        name = self.field.generate_filename(self.instance, name)
+        self.name = self.storage.save(name, content, max_length=self.field.max_length)
+        setattr(self.instance, self.field.name, self.name)
+        self._committed = True
+
+        # Save the object because it has changed, unless save is False
+        if save:
+            self.instance.save()
+
+```
+
+#### django/core/serializers/base.py:DeserializedObject.save
+```python
+    def save(self, save_m2m=True, using=None, **kwargs):
+        # Call save on the Model baseclass directly. This bypasses any
+        # model-defined save. The save is also forced to be raw.
+        # raw=True is passed to any pre/post_save signals.
+        models.Model.save_base(self.object, using=using, raw=True, **kwargs)
+        if self.m2m_data and save_m2m:
+            for accessor_name, object_list in self.m2m_data.items():
+                getattr(self.object, accessor_name).set(object_list)
+
+        # prevent a second (possibly accidental) call to save() from saving
+        # the m2m data twice.
+        self.m2m_data = None
+
+```
+
+#### django/core/files/storage.py:Storage.save
+```python
+    def save(self, name, content, max_length=None):
+        """
+        Save new content to the file specified by name. The content should be
+        a proper File object or any Python file-like object, ready to be read
+        from the beginning.
+        """
+        # Get the proper name for the file, as it will actually be saved.
+        if name is None:
+            name = content.name
+
+        if not hasattr(content, 'chunks'):
+            content = File(content, name)
+
+        name = self.get_available_name(name, max_length=max_length)
+        return self._save(name, content)
+
+```
+
+#### django/forms/models.py:BaseModelFormSet.save
+```python
+    def save(self, commit=True):
+        """
+        Save model instances for every form, adding and changing instances
+        as necessary, and return the list of instances.
+        """
+        if not commit:
+            self.saved_forms = []
+
+            def save_m2m():
+                for form in self.saved_forms:
+                    form.save_m2m()
+            self.save_m2m = save_m2m
+        return self.save_existing_objects(commit) + self.save_new_objects(commit)
+
+```
+
+#### django/contrib/sites/requests.py:RequestSite.save
+```python
+    def save(self, force_insert=False, force_update=False):
+        raise NotImplementedError('RequestSite cannot be saved.')
+
+```
+
+#### django/contrib/gis/utils/layermapping.py:LayerMapping.save
+```python
+    def save(self, verbose=False, fid_range=False, step=False,
+             progress=False, silent=False, stream=sys.stdout, strict=False):
+        """
+        Save the contents from the OGR DataSource Layer into the database
+        according to the mapping dictionary given at initialization.
+
+        Keyword Parameters:
+         verbose:
+           If set, information will be printed subsequent to each model save
+           executed on the database.
+
+         fid_range:
+           May be set with a slice or tuple of (begin, end) feature ID's to map
+           from the data source.  In other words, this keyword enables the user
+           to selectively import a subset range of features in the geographic
+           data source.
+
+         step:
+           If set with an integer, transactions will occur at every step
+           interval. For example, if step=1000, a commit would occur after
+           the 1,000th feature, the 2,000th feature etc.
+
+         progress:
+           When this keyword is set, status information will be printed giving
+           the number of features processed and successfully saved.  By default,
+           progress information will pe printed every 1000 features processed,
+           however, this default may be overridden by setting this keyword with an
+           integer for the desired interval.
+
+         stream:
+           Status information will be written to this file handle.  Defaults to
+           using `sys.stdout`, but any object with a `write` method is supported.
+
+         silent:
+           By default, non-fatal error notifications are printed to stdout, but
+           this keyword may be set to disable these notifications.
+
+         strict:
+           Execution of the model mapping will cease upon the first error
+           encountered.  The default behavior is to attempt to continue.
+        """
+        # Getting the default Feature ID range.
+        default_range = self.check_fid_range(fid_range)
+
+        # Setting the progress interval, if requested.
+        if progress:
+            if progress is True or not isinstance(progress, int):
+                progress_interval = 1000
+            else:
+                progress_interval = progress
+
+        def _save(feat_range=default_range, num_feat=0, num_saved=0):
+            if feat_range:
+                layer_iter = self.layer[feat_range]
+            else:
+                layer_iter = self.layer
+
+            for feat in layer_iter:
+                num_feat += 1
+                # Getting the keyword arguments
+                try:
+                    kwargs = self.feature_kwargs(feat)
+                except LayerMapError as msg:
+                    # Something borked the validation
+                    if strict:
+                        raise
+                    elif not silent:
+                        stream.write('Ignoring Feature ID %s because: %s\n' % (feat.fid, msg))
+                else:
+                    # Constructing the model using the keyword args
+                    is_update = False
+                    if self.unique:
+                        # If we want unique models on a particular field, handle the
+                        # geometry appropriately.
+                        try:
+                            # Getting the keyword arguments and retrieving
+                            # the unique model.
+                            u_kwargs = self.unique_kwargs(kwargs)
+                            m = self.model.objects.using(self.using).get(**u_kwargs)
+                            is_update = True
+
+                            # Getting the geometry (in OGR form), creating
+                            # one from the kwargs WKT, adding in additional
+                            # geometries, and update the attribute with the
+                            # just-updated geometry WKT.
+                            geom_value = getattr(m, self.geom_field)
+                            if geom_value is None:
+                                geom = OGRGeometry(kwargs[self.geom_field])
+                            else:
+                                geom = geom_value.ogr
+                                new = OGRGeometry(kwargs[self.geom_field])
+                                for g in new:
+                                    geom.add(g)
+                            setattr(m, self.geom_field, geom.wkt)
+                        except ObjectDoesNotExist:
+                            # No unique model exists yet, create.
+                            m = self.model(**kwargs)
+                    else:
+                        m = self.model(**kwargs)
+
+                    try:
+                        # Attempting to save.
+                        m.save(using=self.using)
+                        num_saved += 1
+                        if verbose:
+                            stream.write('%s: %s\n' % ('Updated' if is_update else 'Saved', m))
+                    except Exception as msg:
+                        if strict:
+                            # Bailing out if the `strict` keyword is set.
+                            if not silent:
+                                stream.write(
+                                    'Failed to save the feature (id: %s) into the '
+                                    'model with the keyword arguments:\n' % feat.fid
+                                )
+                                stream.write('%s\n' % kwargs)
+                            raise
+                        elif not silent:
+                            stream.write('Failed to save %s:\n %s\nContinuing\n' % (kwargs, msg))
+
+                # Printing progress information, if requested.
+                if progress and num_feat % progress_interval == 0:
+                    stream.write('Processed %d features, saved %d …\n' % (num_feat, num_saved))
+
+            # Only used for status output purposes -- incremental saving uses the
+            # values returned here.
+            return num_saved, num_feat
+
+        if self.transaction_decorator is not None:
+            _save = self.transaction_decorator(_save)
+
+        nfeat = self.layer.num_feat
+        if step and isinstance(step, int) and step < nfeat:
+            # Incremental saving is requested at the given interval (step)
+            if default_range:
+                raise LayerMapError('The `step` keyword may not be used in conjunction with the `fid_range` keyword.')
+            beg, num_feat, num_saved = (0, 0, 0)
+            indices = range(step, nfeat, step)
+            n_i = len(indices)
+
+            for i, end in enumerate(indices):
+                # Constructing the slice to use for this step; the last slice is
+                # special (e.g, [100:] instead of [90:100]).
+                if i + 1 == n_i:
+                    step_slice = slice(beg, None)
+                else:
+                    step_slice = slice(beg, end)
+
+                try:
+                    num_feat, num_saved = _save(step_slice, num_feat, num_saved)
+                    beg = end
+                except Exception:  # Deliberately catch everything
+                    stream.write('%s\nFailed to save slice: %s\n' % ('=-' * 20, step_slice))
+                    raise
+        else:
+            # Otherwise, just calling the previously defined _save() function.
+            _save()
+
+```
+
+#### django/contrib/auth/forms.py:AdminPasswordChangeForm.save
+```python
+    def save(self, commit=True):
+        """Save the new password."""
+        password = self.cleaned_data["password1"]
+        self.user.set_password(password)
+        if commit:
+            self.user.save()
+        return self.user
+
+```
+
+#### django/contrib/auth/base_user.py:AbstractBaseUser.save
+```python
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self._password is not None:
+            password_validation.password_changed(self._password, self)
+            self._password = None
+
+```
+
+#### django/contrib/auth/models.py:AnonymousUser.save
+```python
+    def save(self):
+        raise NotImplementedError("Django doesn't provide a DB representation for AnonymousUser.")
+
+```
+
+#### django/contrib/sessions/base_session.py:BaseSessionManager.save
+```python
+    def save(self, session_key, session_dict, expire_date):
+        s = self.model(session_key, self.encode(session_dict), expire_date)
+        if session_dict:
+            s.save()
+        else:
+            s.delete()  # Clear sessions with no data.
+        return s
+
+```
+
+#### django/contrib/sessions/backends/cache.py:SessionStore.save
+```python
+    def save(self, must_create=False):
+        if self.session_key is None:
+            return self.create()
+        if must_create:
+            func = self._cache.add
+        elif self._cache.get(self.cache_key) is not None:
+            func = self._cache.set
+        else:
+            raise UpdateError
+        result = func(self.cache_key,
+                      self._get_session(no_load=must_create),
+                      self.get_expiry_age())
+        if must_create and not result:
+            raise CreateError
+
+```
+
+#### django/contrib/sessions/backends/base.py:SessionBase.save
+```python
+    def save(self, must_create=False):
+        """
+        Save the session data. If 'must_create' is True, create a new session
+        object (or raise CreateError). Otherwise, only update an existing
+        object and don't create one (raise UpdateError if needed).
+        """
+        raise NotImplementedError('subclasses of SessionBase must provide a save() method')
+
+```
+
+#### django/contrib/sessions/backends/db.py:SessionStore.save
+```python
+    def save(self, must_create=False):
+        """
+        Save the current session data to the database. If 'must_create' is
+        True, raise a database error if the saving operation doesn't create a
+        new entry (as opposed to possibly updating an existing entry).
+        """
+        if self.session_key is None:
+            return self.create()
+        data = self._get_session(no_load=must_create)
+        obj = self.create_model_instance(data)
+        using = router.db_for_write(self.model, instance=obj)
+        try:
+            with transaction.atomic(using=using):
+                obj.save(force_insert=must_create, force_update=not must_create, using=using)
+        except IntegrityError:
+            if must_create:
+                raise CreateError
+            raise
+        except DatabaseError:
+            if not must_create:
+                raise UpdateError
+            raise
+
+```
+
+#### django/contrib/sessions/backends/cached_db.py:SessionStore.save
+```python
+    def save(self, must_create=False):
+        super().save(must_create)
+        self._cache.set(self.cache_key, self._session, self.get_expiry_age())
+
+```
+
+#### django/contrib/sessions/backends/file.py:SessionStore.save
+```python
+    def save(self, must_create=False):
+        if self.session_key is None:
+            return self.create()
+        # Get the session data now, before we start messing
+        # with the file it is stored within.
+        session_data = self._get_session(no_load=must_create)
+
+        session_file_name = self._key_to_file()
+
+        try:
+            # Make sure the file exists.  If it does not already exist, an
+            # empty placeholder file is created.
+            flags = os.O_WRONLY | getattr(os, 'O_BINARY', 0)
+            if must_create:
+                flags |= os.O_EXCL | os.O_CREAT
+            fd = os.open(session_file_name, flags)
+            os.close(fd)
+        except FileNotFoundError:
+            if not must_create:
+                raise UpdateError
+        except FileExistsError:
+            if must_create:
+                raise CreateError
+
+        # Write the session file without interfering with other threads
+        # or processes.  By writing to an atomically generated temporary
+        # file and then using the atomic os.rename() to make the complete
+        # file visible, we avoid having to lock the session file, while
+        # still maintaining its integrity.
+        #
+        # Note: Locking the session file was explored, but rejected in part
+        # because in order to be atomic and cross-platform, it required a
+        # long-lived lock file for each session, doubling the number of
+        # files in the session storage directory at any given time.  This
+        # rename solution is cleaner and avoids any additional overhead
+        # when reading the session data, which is the more common case
+        # unless SESSION_SAVE_EVERY_REQUEST = True.
+        #
+        # See ticket #8616.
+        dir, prefix = os.path.split(session_file_name)
+
+        try:
+            output_file_fd, output_file_name = tempfile.mkstemp(dir=dir, prefix=prefix + '_out_')
+            renamed = False
+            try:
+                try:
+                    os.write(output_file_fd, self.encode(session_data).encode())
+                finally:
+                    os.close(output_file_fd)
+
+                # This will atomically rename the file (os.rename) if the OS
+                # supports it. Otherwise this will result in a shutil.copy2
+                # and os.unlink (for example on Windows). See #9084.
+                shutil.move(output_file_name, session_file_name)
+                renamed = True
+            finally:
+                if not renamed:
+                    os.unlink(output_file_name)
+        except (EOFError, OSError):
+            pass
+
+```
+
+#### django/contrib/sessions/backends/signed_cookies.py:SessionStore.save
+```python
+    def save(self, must_create=False):
+        """
+        To save, get the session key as a securely signed string and then set
+        the modified flag so that the cookie is set on the client for the
+        current request.
+        """
+        self._session_key = self._get_session_key()
+        self.modified = True
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

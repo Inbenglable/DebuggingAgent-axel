@@ -1,0 +1,435 @@
+
+You need to trace the abnormal program to resolve project issues and submit pull requests.
+Now you need to reolve the following issue in the **django** project:
+## ISSUE
+<ISSUE>
+TemplateView.get_context_data()'s kwargs returns SimpleLazyObjects that causes a crash when filtering.
+Description
+	
+Example Code that works in 3.0, but not in 3.1:
+class OfferView(TemplateView):
+	template_name = "offers/offer.html"
+	def get_context_data(self, **kwargs):
+		offer_slug = kwargs.get("offer_slug", "")
+		offer = get_object_or_404(Account, slug=offer_slug)
+		return {"offer": offer, "offer_slug": offer_slug}
+In order to make this work in 3.1, you have to explicitly convert the result of kwargs.get() to a string to get the SimpleLazyObject to resolve:
+class OfferView(TemplateView):
+	template_name = "offers/offer.html"
+	def get_context_data(self, **kwargs):
+		offer_slug = kwargs.get("offer_slug", "")
+		offer = get_object_or_404(Account, slug=str(offer_slug))
+		return {"offer": offer, "offer_slug": offer_slug}
+The error generated if you don't is:
+Error binding parameter 0 - probably unsupported type
+from django/db/backends/sqlite3/operations.py, line 144, in _quote_params_for_last_executed_query
+In both cases, the urls.py looks like:
+path(
+		"/offers/<slug:offer_slug>/",
+		OfferView.as_view(),
+		name="offer_view",
+	),
+When debugging, I found that offer_slug (coming in from kwargs.get) was of type 'SimpleLazyObject' in Django 3.1, and when I explicitly converted it to a string, get_object_or_404 behaved as expected.
+This is using Python 3.7.8 with SQLite.
+
+</ISSUE>
+
+
+Based on this issue, the testing agent has generated a reproducible test:
+import os
+import sys
+import traceback
+from django.conf import settings
+from django.core.management import call_command
+from django.urls import path
+from django.views.generic import TemplateView
+from django.shortcuts import get_object_or_404
+from django.utils.functional import SimpleLazyObject
+from django.db import models
+from django.test import RequestFactory
+from django.test.utils import setup_test_environment, teardown_test_environment
+
+# Define a simple model to mimic the Account model
+class Account(models.Model):
+    slug = models.SlugField(unique=True)
+
+    def __str__(self):
+        return self.slug
+
+# Define the view that reproduces the issue
+class OfferView(TemplateView):
+    template_name = "offers/offer.html"
+
+    def get_context_data(self, **kwargs):
+        offer_slug = kwargs.get("offer_slug", "")
+        # Uncomment the following line to fix the issue
+        # offer_slug = str(offer_slug)
+        offer = get_object_or_404(Account, slug=offer_slug)
+        return {"offer": offer, "offer_slug": offer_slug}
+
+# Function to print the stack trace
+def print_stacktrace(e: Exception):
+    tb = traceback.extract_tb(e.__traceback__)
+    print("Traceback (most recent call last):", file=sys.stderr)
+    for frame in tb:
+        line_number = frame.lineno
+        code_context = frame.line.strip() if frame.line else "Unknown"
+        print(f'  File "{frame.filename}"', file=sys.stderr)
+        print(f"    {line_number}: {code_context}", file=sys.stderr)
+    print(f"{e.__class__.__name__}: {e}", file=sys.stderr)
+
+# Setup Django settings
+settings.configure(
+    DEBUG=True,
+    DATABASES={
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': 'test.db',
+        }
+    },
+    INSTALLED_APPS=[
+        'django.contrib.contenttypes',
+        'django.contrib.auth',
+        __name__,
+    ],
+    ROOT_URLCONF=__name__,
+    TEMPLATES=[
+        {
+            'BACKEND': 'django.template.backends.django.DjangoTemplates',
+            'DIRS': [],
+            'APP_DIRS': True,
+            'OPTIONS': {
+                'context_processors': [
+                    'django.template.context_processors.debug',
+                    'django.template.context_processors.request',
+                    'django.contrib.auth.context_processors.auth',
+                    'django.contrib.messages.context_processors.messages',
+                ],
+            },
+        },
+    ],
+    MIDDLEWARE=[
+        'django.middleware.security.SecurityMiddleware',
+        'django.contrib.sessions.middleware.SessionMiddleware',
+        'django.middleware.common.CommonMiddleware',
+        'django.middleware.csrf.CsrfViewMiddleware',
+        'django.contrib.auth.middleware.AuthenticationMiddleware',
+        'django.contrib.messages.middleware.MessageMiddleware',
+        'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    ],
+)
+
+# Create a URL pattern for the OfferView
+urlpatterns = [
+    path("/offers/<slug:offer_slug>/", OfferView.as_view(), name="offer_view"),
+]
+
+# Setup the test environment
+setup_test_environment()
+
+# Create a test database and run migrations
+if __name__ == "__main__":
+    # Run migrations
+    call_command('migrate', verbosity=0)
+
+    # Create a test account
+    Account.objects.create(slug='test-offer')
+
+    # Simulate a request to the OfferView
+    factory = RequestFactory()
+    request = factory.get('/offers/test-offer/')
+    # Simulate a SimpleLazyObject for the slug
+    request.resolver_match = type('ResolverMatch', (object,), {
+        'kwargs': {'offer_slug': SimpleLazyObject(lambda: 'test-offer')}
+    })
+
+    try:
+        response = OfferView.as_view()(request)
+        # If no exception is raised, the issue is fixed
+        print("The issue is fixed.")
+        sys.exit(0)
+    except Exception as e:
+        print_stacktrace(e)
+        raise AssertionError("The issue is present.")
+    finally:
+        # Teardown the test environment
+        teardown_test_environment()
+
+This is the corresponding output and runtime information:
+Error occurred during script execution:Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.
+
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    Starting var:.. __name__ = '__main__'
+    Starting var:.. __doc__ = None
+    Starting var:.. __package__ = ''
+    Starting var:.. __loader__ = None
+    Starting var:.. __spec__ = None
+    Starting var:.. __file__ = '/data/swe-fl/TMP/testbed/django__django-13297/reproduce.py'
+    Starting var:.. __cached__ = None
+    Starting var:.. __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+     call         1 import os
+     line         1 import os
+    New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/os.py'>
+     line         2 import sys
+    New var:....... sys = <module 'sys' (built-in)>
+     line         3 import traceback
+    New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py'>
+     line         4 from django.conf import settings
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.conf'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fb596727030>
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-13297/django/conf/__init__.py'>
+        Starting var:.. module = <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-13297/django/conf/__init__.py'>
+        Starting var:.. fromlist = ('settings',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'settings'
+        Return value:.. <module 'django.conf' from '/data/swe-fl/TMP/testbed/django__django-13297/django/conf/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... settings = <LazySettings [Unevaluated]>
+     line         5 from django.core.management import call_command
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.core.management'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fb596727030>
+        Return value:.. <module 'django.core.management' from '/data/swe...django-13297/django/core/management/__init__.py'>
+        Starting var:.. module = <module 'django.core.management' from '/data/swe...django-13297/django/core/management/__init__.py'>
+        Starting var:.. fromlist = ('call_command',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'call_command'
+        Return value:.. <module 'django.core.management' from '/data/swe...django-13297/django/core/management/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... call_command = <function call_command at 0x7fb5958f8598>
+     line         6 from django.urls import path
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.urls'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fb596727030>
+        Return value:.. <module 'django.urls' from '/data/swe-fl/TMP/testbed/django__django-13297/django/urls/__init__.py'>
+        Starting var:.. module = <module 'django.urls' from '/data/swe-fl/TMP/testbed/django__django-13297/django/urls/__init__.py'>
+        Starting var:.. fromlist = ('path',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'path'
+        Return value:.. <module 'django.urls' from '/data/swe-fl/TMP/testbed/django__django-13297/django/urls/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... path = functools.partial(<function _path at 0x7fb595049...ern=<class 'django.urls.resolvers.RoutePattern'>)
+     line         7 from django.views.generic import TemplateView
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.views.generic'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fb596727030>
+        Return value:.. <module 'django.views.generic' from '/data/swe-f...__django-13297/django/views/generic/__init__.py'>
+        Starting var:.. module = <module 'django.views.generic' from '/data/swe-f...__django-13297/django/views/generic/__init__.py'>
+        Starting var:.. fromlist = ('TemplateView',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'TemplateView'
+        Return value:.. <module 'django.views.generic' from '/data/swe-f...__django-13297/django/views/generic/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... TemplateView = <class 'django.views.generic.base.TemplateView'>
+     line         8 from django.shortcuts import get_object_or_404
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.shortcuts'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fb596727030>
+        Return value:.. <module 'django.shortcuts' from '/data/swe-fl/TMP/testbed/django__django-13297/django/shortcuts.py'>
+        Starting var:.. module = <module 'django.shortcuts' from '/data/swe-fl/TMP/testbed/django__django-13297/django/shortcuts.py'>
+        Starting var:.. fromlist = ('get_object_or_404',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        Return value:.. <module 'django.shortcuts' from '/data/swe-fl/TMP/testbed/django__django-13297/django/shortcuts.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... get_object_or_404 = <function get_object_or_404 at 0x7fb594cbad90>
+     line         9 from django.utils.functional import SimpleLazyObject
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django.utils.functional' from '/data/sw...django__django-13297/django/utils/functional.py'>
+        Starting var:.. fromlist = ('SimpleLazyObject',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        Return value:.. <module 'django.utils.functional' from '/data/sw...django__django-13297/django/utils/functional.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... SimpleLazyObject = <class 'django.utils.functional.SimpleLazyObject'>
+     line        10 from django.db import models
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-13297/django/db/__init__.py'>
+        Starting var:.. fromlist = ('models',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'models'
+        Return value:.. <module 'django.db' from '/data/swe-fl/TMP/testbed/django__django-13297/django/db/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... models = <module 'django.db.models' from '/data/swe-fl/TM...ango__django-13297/django/db/models/__init__.py'>
+     line        11 from django.test import RequestFactory
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. name = 'django.test'
+        Starting var:.. import_ = <built-in function __import__>
+        New var:....... module = <object object at 0x7fb596727030>
+        Return value:.. <module 'django.test' from '/data/swe-fl/TMP/testbed/django__django-13297/django/test/__init__.py'>
+        Starting var:.. module = <module 'django.test' from '/data/swe-fl/TMP/testbed/django__django-13297/django/test/__init__.py'>
+        Starting var:.. fromlist = ('RequestFactory',)
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        New var:....... x = 'RequestFactory'
+        Return value:.. <module 'django.test' from '/data/swe-fl/TMP/testbed/django__django-13297/django/test/__init__.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... RequestFactory = <class 'django.test.client.RequestFactory'>
+     line        12 from django.test.utils import setup_test_environment, teardown_test_environment
+        Source path:... <frozen importlib._bootstrap>
+        Starting var:.. module = <module 'django.test.utils' from '/data/swe-fl/T...stbed/django__django-13297/django/test/utils.py'>
+        Starting var:.. fromlist = ('setup_test_environment', 'teardown_test_environment')
+        Starting var:.. import_ = <built-in function __import__>
+        Starting var:.. recursive = False
+        Return value:.. <module 'django.test.utils' from '/data/swe-fl/T...stbed/django__django-13297/django/test/utils.py'>
+    Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+    New var:....... setup_test_environment = <function setup_test_environment at 0x7fb594f99048>
+    New var:....... teardown_test_environment = <function teardown_test_environment at 0x7fb594f990d0>
+     line        15 class Account(models.Model):
+         call        15 class Account(models.Model):
+         line        15 class Account(models.Model):
+        New var:....... __module__ = '__main__'
+        New var:....... __qualname__ = 'Account'
+         line        16     slug = models.SlugField(unique=True)
+            Source path:... /data/swe-fl/TMP/testbed/django__django-13297/django/db/models/fields/__init__.py
+            Starting var:.. self = <django.db.models.fields.SlugField>
+            Starting var:.. max_length = 50
+            Starting var:.. db_index = True
+            Starting var:.. allow_unicode = False
+            Starting var:.. args = ()
+            Starting var:.. kwargs = {'unique': True}
+            Starting var:.. __class__ = <class 'django.db.models.fields.SlugField'>
+             call      2018     def __init__(self, *args, max_length=50, db_index=True, allow_unicode=False, **kwargs):
+             line      2019         self.allow_unicode = allow_unicode
+             line      2020         if self.allow_unicode:
+             line      2022         super().__init__(*args, max_length=max_length, db_index=db_index, **kwargs)
+             return    2022         super().__init__(*args, max_length=max_length, db_index=db_index, **kwargs)
+            Return value:.. None
+        Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+        New var:....... slug = <django.db.models.fields.SlugField>
+         line        18     def __str__(self):
+        New var:....... __str__ = <function Account.__str__ at 0x7fb5963587b8>
+         return      18     def __str__(self):
+        Return value:.. None
+            Source path:... /data/swe-fl/TMP/testbed/django__django-13297/django/db/models/base.py
+        Starting var:.. cls = <class 'django.db.models.base.ModelBase'>
+        Starting var:.. name = 'Account'
+        Starting var:.. bases = (<class 'django.db.models.base.Model'>,)
+        Starting var:.. attrs = {'__module__': '__main__', '__qualname__': 'Acco..._': <function Account.__str__ at 0x7fb5963587b8>}
+        Starting var:.. kwargs = {}
+        Starting var:.. __class__ = <class 'django.db.models.base.ModelBase'>
+         call        74     def __new__(cls, name, bases, attrs, **kwargs):
+         line        75         super_new = super().__new__
+        New var:....... super_new = <built-in method __new__ of type object at 0x560fa45cc880>
+         line        79         parents = [b for b in bases if isinstance(b, ModelBase)]
+        New var:....... parents = [<class 'django.db.models.base.Model'>]
+         line        80         if not parents:
+         line        84         module = attrs.pop('__module__')
+        Modified var:.. attrs = {'__qualname__': 'Account', 'slug': <django.db.m..._': <function Account.__str__ at 0x7fb5963587b8>}
+        New var:....... module = '__main__'
+         line        85         new_attrs = {'__module__': module}
+        New var:....... new_attrs = {'__module__': '__main__'}
+         line        86         classcell = attrs.pop('__classcell__', None)
+        New var:....... classcell = None
+         line        87         if classcell is not None:
+         line        89         attr_meta = attrs.pop('Meta', None)
+        New var:....... attr_meta = None
+         line        93         contributable_attrs = {}
+        New var:....... contributable_attrs = {}
+         line        94         for obj_name, obj in attrs.items():
+        New var:....... obj_name = '__qualname__'
+        New var:....... obj = 'Account'
+         line        95             if _has_contribute_to_class(obj):
+         line        98                 new_attrs[obj_name] = obj
+        Modified var:.. new_attrs = {'__module__': '__main__', '__qualname__': 'Account'}
+         line        94         for obj_name, obj in attrs.items():
+        Modified var:.. obj_name = 'slug'
+        Modified var:.. obj = <django.db.models.fields.SlugField>
+         line        95             if _has_contribute_to_class(obj):
+         line        96                 contributable_attrs[obj_name] = obj
+        Modified var:.. contributable_attrs = {'slug': <django.db.models.fields.SlugField>}
+         line        94         for obj_name, obj in attrs.items():
+        Modified var:.. obj_name = '__str__'
+        Modified var:.. obj = <function Account.__str__ at 0x7fb5963587b8>
+         line        95             if _has_contribute_to_class(obj):
+         line        98                 new_attrs[obj_name] = obj
+        Modified var:.. new_attrs = {'__module__': '__main__', '__qualname__': 'Acco..._': <function Account.__str__ at 0x7fb5963587b8>}
+         line        94         for obj_name, obj in attrs.items():
+         line        99         new_class = super_new(cls, name, bases, new_attrs, **kwargs)
+        New var:....... new_class = <class '__main__.Account'>
+         line       101         abstract = getattr(attr_meta, 'abstract', False)
+        New var:....... abstract = False
+         line       102         meta = attr_meta or getattr(new_class, 'Meta', None)
+        New var:....... meta = None
+         line       103         base_meta = getattr(new_class, '_meta', None)
+        New var:....... base_meta = None
+         line       105         app_label = None
+        New var:....... app_label = None
+         line       108         app_config = apps.get_containing_app_config(module)
+         exception  108         app_config = apps.get_containing_app_config(module)
+        Exception:..... django.core.exceptions.ImproperlyConfigured: Req...l settings.configure() before accessing settings.
+    Call ended by exception
+Source path:... /data/swe-fl/TMP/testbed/django__django-13297/reproduce.py
+ exception   15 class Account(models.Model):
+Exception:..... django.core.exceptions.ImproperlyConfigured: Req...l settings.configure() before accessing settings.
+New var:....... __name__ = '__main__'
+New var:....... __doc__ = None
+New var:....... __package__ = ''
+New var:....... __loader__ = None
+New var:....... __spec__ = None
+New var:....... __file__ = '/data/swe-fl/TMP/testbed/django__django-13297/reproduce.py'
+New var:....... __cached__ = None
+New var:....... __builtins__ = {'__name__': 'builtins', '__doc__': "Built-in fu...ive help, or help(object) for help about object.}
+New var:....... os = <module 'os' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/os.py'>
+New var:....... sys = <module 'sys' (built-in)>
+New var:....... traceback = <module 'traceback' from '/root/miniforge3/envs/django__django__3.2/lib/python3.6/traceback.py'>
+New var:....... settings = <LazySettings [Unevaluated]>
+New var:....... call_command = <function call_command at 0x7fb5958f8598>
+New var:....... path = functools.partial(<function _path at 0x7fb595049...ern=<class 'django.urls.resolvers.RoutePattern'>)
+New var:....... TemplateView = <class 'django.views.generic.base.TemplateView'>
+New var:....... get_object_or_404 = <function get_object_or_404 at 0x7fb594cbad90>
+New var:....... SimpleLazyObject = <class 'django.utils.functional.SimpleLazyObject'>
+New var:....... models = <module 'django.db.models' from '/data/swe-fl/TM...ango__django-13297/django/db/models/__init__.py'>
+New var:....... RequestFactory = <class 'django.test.client.RequestFactory'>
+New var:....... setup_test_environment = <function setup_test_environment at 0x7fb594f99048>
+New var:....... teardown_test_environment = <function teardown_test_environment at 0x7fb594f990d0>
+Call ended by exception
+Traceback (most recent call last):
+  File "run_debugging_test.py", line 17, in debugging_test_execution_wrapper
+    wrapped_execute()
+  File "/data/swe-fl/SRC/pysnooper_axel/dbgsnooper/dbgsnooper/tracer.py", line 335, in simple_wrapper
+    return function(*args, **kwargs)
+  File "run_debugging_test.py", line 15, in wrapped_execute
+    runpy.run_path(test_path, run_name="__main__")
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 263, in run_path
+    pkg_name=pkg_name, script_name=fname)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 96, in _run_module_code
+    mod_name, mod_spec, pkg_name, script_name)
+  File "/root/miniforge3/envs/django__django__3.2/lib/python3.6/runpy.py", line 85, in _run_code
+    exec(code, run_globals)
+  File "/data/swe-fl/TMP/testbed/django__django-13297/reproduce.py", line 15, in <module>
+    class Account(models.Model):
+  File "/data/swe-fl/TMP/testbed/django__django-13297/django/db/models/base.py", line 108, in __new__
+    app_config = apps.get_containing_app_config(module)
+  File "/data/swe-fl/TMP/testbed/django__django-13297/django/apps/registry.py", line 253, in get_containing_app_config
+    self.check_apps_ready()
+  File "/data/swe-fl/TMP/testbed/django__django-13297/django/apps/registry.py", line 135, in check_apps_ready
+    settings.INSTALLED_APPS
+  File "/data/swe-fl/TMP/testbed/django__django-13297/django/conf/__init__.py", line 83, in __getattr__
+    self._setup(name)
+  File "/data/swe-fl/TMP/testbed/django__django-13297/django/conf/__init__.py", line 68, in _setup
+    % (desc, ENVIRONMENT_VARIABLE))
+django.core.exceptions.ImproperlyConfigured: Requested setting INSTALLED_APPS, but settings are not configured. You must either define the environment variable DJANGO_SETTINGS_MODULE or call settings.configure() before accessing settings.
+
+
+
+You need to trace the abnormal program behavior step by step to identify the root cause of the bug and locate the buggy method that contains the code to be fixed.
+Now, please first analyze the current observed code and the abnormal program behavior. 
+
+Then, if you can already locate the buggy method and buggy code, reply with:
+Buggy method: `{FILE_PATH}:{METHOD_NAME}`
+Otherwise, continue tracing by selecting the next method to observe. Reply with: 
+Observed method: `{FILE_PATH}:{METHOD_NAME}`
+Note that {FILE_PATH} refers to the path relative to the repository. And if you want to observe a method inside a class, please specify the class name and method name in the format of `ClassName.method_name` as METHOD_NAME.
+

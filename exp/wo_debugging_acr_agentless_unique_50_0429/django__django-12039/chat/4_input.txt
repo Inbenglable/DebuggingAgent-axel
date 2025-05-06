@@ -1,0 +1,146 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+This is the bug issue, which is in the **django** project:
+## ISSUE
+<ISSUE>
+Use proper whitespace in CREATE INDEX statements
+Description
+	 
+		(last modified by Hannes Ljungberg)
+	 
+Creating an index through:
+index = Index(
+	fields=['-name’],
+	name='idx'
+)
+Will generate the valid but not so pretty CREATE INDEX statement: 
+CREATE INDEX "idx" ON "schema_author" ("name"DESC)
+The following would be expected:
+CREATE INDEX "idx" ON "schema_author" ("name" DESC)
+This was partially fixed for indexes using opclasses in https://code.djangoproject.com/ticket/30903#ticket but it introduced a new quirk when opclasses is used without explicit ordering:
+index = Index(
+	fields=['name’],
+	name='idx'
+	opclasses=['text_pattern_ops’]
+)
+Will result in:
+CREATE INDEX "idx" ON "schema_author" (“name” text_pattern_ops )
+Note the whitespace after text_pattern_ops. When used with a descending order it will look correct. 
+Unfortunately in the fix in #30903 it was assumed that the col_suffixes passed to django.db.backends.ddl_references.Columns would be empty for ascending order but instead it will contain empty strings and thus causing this bug. See: ​https://github.com/django/django/blob/master/django/db/backends/ddl_references.py#L87
+The expected output would be:
+CREATE INDEX "idx" ON "schema_author" (“name” text_pattern_ops)
+
+</ISSUE>
+
+
+In the previous round, you called search APIs to retrieve relevant source code that would help identify the root cause of the issue and generate a patch. However, the code you retrieved appears in multiple locations (maybe some are irrelevant but have same key). So now your task is to determine which of the retrieved contents are indeed you need, and filter out the irrelevant ones.
+This is your API invocation round output:
+To generate an accurate patch, it is essential to verify the usage and logic of the `self.col_suffixes` attribute in the `Columns.__str__` method to ensure that unnecessary spaces are not inserted. I will review other methods involved, such as potential indexing helpers or other places where SQL representations might be formatted.
+
+In particular, the method `Index._create_index_sql` could be relevant, as it is typically responsible for constructing such SQL commands, so verifying its role could be beneficial.
+
+I will search for the `Index._create_index_sql` method in the codebase to understand the context where the `Columns` class is invoked and how it interacts with other components during index creation.
+
+```python
+search_method_in_codebase("Index._create_index_sql")
+```
+
+
+And this is the corresponding API returned result (each content is started with #### FILE_PATH:NAME):
+Your API invoke result:
+
+### API INVOKE: search_method_in_codebase("Index._create_index_sql")
+RESULT:
+#### django/db/backends/base/schema.py:BaseDatabaseSchemaEditor._create_index_sql
+```python
+    def _create_index_sql(self, model, fields, *, name=None, suffix='', using='',
+                          db_tablespace=None, col_suffixes=(), sql=None, opclasses=(),
+                          condition=None):
+        """
+        Return the SQL statement to create the index for one or several fields.
+        `sql` can be specified if the syntax differs from the standard (GIS
+        indexes, ...).
+        """
+        tablespace_sql = self._get_index_tablespace_sql(model, fields, db_tablespace=db_tablespace)
+        columns = [field.column for field in fields]
+        sql_create_index = sql or self.sql_create_index
+        table = model._meta.db_table
+
+        def create_index_name(*args, **kwargs):
+            nonlocal name
+            if name is None:
+                name = self._create_index_name(*args, **kwargs)
+            return self.quote_name(name)
+
+        return Statement(
+            sql_create_index,
+            table=Table(table, self.quote_name),
+            name=IndexName(table, columns, suffix, create_index_name),
+            using=using,
+            columns=self._index_columns(table, columns, col_suffixes, opclasses),
+            extra=tablespace_sql,
+            condition=(' WHERE ' + condition) if condition else '',
+        )
+
+```
+
+#### django/db/backends/postgresql/schema.py:DatabaseSchemaEditor._create_index_sql
+```python
+    def _create_index_sql(
+        self, model, fields, *, name=None, suffix='', using='',
+        db_tablespace=None, col_suffixes=(), sql=None, opclasses=(),
+        condition=None, concurrently=False,
+    ):
+        sql = self.sql_create_index if not concurrently else self.sql_create_index_concurrently
+        return super()._create_index_sql(
+            model, fields, name=name, suffix=suffix, using=using, db_tablespace=db_tablespace,
+            col_suffixes=col_suffixes, sql=sql, opclasses=opclasses, condition=condition,
+        )
+
+```
+
+#### django/contrib/gis/db/backends/postgis/schema.py:PostGISSchemaEditor._create_index_sql
+```python
+    def _create_index_sql(self, model, fields, **kwargs):
+        if len(fields) != 1 or not hasattr(fields[0], 'geodetic'):
+            return super()._create_index_sql(model, fields, **kwargs)
+
+        field = fields[0]
+        field_column = self.quote_name(field.column)
+
+        if field.geom_type == 'RASTER':
+            # For raster fields, wrap index creation SQL statement with ST_ConvexHull.
+            # Indexes on raster columns are based on the convex hull of the raster.
+            field_column = self.rast_index_wrapper % field_column
+        elif field.dim > 2 and not field.geography:
+            # Use "nd" ops which are fast on multidimensional cases
+            field_column = "%s %s" % (field_column, self.geom_index_ops_nd)
+
+        return Statement(
+            self.sql_create_index,
+            name=self.quote_name('%s_%s_id' % (model._meta.db_table, field.column)),
+            table=self.quote_name(model._meta.db_table),
+            using='USING %s' % self.geom_index_type,
+            columns=field_column,
+            extra='',
+            condition='',
+        )
+
+```
+
+
+
+Among the API returned contents, there may be some irrelevant ones or not. So now you need to analyze each returned content and determine whether each one is your needed.
+Now, please first analyze the API returned content and determine whether each one is your needed.
+
+Then you need to choose you needed ones with the following format:
+```
+FILE_PATH_1:NAME_1
+FILE_PATH_2:NAME_2
+...
+```
+
+Note:
+1. The value of FILE_PATH:NAME, must consistent with the API returned content (but remove the prefix ####).
+2. You may select one or more contents, or even all of them if they are indeed you need.
+

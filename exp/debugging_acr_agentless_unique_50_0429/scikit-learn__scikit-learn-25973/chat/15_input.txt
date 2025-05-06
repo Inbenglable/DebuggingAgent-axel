@@ -1,0 +1,197 @@
+
+You are a bug repair agent to resolve issues and submit pull requests.
+Now You need to reolve the following issue in the **scikit-learn** project:
+## ISSUE
+<ISSUE>
+Unable to pass splits to SequentialFeatureSelector
+### Describe the bug
+
+This runs fine with e.g. `cv=5`, but according to the documentation, it should also be able to take an iterable of splits.
+However, passing splits from the cross validator fails
+
+Im fairly certain I have done similar things in the past to other classes in scikit-learn requiring a `cv` parameter.
+
+If somebody could confirm wether this is a bug, or I'm doing something wrong, that would great. Sorry if this is unneeded noise in the feed.
+
+### Steps/Code to Reproduce
+
+```
+from sklearn.datasets import make_classification
+from sklearn.feature_selection import SequentialFeatureSelector
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import LeaveOneGroupOut
+
+import numpy as np
+
+X, y = make_classification()
+
+
+groups = np.zeros_like(y, dtype=int)
+groups[y.size//2:] = 1
+
+cv = LeaveOneGroupOut()
+splits = cv.split(X, y, groups=groups)
+
+clf = KNeighborsClassifier(n_neighbors=5)
+
+seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
+seq.fit(X, y)
+```
+
+### Expected Results
+
+Expected to run without errors
+
+### Actual Results
+
+```
+---------------------------------------------------------------------------
+
+IndexError                                Traceback (most recent call last)
+
+[<ipython-input-18-d4c8f5222560>](https://localhost:8080/#) in <module>
+     19 
+     20 seq = SequentialFeatureSelector(clf, n_features_to_select=5, scoring='accuracy', cv=splits)
+---> 21 seq.fit(X, y)
+
+4 frames
+
+[/usr/local/lib/python3.9/dist-packages/sklearn/model_selection/_validation.py](https://localhost:8080/#) in _aggregate_score_dicts(scores)
+   1928         if isinstance(scores[0][key], numbers.Number)
+   1929         else [score[key] for score in scores]
+-> 1930         for key in scores[0]
+   1931     }
+
+IndexError: list index out of range
+```
+
+### Versions
+
+```shell
+1.2.2
+```
+
+
+</ISSUE>
+
+
+A debugging agent has tried to trace the abnormal program and locate the root cause of the bug. This is its debugging history:
+
+==================================================
+Observed method: `sklearn/model_selection/_validation.py:cross_validate`
+==================================================
+The abnormal program behavior occurs because the function `_aggregate_score_dicts` in `sklearn/model_selection/_validation.py` is attempting to access the first element of an empty list, leading to an `IndexError`.
+
+Given the behavior and provided information, the issue appears to stem from how the `SequentialFeatureSelector` class handles the `cv` parameter when it is an iterable of splits. Specifically, it seems that the splitting generator might get exhausted before being utilized properly.
+
+The specific trace steps show that:
+
+1. Splitting occurs normally with a generator.
+2. The generator is passed but might be exhausted by the time it is used within the cross-validation process.
+3. The `_aggregate_score_dicts` function attempts to aggregate results but finds an empty list, hence the `IndexError`.
+
+To fix this issue, we should make sure that the splits generator is properly materialized so it's not exhausted prematurely.
+
+Now let's locate the actual root cause of this issue. Given the discussed, it's worth looking at how the `SequentialFeatureSelector` is using these splits. Let's start with the `fit` method and observe how it's handling the `cv` splits.
+
+Observed scope: `sklearn/feature_selection/_sequential.py:263-300`
+==================================================
+To address the cross-validation generator issue, we should investigate how the `cv` parameter is used within `SequentialFeatureSelector`, specifically the `fit` method, which has been observed. The error implicates the `_get_best_new_feature_score` method, which seems to be where the `cross_val_score` is called, and it's likely that `cross_validate` is being invoked.
+
+The initial analysis suggests the generator might be exhausted or improperly handled before the cross-validation. Therefore, we'll need to observe the method where `cross_val_score` is called to ensure it's handled correctly.
+
+Observed method: `sklearn/feature_selection/_sequential.py:SequentialFeatureSelector._get_best_new_feature_score`
+==================================================
+The issue seems to be related to how the generator object passed as `cv` in `SequentialFeatureSelector` is handled in the `cross_val_score` function. Specifically, the generator might be exhausted, leading to an empty list being returned in the cross-validation results, which then causes an `IndexError` in `_aggregate_score_dicts` when it tries to access a key in an empty list.
+
+The runtime traces show that `_get_best_new_feature_score` calls `cross_val_score` with `cv=self.cv`. The generator passed as `cv` may be consumed after the first feature index is processed, leading to no splits being available for subsequent iterations.
+
+Based on the analysis of `SequentialFeatureSelector._get_best_new_feature_score` and the observed exception, it appears that the handling of `cv` as a generator in this method could be the root cause of the bug.
+
+Therefore, the buggy method is likely located in the observed scope, as the handling of the `cv` generator needs to be addressed in `SequentialFeatureSelector`.
+
+Buggy method: `sklearn/feature_selection/_sequential.py:_get_best_new_feature_score`
+==================================================
+
+You have called API to retrieve some code and this is your API call and reply history:
+==================================================
+Your Output:
+Let's retrieve the source code of the `_get_best_new_feature_score` method from the `sklearn/feature_selection/_sequential.py` file to better understand how the `cv` parameter is being handled.
+
+```python
+search_method_in_file("sklearn/feature_selection/_sequential.py", "SequentialFeatureSelector._get_best_new_feature_score")
+```
+==================================================
+Your API invoke result:
+
+### API INVOKE: search_method_in_file("sklearn/feature_selection/_sequential.py", "SequentialFeatureSelector._get_best_new_feature_score")
+RESULT:
+#### sklearn/feature_selection/_sequential.py:SequentialFeatureSelector._get_best_new_feature_score
+```python
+    def _get_best_new_feature_score(self, estimator, X, y, current_mask):
+        # Return the best new feature and its score to add to the current_mask,
+        # i.e. return the best new feature and its score to add (resp. remove)
+        # when doing forward selection (resp. backward selection).
+        # Feature will be added if the current score and past score are greater
+        # than tol when n_feature is auto,
+        candidate_feature_indices = np.flatnonzero(~current_mask)
+        scores = {}
+        for feature_idx in candidate_feature_indices:
+            candidate_mask = current_mask.copy()
+            candidate_mask[feature_idx] = True
+            if self.direction == "backward":
+                candidate_mask = ~candidate_mask
+            X_new = X[:, candidate_mask]
+            scores[feature_idx] = cross_val_score(
+                estimator,
+                X_new,
+                y,
+                cv=self.cv,
+                scoring=self.scoring,
+                n_jobs=self.n_jobs,
+            ).mean()
+        new_feature_idx = max(scores, key=lambda feature_idx: scores[feature_idx])
+        return new_feature_idx, scores[new_feature_idx]
+
+```
+
+
+==================================================
+
+Your Output:
+Ready generation: `True`
+==================================================
+
+Now, you need to generate patches to resolve the issue. Please ensure that your patch does not disrupt the original functionality of the code.
+You should generate *SEARCH/REPLACE* format patches to fix the issue.
+Every *SEARCH/REPLACE* edit must use this format:
+```pythony
+### mathweb/flask/app.py
+<<<<<<< SEARCH
+from flask import Flask
+=======
+import math
+from flask import Flask
+>>>>>>> REPLACE
+```
+
+You should finally provide edit result in the following JSON format (each {SEARCH_REPLACE_EDIT} is a *SEARCH/REPLACE* edit):
+{
+  "search_replace_edits": [
+    "{SEARCH_REPLACE_EDIT_1}",
+    "{SEARCH_REPLACE_EDIT_2}",
+  ]
+}
+
+A final json reply example:
+```json
+{
+  "search_replace_edits": [
+    "### A/B.py\n<<<<<<< SEARCH
+       def foo():\n=======\n    def bar():\n>>>>>>> REPLACE\n",
+    "### A/B.py\n<<<<<<< SEARCH
+       x = x + 1\n=======\n    x = x - 1\n>>>>>>> REPLACE\n",
+}
+```
+
+
